@@ -1,0 +1,24 @@
+{
+  "$schema": "https://nitro.margelo.com/nitro.schema.json",
+  "cxxNamespace": [
+    "s3bguploader"
+  ],
+  "ios": {
+    "iosModuleName": "S3BgUploader"
+  },
+  "android": {
+    "androidNamespace": [
+      "s3bguploader"
+    ],
+    "androidCxxLibName": "S3BgUploader"
+  },
+  "autolinking": {
+    "S3BgUploader": {
+      "swift": "HybridS3BgUploader",
+      "kotlin": "HybridS3BgUploader"
+    }
+  },
+  "ignorePaths": [
+    "**/node_modules"
+  ]
+}
