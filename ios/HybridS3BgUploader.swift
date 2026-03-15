@@ -6,9 +6,10 @@
 //
 
 import Foundation
+import RustCore
 
 class HybridS3BgUploader: HybridS3BgUploaderSpec {
     func sum(num1: Double, num2: Double) throws -> Double {
-        return num1 + num2
+        return Double(add(Int32(num1), Int32(num2)))
     }
 }

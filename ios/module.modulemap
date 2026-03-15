@@ -1,0 +1,4 @@
+module RustCore {
+    header "rust/uploader.h"
+    export *
+}

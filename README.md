@@ -20,6 +20,11 @@ react-native-s3-bg-uploader is a react native package built with Nitro
 npm install react-native-s3-bg-uploader react-native-nitro-modules
 ```
 
+## Run example app
+```bash
+npm run example:ios
+```
+
 ## Credits
 
 Bootstrapped with [create-nitro-module](https://github.com/patrickkabwe/create-nitro-module).
