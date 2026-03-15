@@ -11,10 +11,10 @@
     "typecheck": "tsc --noEmit",
     "clean": "git clean -dfX",
     "release": "semantic-release",
+    "build:rust:ios": "cd uploader && ./build.sh ios",
     "build": "npm run typecheck && bob build",
     "codegen": "nitrogen --logLevel=\"debug\" && npm run build && node post-script.js",
-    "build:rust:ios": "cd uploader && ./build.sh ios",
-    "example:ios": "npm run codegen && cd example/ios && npm run pod && npm run ios"
+    "example:ios": "npm run build:rust:ios && npm run codegen && cd example/ios && npm run pod && npm run ios"
   },
   "keywords": [
     "react-native",
