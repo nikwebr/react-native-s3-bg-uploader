@@ -1,0 +1,2 @@
+language = "C"
+cpp_compat = true  # generiert extern "C" Guards automatisch

@@ -13,6 +13,7 @@
     "release": "semantic-release",
     "build": "npm run typecheck && bob build",
     "codegen": "nitrogen --logLevel=\"debug\" && npm run build && node post-script.js",
+    "build:rust:ios": "cd uploader && ./build.sh ios",
     "example:ios": "npm run codegen && cd example/ios && npm run pod && npm run ios"
   },
   "keywords": [

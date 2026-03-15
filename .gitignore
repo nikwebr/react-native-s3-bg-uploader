@@ -83,6 +83,9 @@ android/generated
 # React Native Nitro Modules
 nitrogen/
 
+# Rust
+uploader/target/
+
 # Example
 example/ios/Podfile.lock
 example/Gemfile.lock
