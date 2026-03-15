@@ -90,3 +90,6 @@ uploader/target/
 example/ios/Podfile.lock
 example/Gemfile.lock
 example/ios/S3BgUploaderExample.xcworkspace/contents.xcworkspacedata
+
+# Misc
+ios/rust/
