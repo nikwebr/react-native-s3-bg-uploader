@@ -16,6 +16,11 @@ use crate::core::chunk::{self, ChunkInfo};
 use crate::core::retry::{self, RetryPolicy};
 
 #[wasm_bindgen]
+pub fn add(one: f64, two: f64) -> f64 {
+    one + two
+}
+
+#[wasm_bindgen]
 pub async fn upload_file(file: web_sys::File) -> Result<JsValue, JsValue> {
     upload_file_internal(file)
         .await

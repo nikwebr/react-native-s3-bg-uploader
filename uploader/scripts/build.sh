@@ -13,7 +13,8 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IOS_RUST_DIR="$SCRIPT_DIR/../ios/rust"
+IOS_RUST_DIR="$SCRIPT_DIR/../../ios/rust"
+TARGET_DIR="$SCRIPT_DIR/../target"
 
 ensure_deps() {
     echo -e "${BLUE}🔍 Checking dependencies...${NC}"
@@ -86,18 +87,18 @@ if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
     cargo build --features ios --target x86_64-apple-ios --release
 
     echo -e "${BLUE}🔗 Creating universal simulator fat library (lipo)...${NC}"
-    mkdir -p target/universal-ios-sim/release
+    mkdir -p $TARGET_DIR/universal-ios-sim/release
     lipo -create \
-        target/aarch64-apple-ios-sim/release/libuploader.a \
-        target/x86_64-apple-ios/release/libuploader.a \
-        -output target/universal-ios-sim/release/libuploader.a
+        $TARGET_DIR/aarch64-apple-ios-sim/release/libuploader.a \
+        $TARGET_DIR/x86_64-apple-ios/release/libuploader.a \
+        -output $TARGET_DIR/universal-ios-sim/release/libuploader.a
 
     echo -e "${BLUE}📦 Creating XCFramework...${NC}"
-    rm -rf target/libuploader.xcframework
+    rm -rf $TARGET_DIR/libuploader.xcframework
     xcodebuild -create-xcframework \
-        -library target/aarch64-apple-ios/release/libuploader.a \
-        -library target/universal-ios-sim/release/libuploader.a \
-        -output target/libuploader.xcframework
+        -library $TARGET_DIR/aarch64-apple-ios/release/libuploader.a \
+        -library $TARGET_DIR/universal-ios-sim/release/libuploader.a \
+        -output $TARGET_DIR/libuploader.xcframework
 
     mkdir -p "$IOS_RUST_DIR"
 
@@ -111,12 +112,12 @@ if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
     fi
 
     echo -e "${BLUE}📋 Copying artifacts to ios/rust/...${NC}"
-    cp target/aarch64-apple-ios/release/libuploader.a "$IOS_RUST_DIR/libuploader.a"
+    rm -rf "$IOS_RUST_DIR/libuploader.xcframework"
+    cp -R $TARGET_DIR/libuploader.xcframework "$IOS_RUST_DIR/libuploader.xcframework"
 
     echo -e "${GREEN}✓ iOS build successful${NC}"
-    echo "  Device lib : ios/rust/libuploader.a  (aarch64-apple-ios)"
+    echo "  XCFramework: ios/rust/libuploader.xcframework  (device + simulator)"
     echo "  Header     : ios/rust/uploader.h"
-    echo "  XCFramework: uploader/target/libuploader.xcframework  (device + sim)"
     echo ""
 fi
 
@@ -132,16 +133,20 @@ if [[ "$1" == "wasm" ]] || [[ "$1" == "all" ]]; then
         if command -v wasm-bindgen &> /dev/null; then
             echo -e "${BLUE}🔗 Running wasm-bindgen...${NC}"
             wasm-bindgen \
-                --out-dir ./pkg \
-                --target web \
-                ./target/wasm32-unknown-unknown/release/uploader.wasm
+                --out-dir $TARGET_DIR/wasm \
+                --target no-modules \
+                $TARGET_DIR/wasm32-unknown-unknown/release/uploader.wasm
 
             if [ $? -eq 0 ]; then
                 echo -e "${GREEN}✓ wasm-bindgen successful${NC}"
-                echo "Output: pkg/"
+                echo "Output: target/wasm/"
                 echo "  - uploader.js"
                 echo "  - uploader_bg.wasm"
                 echo "  - uploader.d.ts"
+
+                echo -e "${BLUE}📦 Embedding WASM into library source...${NC}"
+                node "$SCRIPT_DIR/embed-wasm.js"
+                echo -e "${GREEN}✓ WASM embedded into src/web/wasm-assets.ts${NC}"
             else
                 echo -e "${RED}✗ wasm-bindgen failed${NC}"
                 exit 1

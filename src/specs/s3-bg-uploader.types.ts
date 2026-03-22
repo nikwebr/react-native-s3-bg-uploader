@@ -1,5 +1,3 @@
-import { type HybridObject } from 'react-native-nitro-modules'
-
 export interface UploadProgress {
   totalBytes: number
   uploadedBytes: number
@@ -8,8 +6,10 @@ export interface UploadProgress {
   percentage: number
 }
 
-export interface S3BgUploader extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
+export type ProgressCallback = (progress: UploadProgress) => void
+
+export interface S3BgUploaderAPI {
   sum(num1: number, num2: number): number
   uploadFile(filePath: string): Promise<void>
-  setProgressCallback(callback: ((progress: UploadProgress) => void) | null): void
+  setProgressCallback(callback: ProgressCallback | null): void
 }

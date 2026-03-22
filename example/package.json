@@ -8,18 +8,24 @@
     "lint": "eslint .",
     "start": "react-native start --reset-cache",
     "test": "jest",
-    "pod": "bundle install && bundle exec pod install --project-directory=ios"
+    "pod": "bundle install && bundle exec pod install --project-directory=ios",
+    "web": "webpack serve --config webpack.config.js --mode development"
   },
   "dependencies": {
-    "react": "19.2.3",
-    "react-native": "0.84.1",
     "@react-native/new-app-screen": "0.84.1",
+    "react": "19.2.3",
+    "react-dom": "^19.2.3",
+    "react-native": "0.84.1",
+    "react-native-document-picker": "^9.3.1",
+    "react-native-nitro-modules": "0.35.1",
     "react-native-safe-area-context": "^5.5.2",
-    "react-native-nitro-modules": "0.35.1"
+    "react-native-web": "^0.21.2"
   },
   "devDependencies": {
-    "@babel/core": "^7.25.2",
-    "@babel/preset-env": "^7.25.3",
+    "@babel/core": "^7.29.0",
+    "@babel/preset-env": "^7.29.0",
+    "@babel/preset-react": "^7.28.5",
+    "@babel/preset-typescript": "^7.28.5",
     "@babel/runtime": "^7.25.0",
     "@react-native-community/cli": "20.1.0",
     "@react-native-community/cli-platform-android": "20.1.0",
@@ -29,7 +35,13 @@
     "@react-native/metro-config": "0.84.1",
     "@react-native/typescript-config": "0.84.1",
     "@types/jest": "^29.5.13",
-    "babel-plugin-module-resolver": "^5.0.2"
+    "babel-loader": "^10.1.1",
+    "babel-plugin-module-resolver": "^5.0.2",
+    "copy-webpack-plugin": "^14.0.0",
+    "html-webpack-plugin": "^5.6.6",
+    "webpack": "^5.105.4",
+    "webpack-cli": "^7.0.1",
+    "webpack-dev-server": "^5.2.3"
   },
   "engines": {
     "node": ">= 22.11.0"

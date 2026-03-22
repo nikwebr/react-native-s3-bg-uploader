@@ -22,10 +22,11 @@ Pod::Spec.new do |s|
     "cpp/**/*.{hpp,cpp}",
   ]
 
-  s.vendored_libraries = 'ios/rust/libuploader.a'
+  s.vendored_frameworks = 'ios/rust/libuploader.xcframework'
 
   s.pod_target_xcconfig = {
-    'SWIFT_INCLUDE_PATHS' => '${PODS_TARGET_SRCROOT}/ios'
+    'SWIFT_INCLUDE_PATHS' => '${PODS_TARGET_SRCROOT}/ios',
+    'HEADER_SEARCH_PATHS' => '${PODS_TARGET_SRCROOT}/ios'
   }
 
   load 'nitrogen/generated/ios/S3BgUploader+autolinking.rb'

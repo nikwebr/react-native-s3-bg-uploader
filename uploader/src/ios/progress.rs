@@ -27,7 +27,7 @@ pub extern "C" fn get_upload_progress_json() -> *const c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn set_progress_callback(callback: Option<ProgressCallback>) {
+pub extern "C" fn set_progress_callback(callback: Option<extern "C" fn(u64, u64, u32, u32, f64)>) {
     let mut cb = PROGRESS_CALLBACK.lock().unwrap();
     *cb = callback;
 }
