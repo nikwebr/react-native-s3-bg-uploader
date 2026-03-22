@@ -21,9 +21,15 @@ npm install react-native-s3-bg-uploader react-native-nitro-modules
 ```
 
 ## Building
+For native platforms:
 ```bash
 npm run build:rust:ios
 npm run codegen
+```
+
+For web:
+```bash
+npm run build:rust:wasm
 ```
 
 ### Additional requirements
@@ -32,6 +38,14 @@ npm run codegen
 ### Example
 ```bash
 npm run example:ios
+npm run example:web
+```
+
+## Troubleshooting
+### ReferenceError: Can't find variable: wasm_bindgen
+Run in the root of the repo
+```bash
+npm run build:rust:wasm
 ```
 
 ## Credits

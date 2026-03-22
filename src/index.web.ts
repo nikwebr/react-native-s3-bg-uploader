@@ -1,5 +1,5 @@
 /// <reference lib="dom" />
-import type { S3BgUploaderAPI, ProgressCallback } from './specs/s3-bg-uploader.types'
+import type { ProgressCallback, S3BgUploaderAPI } from './specs/s3-bg-uploader.types'
 import { UPLOADER_JS_CODE, UPLOADER_WASM_BASE64 } from './web/wasm-assets'
 
 // ---------------------------------------------------------------------------
@@ -75,39 +75,32 @@ function getWorker(): Worker {
 // Public API
 // ---------------------------------------------------------------------------
 
-const S3BgUploaderWeb: S3BgUploaderAPI = {
+export const S3BgUploader: S3BgUploaderAPI = {
   sum(num1: number, num2: number): number {
     return num1 + num2
   },
 
-  async uploadFile(_filePath: string): Promise<void> {
-    throw new Error('On web, use the exported uploadWebFile(file) helper instead of uploadFile().')
+  async uploadFile(file: File | string): Promise<void> {
+    if (typeof file === 'string') {
+      throw new TypeError('S3BgUploader: On web platform, uploadFile requires a File value as file parameter.')
+    }
+    const w = getWorker()
+    return new Promise((resolve, reject) => {
+      const onMessage = (e: MessageEvent) => {
+        if (e.data.type === 'complete') {
+          w.removeEventListener('message', onMessage)
+          resolve()
+        } else if (e.data.type === 'error') {
+          w.removeEventListener('message', onMessage)
+          reject(new Error(e.data.message))
+        }
+      }
+      w.addEventListener('message', onMessage)
+      w.postMessage({ file })
+    })
   },
 
   setProgressCallback(callback: ProgressCallback | null): void {
     progressCallback = callback
   },
-}
-
-export const S3BgUploader = S3BgUploaderWeb
-
-/**
- * Upload a web File object via the WASM Web Worker.
- * Use this on web instead of S3BgUploader.uploadFile().
- */
-export async function uploadWebFile(file: File): Promise<void> {
-  const w = getWorker()
-  return new Promise((resolve, reject) => {
-    const onMessage = (e: MessageEvent) => {
-      if (e.data.type === 'complete') {
-        w.removeEventListener('message', onMessage)
-        resolve()
-      } else if (e.data.type === 'error') {
-        w.removeEventListener('message', onMessage)
-        reject(new Error(e.data.message))
-      }
-    }
-    w.addEventListener('message', onMessage)
-    w.postMessage({ file })
-  })
 }

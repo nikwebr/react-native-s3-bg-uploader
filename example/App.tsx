@@ -8,7 +8,7 @@ import {
   ActivityIndicator,
   ScrollView,
 } from 'react-native';
-import { S3BgUploader, uploadWebFile } from 'react-native-s3-bg-uploader';
+import { S3BgUploader } from 'react-native-s3-bg-uploader';
 import { pickSingle, isCancel, types } from 'react-native-document-picker';
 
 interface UploadProgress {
@@ -103,7 +103,7 @@ function App(): React.JSX.Element {
 
     try {
       if (Platform.OS === 'web') {
-        await uploadWebFile(webFile!);
+        await S3BgUploader.uploadFile(webFile!);
       } else {
         await S3BgUploader.uploadFile(nativePath!);
       }

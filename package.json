@@ -15,7 +15,8 @@
     "build:rust:wasm": "cd uploader && ./scripts/build.sh wasm",
     "build": "npm run typecheck && bob build",
     "codegen": "nitrogen --logLevel=\"debug\" && npm run build && node post-script.js",
-    "example:ios": "npm run build:rust:ios && npm run codegen && cd example/ios && npm run pod && npm run ios"
+    "example:ios": "npm run build:rust:ios && npm run codegen && cd example/ios && npm run pod && npm run ios",
+    "example:web": "npm run build:rust:wasm && cd example && npm run web"
   },
   "keywords": [
     "react-native",

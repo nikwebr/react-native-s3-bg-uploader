@@ -8,8 +8,19 @@ export interface UploadProgress {
 
 export type ProgressCallback = (progress: UploadProgress) => void
 
-export interface S3BgUploaderAPI {
+interface BaseUploaderAPI {
   sum(num1: number, num2: number): number
-  uploadFile(filePath: string): Promise<void>
   setProgressCallback(callback: ProgressCallback | null): void
+}
+
+export interface S3BgUploaderAPI extends BaseUploaderAPI {
+  uploadFile(file: string | File): Promise<void>
+}
+
+export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
+  uploadFile(filePath: string): Promise<void>
+}
+
+export interface WebS3BgUploaderAPI extends BaseUploaderAPI {
+  uploadFile(file: File): Promise<void>
 }
