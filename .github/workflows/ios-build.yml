@@ -81,10 +81,8 @@ jobs:
             ${{ runner.os }}-pods-
 
       - name: Build
-        working-directory: /
         run: npm run build:rust:ios
       - name: Codegen
-        working-directory: /
         run: npm run codegen
       - name: Install Pods
         working-directory: example/ios
