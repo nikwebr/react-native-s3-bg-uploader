@@ -11,12 +11,13 @@
     "typecheck": "tsc --noEmit",
     "clean": "git clean -dfX",
     "release": "semantic-release",
-    "build:rust:ios": "cd uploader && ./scripts/build.sh ios",
-    "build:rust:wasm": "cd uploader && ./scripts/build.sh wasm",
-    "build": "npm run typecheck && bob build",
-    "codegen": "nitrogen --logLevel=\"debug\" && npm run build && node post-script.js",
-    "example:ios": "npm run build:rust:ios && npm run codegen && cd example/ios && npm run pod && npm run ios",
-    "example:web": "npm run build:rust:wasm && cd example && npm run web"
+    "native-codegen": "nitrogen --logLevel=\"debug\" && node post-script.js",
+    "build:ios": "cd uploader && ./scripts/build.sh ios && cd .. && npm run native-codegen",
+    "build:wasm": "cd uploader && ./scripts/build.sh wasm",
+    "build:ts": "npm run typecheck && bob build",
+    "build": "npm run build:ts && npm run build:ios && npm run build:wasm",
+    "example:ios": "npm run build:ios && cd example/ios && npm run pod && npm run ios",
+    "example:web": "npm run build:wasm && cd example && npm run web"
   },
   "keywords": [
     "react-native",
