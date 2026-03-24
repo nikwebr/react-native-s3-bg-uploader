@@ -23,13 +23,12 @@ npm install react-native-s3-bg-uploader react-native-nitro-modules
 ## Building
 For native platforms:
 ```bash
-npm run build:rust:ios
-npm run codegen
+npm run build:ios
 ```
 
 For web:
 ```bash
-npm run build:rust:wasm
+npm run build:wasm
 ```
 
 ### Additional requirements
