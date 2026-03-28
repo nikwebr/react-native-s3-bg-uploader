@@ -53,6 +53,7 @@ pub fn progress_to_js_object(progress: &UploadProgress) -> JsValue {
     js_sys::Reflect::set(&obj, &"completedParts".into(), &JsValue::from(progress.completed_parts)).ok();
     js_sys::Reflect::set(&obj, &"totalParts".into(), &JsValue::from(progress.total_parts)).ok();
     js_sys::Reflect::set(&obj, &"percentage".into(), &JsValue::from(progress.percentage())).ok();
+    js_sys::Reflect::set(&obj, &"state".into(), &JsValue::from_str(progress.status.as_str())).ok();
     obj.into()
 }
 

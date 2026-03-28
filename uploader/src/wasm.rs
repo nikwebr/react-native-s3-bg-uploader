@@ -14,6 +14,7 @@ use crate::core::{
 };
 use crate::core::chunk::{self, ChunkInfo};
 use crate::core::retry::{self, RetryPolicy};
+use crate::core::progress::UploadStatus;
 
 #[wasm_bindgen]
 pub fn add(one: f64, two: f64) -> f64 {
@@ -45,11 +46,22 @@ async fn upload_file_internal(file: web_sys::File) -> Result<(), String> {
     let chunk_infos_arc = Arc::new(chunk_infos);
 
     // Chunks parallel hochladen mit Sliding Window
-    let completed_parts = upload_chunks_parallel_async(file_arc, chunk_infos_arc).await?;
+    let completed_parts = upload_chunks_parallel_async(file_arc, chunk_infos_arc)
+        .await
+        .map_err(|e| {
+            progress::progress_manager().set_status(UploadStatus::Failed);
+            e
+        })?;
 
     // Upload abschließen
-    api::complete_upload_async(&upload_info, completed_parts).await?;
+    api::complete_upload_async(&upload_info, completed_parts)
+        .await
+        .map_err(|e| {
+            progress::progress_manager().set_status(UploadStatus::Failed);
+            e
+        })?;
 
+    progress::progress_manager().set_status(UploadStatus::Finished);
     Ok(())
 }
 

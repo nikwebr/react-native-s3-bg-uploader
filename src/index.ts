@@ -11,7 +11,7 @@ export const S3BgUploader: S3BgUploaderAPI = {
   setProgressCallback(callback: ProgressCallback | null): void {
     NativeS3BgUploader.setProgressCallback(callback)
   },
-  async uploadFile(file: string | File): Promise<void> {
+  uploadFile(file: string | File) {
     if (typeof file !== 'string') {
       throw new TypeError('S3BgUploader: On native platforms, uploadFile requires a stringish file path value as file paramenter.')
     }

@@ -8,21 +8,27 @@
 import Foundation
 import NitroModules
 import RustCore
+import BackgroundTasks
+
+private let taskId = "\(Bundle.main.bundleIdentifier!).background"
 
 private func rustProgressBridge(
     totalBytes: UInt64,
     uploadedBytes: UInt64,
     completedParts: UInt32,
     totalParts: UInt32,
-    percentage: Double
+    percentage: Double,
+    state: UnsafePointer<CChar>?
 ) {
     guard let cb = HybridS3BgUploader.sharedProgressCallback else { return }
+    let stateStr = state.map { String(cString: $0) } ?? ""
     let progress = UploadProgress(
         totalBytes: Double(totalBytes),
         uploadedBytes: Double(uploadedBytes),
         completedParts: Double(completedParts),
         totalParts: Double(totalParts),
-        percentage: percentage
+        percentage: percentage,
+        state: UploadState(fromString: stateStr) ?? .failed
     )
     DispatchQueue.main.async { cb(progress) }
 }
@@ -43,21 +49,47 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
         return Double(add(Int32(num1), Int32(num2)))
     }
 
-    func uploadFile(filePath: String) throws -> Promise<Void> {
-        return Promise.async {
-            if HybridS3BgUploader.sharedProgressCallback != nil {
-                set_progress_callback(rustProgressBridge)
-            }
+    func uploadFile(filePath: String) throws -> Void {
+        registerBgTask(filePath)
+        runBgTask()
+    }
 
-            let success = filePath.withCString { cPath in
-                upload_file(cPath) == 0
-            }
+    private func registerBgTask(_ filePath: String) {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: taskId, using: nil) { task in
+            guard let task = task as? BGContinuedProcessingTask else { return }
 
-            set_progress_callback(nil)
+            task.expirationHandler = {}
 
-            if !success {
-                throw RuntimeError.error(withMessage: "Upload failed")
+            task.progress.totalUnitCount = 100
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                if HybridS3BgUploader.sharedProgressCallback != nil {
+                    set_progress_callback(rustProgressBridge)
+                }
+                let success = filePath.withCString { cPath in
+                    upload_file(cPath) == 0
+                }
+                set_progress_callback(nil)
+
+                DispatchQueue.main.async {
+                    task.setTaskCompleted(success: success)
+                }
             }
+        }
+    }
+
+    /// Runs the background continued processing task.
+    private func runBgTask() {
+        let request = BGContinuedProcessingTaskRequest(
+            identifier: taskId,
+            title: "Upload",
+            subtitle: "Running..."
+        )
+        request.strategy = .queue
+        do {
+            try BGTaskScheduler.shared.submit(request)
+        } catch {
+            print(error)
         }
     }
 }

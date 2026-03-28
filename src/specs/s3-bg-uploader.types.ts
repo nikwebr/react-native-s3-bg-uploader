@@ -4,7 +4,10 @@ export interface UploadProgress {
   completedParts: number
   totalParts: number
   percentage: number
+  state: UploadState
 }
+
+export type UploadState = 'RUNNING' | 'PAUSED' | 'FINISHED' | 'FAILED'
 
 export type ProgressCallback = (progress: UploadProgress) => void
 
@@ -14,11 +17,11 @@ interface BaseUploaderAPI {
 }
 
 export interface S3BgUploaderAPI extends BaseUploaderAPI {
-  uploadFile(file: string | File): Promise<void>
+  uploadFile(file: string | File): void
 }
 
 export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
-  uploadFile(filePath: string): Promise<void>
+  uploadFile(filePath: string): void
 }
 
 export interface WebS3BgUploaderAPI extends BaseUploaderAPI {

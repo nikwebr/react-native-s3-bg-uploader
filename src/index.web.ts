@@ -32,6 +32,7 @@ onmessage = async function (e) {
         completedParts: Number(progress.completedParts),
         totalParts: Number(progress.totalParts),
         percentage: Number(progress.percentage),
+        state: progress.state
       },
     });
   });
@@ -80,24 +81,12 @@ export const S3BgUploader: S3BgUploaderAPI = {
     return num1 + num2
   },
 
-  async uploadFile(file: File | string): Promise<void> {
+  uploadFile(file: File | string) {
     if (typeof file === 'string') {
       throw new TypeError('S3BgUploader: On web platform, uploadFile requires a File value as file parameter.')
     }
     const w = getWorker()
-    return new Promise((resolve, reject) => {
-      const onMessage = (e: MessageEvent) => {
-        if (e.data.type === 'complete') {
-          w.removeEventListener('message', onMessage)
-          resolve()
-        } else if (e.data.type === 'error') {
-          w.removeEventListener('message', onMessage)
-          reject(new Error(e.data.message))
-        }
-      }
-      w.addEventListener('message', onMessage)
-      w.postMessage({ file })
-    })
+    w.postMessage({ file })
   },
 
   setProgressCallback(callback: ProgressCallback | null): void {
