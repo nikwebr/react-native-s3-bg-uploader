@@ -15,7 +15,7 @@ react-native-s3-bg-uploader is a react native package built with Nitro
 > To Support `Nitro Views` you need to install React Native version v0.78.0 or higher.
 
 ### iOS
-- mimimum iOS version 26
+- background uploading is only supported for iOS 26 or later
 - enabled "background fetch" & "background processing" capabilities
 - registered BGTaskSchedulerPermittedIdentifiers of value $(PRODUCT_BUNDLE_IDENTIFIER).background inside info.plist
 
