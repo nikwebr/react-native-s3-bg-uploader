@@ -1,13 +1,33 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum UploadStatus {
+    Running,
+    Paused,
+    Failed,
+    Finished,
+}
+
+impl UploadStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UploadStatus::Running => "RUNNING",
+            UploadStatus::Paused => "PAUSED",
+            UploadStatus::Failed => "FAILED",
+            UploadStatus::Finished => "FINISHED",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UploadProgress {
     pub total_bytes: u64,
     pub total_parts: u32,
     pub completed_bytes: u64, // only considers completed chunks
     pub in_flight_progress: HashMap<u32, u64>, // part_number -> uploaded bytes
-    pub completed_parts: u32
+    pub completed_parts: u32,
+    pub status: UploadStatus,
 }
 
 impl UploadProgress {
@@ -18,6 +38,7 @@ impl UploadProgress {
             in_flight_progress: HashMap::new(),
             completed_parts: 0,
             total_parts,
+            status: UploadStatus::Running,
         }
     }
 
@@ -52,7 +73,8 @@ impl UploadProgress {
             "uploadedBytes": self.uploaded_bytes(),
             "completedParts": self.completed_parts,
             "totalParts": self.total_parts,
-            "percentage": self.percentage()
+            "percentage": self.percentage(),
+            "state": self.status.as_str()
         })
     }
 }
@@ -107,6 +129,16 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         let mut progress = self.progress.lock().unwrap();
         if let Some(ref mut p) = *progress {
             p.complete_chunk(part_number, chunk_size);
+            let snapshot = p.clone();
+            drop(progress);
+            self.notifier.notify(&snapshot);
+        }
+    }
+
+    pub fn set_status(&self, status: UploadStatus) {
+        let mut progress = self.progress.lock().unwrap();
+        if let Some(ref mut p) = *progress {
+            p.status = status;
             let snapshot = p.clone();
             drop(progress);
             self.notifier.notify(&snapshot);

@@ -25,7 +25,6 @@ Pod::Spec.new do |s|
   s.vendored_frameworks = 'ios/rust/libuploader.xcframework'
 
   s.pod_target_xcconfig = {
-    'SWIFT_INCLUDE_PATHS' => '${PODS_TARGET_SRCROOT}/ios',
     'HEADER_SEARCH_PATHS' => '${PODS_TARGET_SRCROOT}/ios'
   }
 

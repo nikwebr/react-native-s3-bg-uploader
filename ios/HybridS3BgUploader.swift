@@ -8,28 +8,41 @@
 import Foundation
 import NitroModules
 import RustCore
+import BackgroundTasks
+
+private let taskId = "\(Bundle.main.bundleIdentifier!).background"
 
 private func rustProgressBridge(
     totalBytes: UInt64,
     uploadedBytes: UInt64,
     completedParts: UInt32,
     totalParts: UInt32,
-    percentage: Double
+    percentage: Double,
+    state: UnsafePointer<CChar>?
 ) {
-    guard let cb = HybridS3BgUploader.sharedProgressCallback else { return }
+    let stateStr = state.map { String(cString: $0) } ?? ""
     let progress = UploadProgress(
         totalBytes: Double(totalBytes),
         uploadedBytes: Double(uploadedBytes),
         completedParts: Double(completedParts),
         totalParts: Double(totalParts),
-        percentage: percentage
+        percentage: percentage,
+        state: UploadState(fromString: stateStr) ?? .failed
     )
-    DispatchQueue.main.async { cb(progress) }
+    DispatchQueue.main.async {
+        if #available(iOS 26.0, *), let task = HybridS3BgUploader.sharedBgTask {
+            task.progress.completedUnitCount = Int64(percentage)
+            task.updateTitle("Upload", subtitle: "\(Int(percentage))%")
+        }
+        HybridS3BgUploader.sharedProgressCallback?(progress)
+    }
 }
 
 class HybridS3BgUploader: HybridS3BgUploaderSpec {
 
     fileprivate static var sharedProgressCallback: ((_ progress: UploadProgress) -> Void)?
+    @available(iOS 26.0, *)
+    fileprivate static weak var sharedBgTask: BGContinuedProcessingTask?
 
     func setProgressCallback(callback: Variant_NullType____progress__UploadProgress_____Void?) throws -> Void {
         if case .second(let fn) = callback {
@@ -43,21 +56,60 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
         return Double(add(Int32(num1), Int32(num2)))
     }
 
-    func uploadFile(filePath: String) throws -> Promise<Void> {
-        return Promise.async {
-            if HybridS3BgUploader.sharedProgressCallback != nil {
-                set_progress_callback(rustProgressBridge)
+    func uploadFile(filePath: String) throws -> Void {
+        if #available(iOS 26.0, *) {
+            registerBgTask(filePath)
+            runBgTask()
+        } else {
+            DispatchQueue.global(qos: .userInitiated).async {
+                if HybridS3BgUploader.sharedProgressCallback != nil {
+                    set_progress_callback(rustProgressBridge)
+                }
+                let _ = filePath.withCString { cPath in upload_file(cPath) }
+                set_progress_callback(nil)
             }
+        }
+    }
 
-            let success = filePath.withCString { cPath in
-                upload_file(cPath) == 0
+    @available(iOS 26.0, *)
+    private func registerBgTask(_ filePath: String) {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: taskId, using: nil) { task in
+            guard let task = task as? BGContinuedProcessingTask else { return }
+
+            HybridS3BgUploader.sharedBgTask = task
+            task.expirationHandler = {}
+
+            task.progress.totalUnitCount = 100
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                if HybridS3BgUploader.sharedProgressCallback != nil {
+                    set_progress_callback(rustProgressBridge)
+                }
+                let success = filePath.withCString { cPath in
+                    upload_file(cPath) == 0
+                }
+                set_progress_callback(nil)
+
+                DispatchQueue.main.async {
+                    HybridS3BgUploader.sharedBgTask = nil
+                    task.setTaskCompleted(success: success)
+                }
             }
+        }
+    }
 
-            set_progress_callback(nil)
-
-            if !success {
-                throw RuntimeError.error(withMessage: "Upload failed")
-            }
+    @available(iOS 26.0, *)
+    private func runBgTask() {
+        let request = BGContinuedProcessingTaskRequest(
+            identifier: taskId,
+            title: "Upload",
+            subtitle: "Running..."
+        )
+        request.strategy = .queue
+        do {
+            try BGTaskScheduler.shared.submit(request)
+        } catch {
+            print(error)
         }
     }
 }

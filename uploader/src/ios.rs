@@ -18,7 +18,7 @@ use crate::core::{
 };
 use crate::core::api::{CompleteRequest, UploadUrlsResponse};
 use crate::core::chunk::{self, ChunkInfo};
-use crate::core::progress::{ProgressNotifier};
+use crate::core::progress::{ProgressNotifier, UploadStatus};
 use crate::core::retry::{self, RetryPolicy};
 use crate::ios::progress::{self as iosProgress, ProgressReader};
 
@@ -75,11 +75,20 @@ fn upload_file_internal(file_path: &str) -> Result<(), Box<dyn std::error::Error
         .map_err(|e| format!("Failed to generate chunk infos: {}", e))?;
 
     // Chunks parallel hochladen
-    let completed_parts = upload_chunks_parallel(file_path, &chunk_infos)?;
+    let completed_parts = upload_chunks_parallel(file_path, &chunk_infos)
+        .map_err(|e| {
+            iosProgress::update_progress(|m| m.set_status(UploadStatus::Failed));
+            e
+        })?;
 
     // Upload abschließen
-    api::complete_upload(&client, &upload_info, completed_parts)?;
+    api::complete_upload(&client, &upload_info, completed_parts)
+        .map_err(|e| {
+            iosProgress::update_progress(|m| m.set_status(UploadStatus::Failed));
+            e
+        })?;
 
+    iosProgress::update_progress(|m| m.set_status(UploadStatus::Finished));
     Ok(())
 }
 

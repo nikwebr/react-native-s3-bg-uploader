@@ -10,6 +10,7 @@ import {
 } from 'react-native';
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
 import { pickSingle, isCancel, types } from 'react-native-document-picker';
+import { UploadState } from '../src/specs/s3-bg-uploader.types';
 
 interface UploadProgress {
   totalBytes: number;
@@ -17,6 +18,7 @@ interface UploadProgress {
   completedParts: number;
   totalParts: number;
   percentage: number;
+  state: UploadState;
 }
 
 function formatBytes(bytes: number): string {
@@ -99,21 +101,32 @@ function App(): React.JSX.Element {
 
     S3BgUploader.setProgressCallback((p: UploadProgress) => {
       setProgress({ ...p });
+      console.log(p);
+      switch (p.state) {
+        case "FINISHED":
+          setUploadState('success');
+          setUploading(false);
+          S3BgUploader.setProgressCallback(null);
+          break;
+        case "FAILED":
+          setUploadState('error');
+           setUploading(false);
+          S3BgUploader.setProgressCallback(null);
+          break;
+        default:
+          break;
+      }
     });
 
     try {
       if (Platform.OS === 'web') {
-        await S3BgUploader.uploadFile(webFile!);
+        S3BgUploader.uploadFile(webFile!);
       } else {
-        await S3BgUploader.uploadFile(nativePath!);
+        S3BgUploader.uploadFile(nativePath!);
       }
-      setUploadState('success');
     } catch (e: unknown) {
       setErrorMsg((e as Error)?.message ?? String(e));
       setUploadState('error');
-    } finally {
-      setUploading(false);
-      S3BgUploader.setProgressCallback(null);
     }
   }, [webFile, nativePath]);
 

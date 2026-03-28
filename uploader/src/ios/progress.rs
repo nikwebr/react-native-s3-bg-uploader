@@ -27,13 +27,13 @@ pub extern "C" fn get_upload_progress_json() -> *const c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn set_progress_callback(callback: Option<extern "C" fn(u64, u64, u32, u32, f64)>) {
+pub extern "C" fn set_progress_callback(callback: Option<extern "C" fn(u64, u64, u32, u32, f64, *const c_char)>) {
     let mut cb = PROGRESS_CALLBACK.lock().unwrap();
     *cb = callback;
 }
 
 pub struct IosProgressNotifier;
-pub type ProgressCallback = extern "C" fn(u64, u64, u32, u32, f64);
+pub type ProgressCallback = extern "C" fn(u64, u64, u32, u32, f64, *const c_char);
 
 
 impl ProgressNotifier for IosProgressNotifier {
@@ -96,12 +96,14 @@ impl Seek for ProgressReader {
 fn notify_progress(progress: &UploadProgress) {
     let callback = PROGRESS_CALLBACK.lock().unwrap();
     if let Some(cb) = *callback {
+        let status_cstr = CString::new(progress.status.as_str()).unwrap_or_default();
         cb(
             progress.total_bytes,
             progress.uploaded_bytes(),
             progress.completed_parts,
             progress.total_parts,
             progress.percentage(),
+            status_cstr.as_ptr(),
         );
     }
 }

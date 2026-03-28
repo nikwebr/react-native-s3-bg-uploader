@@ -15,6 +15,7 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IOS_RUST_DIR="$SCRIPT_DIR/../../ios/rust"
 TARGET_DIR="$SCRIPT_DIR/../target"
+IOS_MIN_VERSION="15.1" # same as React Native's min_ios_version_supported
 
 ensure_deps() {
     echo -e "${BLUE}🔍 Checking dependencies...${NC}"
@@ -86,20 +87,6 @@ if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
     echo -e "${BLUE}📱 Building for iOS Simulator x86_64 (x86_64-apple-ios)...${NC}"
     cargo build --features ios --target x86_64-apple-ios --release
 
-    echo -e "${BLUE}🔗 Creating universal simulator fat library (lipo)...${NC}"
-    mkdir -p $TARGET_DIR/universal-ios-sim/release
-    lipo -create \
-        $TARGET_DIR/aarch64-apple-ios-sim/release/libuploader.a \
-        $TARGET_DIR/x86_64-apple-ios/release/libuploader.a \
-        -output $TARGET_DIR/universal-ios-sim/release/libuploader.a
-
-    echo -e "${BLUE}📦 Creating XCFramework...${NC}"
-    rm -rf $TARGET_DIR/libuploader.xcframework
-    xcodebuild -create-xcframework \
-        -library $TARGET_DIR/aarch64-apple-ios/release/libuploader.a \
-        -library $TARGET_DIR/universal-ios-sim/release/libuploader.a \
-        -output $TARGET_DIR/libuploader.xcframework
-
     mkdir -p "$IOS_RUST_DIR"
 
     echo -e "${BLUE}🔤 Generating header with cbindgen...${NC}"
@@ -110,6 +97,79 @@ if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
         echo -e "${RED}⚠ cbindgen not found – header not regenerated. Install with:${NC}"
         echo "  cargo install cbindgen"
     fi
+
+    echo -e "${BLUE}🔧 Fixing dylib install names...${NC}"
+    install_name_tool -id "@rpath/libuploader.framework/libuploader" \
+        $TARGET_DIR/aarch64-apple-ios/release/libuploader.dylib
+    install_name_tool -id "@rpath/libuploader.framework/libuploader" \
+        $TARGET_DIR/aarch64-apple-ios-sim/release/libuploader.dylib
+    install_name_tool -id "@rpath/libuploader.framework/libuploader" \
+        $TARGET_DIR/x86_64-apple-ios/release/libuploader.dylib
+
+    echo -e "${BLUE}🔗 Creating universal simulator fat dylib (lipo)...${NC}"
+    mkdir -p $TARGET_DIR/universal-ios-sim/release
+    lipo -create \
+        $TARGET_DIR/aarch64-apple-ios-sim/release/libuploader.dylib \
+        $TARGET_DIR/x86_64-apple-ios/release/libuploader.dylib \
+        -output $TARGET_DIR/universal-ios-sim/release/libuploader.dylib
+
+    echo -e "${BLUE}🏗️  Creating .framework bundles...${NC}"
+
+    make_framework() {
+        local DYLIB="$1"
+        local OUT_FW="$2"
+        local MIN_OS="$3"
+
+        rm -rf "$OUT_FW"
+        mkdir -p "$OUT_FW"
+        cp "$DYLIB" "$OUT_FW/libuploader"
+        cat > "$OUT_FW/Info.plist" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>libuploader</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.rust.libuploader</string>
+    <key>CFBundleName</key>
+    <string>libuploader</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>MinimumOSVersion</key>
+    <string>$MIN_OS</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>iPhoneOS</string>
+    </array>
+</dict>
+</plist>
+PLISTEOF
+    }
+
+    FW_DIR="$TARGET_DIR/frameworks"
+    rm -rf "$FW_DIR"
+
+    make_framework \
+        "$TARGET_DIR/aarch64-apple-ios/release/libuploader.dylib" \
+        "$FW_DIR/ios-arm64/libuploader.framework" \
+        "$IOS_MIN_VERSION"
+
+    make_framework \
+        "$TARGET_DIR/universal-ios-sim/release/libuploader.dylib" \
+        "$FW_DIR/ios-sim/libuploader.framework" \
+        "$IOS_MIN_VERSION"
+
+    echo -e "${BLUE}📦 Creating XCFramework...${NC}"
+    rm -rf $TARGET_DIR/libuploader.xcframework
+    xcodebuild -create-xcframework \
+        -framework "$FW_DIR/ios-arm64/libuploader.framework" \
+        -framework "$FW_DIR/ios-sim/libuploader.framework" \
+        -output $TARGET_DIR/libuploader.xcframework
 
     echo -e "${BLUE}📋 Copying artifacts to ios/rust/...${NC}"
     rm -rf "$IOS_RUST_DIR/libuploader.xcframework"
