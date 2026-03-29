@@ -1,0 +1,54 @@
+name: Build Web
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build WASM lib + Web App
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: uploader
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies (bun)
+        working-directory: .
+        run: bun install
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            uploader/target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('uploader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.110 --locked
+
+      - name: Build WASM library
+        run: ./scripts/build.sh wasm
+
+      - name: Build example web app
+        working-directory: example
+        run: npx webpack --config webpack.config.js --mode production
