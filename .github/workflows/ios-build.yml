@@ -54,9 +54,7 @@ jobs:
       - name: Install Pods
         working-directory: example/ios
         run: npm run pod
-        
-      - name: Install iOS Platform
-        run: xcodebuild -downloadPlatform iOS
+      
 
       - name: Build App
         working-directory: example/ios
