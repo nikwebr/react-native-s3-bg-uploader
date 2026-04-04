@@ -8,7 +8,8 @@ crate-type = ["staticlib", "cdylib"]
 
 [features]
 ios = ["nyquest"]
-wasm = ["wasm-bindgen", "wasm-bindgen-file-reader", "web-sys", "reqwest", "wasm-bindgen-futures", "js-sys", "futures"]
+android = ["jni", "reqwest", "reqwest/blocking", "reqwest/rustls-tls-webpki-roots", "android_logger", "log", "libc"]
+wasm = ["wasm-bindgen", "wasm-bindgen-file-reader", "web-sys", "wasm-bindgen-futures", "js-sys", "futures"]
 
 [dependencies]
 # https://github.com/rustwasm/wasm-bindgen
@@ -27,8 +28,16 @@ futures = { version = "0.3", optional = true }
 nyquest = { version = "0.3", optional = true, features = ["blocking"] }
 nyquest-backend-nsurlsession = { version = "0.3", features = ["blocking"] }
 
-# For WASM networking
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
+# For Android and WASM networking
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "blocking"] }
+
+# For Android JNI
+jni = { version = "0.21", optional = true, default-features = false }
+libc = { version = "0.2", optional = true }
+
+# For Android logging
+log = { version = "0.4", optional = true }
+android_logger = { version = "0.14", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 

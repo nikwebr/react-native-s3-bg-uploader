@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   Text,
   View,
@@ -7,9 +7,10 @@ import {
   Platform,
   ActivityIndicator,
   ScrollView,
+  PermissionsAndroid,
 } from 'react-native';
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
-import { pickSingle, isCancel, types } from 'react-native-document-picker';
+import { pick, isCancel, types } from '@react-native-documents/picker';
 import { UploadState } from '../src/specs/s3-bg-uploader.types';
 
 interface UploadProgress {
@@ -44,12 +45,16 @@ function App(): React.JSX.Element {
   const [errorMsg, setErrorMsg] = useState('');
   const webInputRef = useRef<HTMLInputElement | null>(null);
 
-  // iOS: use react-native-document-picker
+  useEffect(() => {
+    if (Platform.OS === 'android' && Platform.Version >= 33) {
+      PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+    }
+  }, []);
+
   const handlePickNative = useCallback(async () => {
     try {
-      const result = await pickSingle({ type: [types.allFiles], copyTo: 'cachesDirectory' });
-      // Use fileCopyUri (local cache copy) when available, else fallback to uri
-      const uri = result.fileCopyUri ?? result.uri;
+      const [result] = await pick({ mode: 'open', type: [types.allFiles], allowMultiSelection: false });
+      const uri = result.uri;
       setNativePath(uriToPath(uri));
       setFileName(result.name ?? uri);
       setUploadState('idle');

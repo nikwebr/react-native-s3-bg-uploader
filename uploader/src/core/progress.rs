@@ -48,12 +48,14 @@ impl UploadProgress {
         self.completed_bytes + in_flight_sum
     }
 
-    // considers completed & in-flight chunks
     pub fn percentage(&self) -> f64 {
+        if self.status == UploadStatus::Finished {
+            return 100.0;
+        }
         if self.total_bytes == 0 {
             return 0.0;
         }
-        (self.uploaded_bytes() as f64 / self.total_bytes as f64) * 100.0
+        ((self.uploaded_bytes() as f64 / self.total_bytes as f64) * 100.0).min(100.0)
     }
 
     fn update_in_flight(&mut self, part_number: u32, bytes_uploaded: u64) {
@@ -110,7 +112,6 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         *progress = Some(UploadProgress::new(total_bytes, total_parts));
         if let Some(ref p) = *progress {
             let snapshot = p.clone();
-            drop(progress);
             self.notifier.notify(&snapshot);
         }
     }
@@ -120,7 +121,6 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         if let Some(ref mut p) = *progress {
             p.update_in_flight(part_number, bytes_uploaded);
             let snapshot = p.clone();
-            drop(progress);
             self.notifier.notify(&snapshot);
         }
     }
@@ -130,7 +130,6 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         if let Some(ref mut p) = *progress {
             p.complete_chunk(part_number, chunk_size);
             let snapshot = p.clone();
-            drop(progress);
             self.notifier.notify(&snapshot);
         }
     }
@@ -140,7 +139,6 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         if let Some(ref mut p) = *progress {
             p.status = status;
             let snapshot = p.clone();
-            drop(progress);
             self.notifier.notify(&snapshot);
         }
     }

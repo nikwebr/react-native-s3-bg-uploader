@@ -128,6 +128,65 @@ repositories {
   google()
 }
 
+// ── Rust / cargo-ndk build ──────────────────────────────────────────────────
+def uploaderDir = new File(projectDir, "../uploader").canonicalPath
+def jniLibsDir = new File(projectDir, "src/main/jniLibs").canonicalPath
+
+// ABI → cargo-ndk target mapping
+def abiToTarget = [
+  "arm64-v8a"    : "arm64-v8a",
+  "armeabi-v7a"  : "armeabi-v7a",
+  "x86_64"       : "x86_64",
+  "x86"          : "x86",
+]
+
+task buildRustAndroid {
+  def abis = reactNativeArchitectures()
+  inputs.dir("$uploaderDir/src")
+  inputs.file("$uploaderDir/Cargo.toml")
+  outputs.dir(jniLibsDir)
+
+  doLast {
+    def buildType = gradle.startParameter.taskNames.any { it.toLowerCase().contains("release") } ? "release" : "debug"
+    def cargoFlags = buildType == "release" ? ["--release"] : []
+
+    abis.each { abi ->
+      def cmd = ["cargo", "ndk", "-t", abi, "build", "--features", "android"] + cargoFlags
+      def proc = new ProcessBuilder(cmd)
+          .directory(new File(uploaderDir))
+          .inheritIO()
+          .start()
+      def exitCode = proc.waitFor()
+      if (exitCode != 0) {
+        throw new Exception("cargo ndk failed for $abi (exit $exitCode)")
+      }
+
+      // copy .so into jniLibs/<abi>/
+      def targetSubdir = buildType == "release" ? "release" : "debug"
+      def soSrc = new File("$uploaderDir/target/${abiToNdkRustTarget(abi)}/$targetSubdir/libuploader.so")
+      def soDestDir = new File("$jniLibsDir/$abi")
+      soDestDir.mkdirs()
+      java.nio.file.Files.copy(
+          soSrc.toPath(),
+          new File(soDestDir, "libuploader.so").toPath(),
+          java.nio.file.StandardCopyOption.REPLACE_EXISTING
+      )
+    }
+  }
+}
+
+def abiToNdkRustTarget(String abi) {
+  switch (abi) {
+    case "arm64-v8a":    return "aarch64-linux-android"
+    case "armeabi-v7a":  return "armv7-linux-androideabi"
+    case "x86_64":       return "x86_64-linux-android"
+    case "x86":          return "i686-linux-android"
+    default: throw new Exception("Unknown ABI: $abi")
+  }
+}
+
+preBuild.dependsOn buildRustAndroid
+// ───────────────────────────────────────────────────────────────────────────
 
 dependencies {
   // For < 0.71, this will be from the local maven repo
