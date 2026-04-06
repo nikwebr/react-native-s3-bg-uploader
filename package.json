@@ -17,6 +17,7 @@
     "build:ts": "npm run typecheck && bob build",
     "build": "npm run build:ts && npm run build:ios && npm run build:wasm",
     "example:ios": "npm run build:ios && cd example/ios && npm run pod && npm run ios",
+    "example:android": "cd example && npm run android",
     "example:web": "npm run build:wasm && cd example && npm run web"
   },
   "keywords": [
