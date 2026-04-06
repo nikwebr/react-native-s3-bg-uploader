@@ -13,7 +13,7 @@ module.exports = {
     alias: {
       'react-native$': 'react-native-web',
       'react-native-s3-bg-uploader': path.resolve(rootDir, 'src/index.web.ts'),
-      'react-native-document-picker': path.resolve(__dirname, 'stubs/react-native-document-picker.js'),
+      '@react-native-documents/picker': path.resolve(__dirname, 'stubs/react-native-document-picker.js'),
     },
     extensions: ['.web.tsx', '.web.ts', '.web.js', '.tsx', '.ts', '.js', '.json'],
   },

@@ -4,30 +4,7 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/android-build.yml'
-      - 'example/android/**'
-      - 'nitrogen/generated/shared/**'
-      - 'nitrogen/generated/android/**'
-      - 'cpp/**'
-      - 'android/**'
-      - '**/bun.lock'
-      - '**/react-native.config.js'
-      - '**/nitro.json'
   pull_request:
-    paths:
-      - '.github/workflows/android-build.yml'
-      - 'example/android/**'
-      - '**/nitrogen/generated/shared/**'
-      - '**/nitrogen/generated/android/**'
-      - 'cpp/**'
-      - 'android/**'
-      - '**/bun.lock'
-      - '**/react-native.config.js'
-      - '**/nitro.json'
   workflow_dispatch:
 
 concurrency:
@@ -52,6 +29,25 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            uploader/target
+          key: ${{ runner.os }}-rust-${{ hashFiles('uploader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-
+
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
@@ -61,6 +57,9 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('example/android/**/*.gradle*') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
+
+      - name: Generate Nitro bindings
+        run: bun run native-codegen
 
       - name: Run Gradle build
         working-directory: example/android

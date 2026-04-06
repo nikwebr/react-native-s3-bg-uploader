@@ -3,6 +3,9 @@ mod core;
 #[cfg(feature = "ios")]
 mod ios;
 
+#[cfg(feature = "android")]
+mod android;
+
 #[cfg(feature = "wasm")]
 mod wasm;
 
@@ -146,7 +149,6 @@ fn log_to_browser(log_msg: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn it_works() {

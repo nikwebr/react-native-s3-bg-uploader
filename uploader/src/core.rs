@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 
 pub const MAX_CONCURRENT_UPLOADS: usize = 4;
-pub const MAX_RETRIES: usize = 3;
+pub const MAX_RETRIES: usize = 5;
 pub const UPLOAD_BASE_URL: &str = "https://development1.ysendit.com/upload/MobileS3";
 
 /// Ergebnis eines Chunk-Uploads
