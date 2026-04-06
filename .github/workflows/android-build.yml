@@ -39,6 +39,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
+      - name: Generate Nitro bindings
+        run: bun run native-codegen
+
       - name: Run Gradle build
         working-directory: example/android
         run: ./gradlew assembleDebug --no-daemon --build-cache
