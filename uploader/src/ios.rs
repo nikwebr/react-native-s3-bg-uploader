@@ -201,12 +201,13 @@ fn upload_chunk_with_retry(
 
             match client.request(request) {
                 Ok(response) => {
-                    // Chunk als abgeschlossen markieren
-                    iosProgress::update_progress(|m| m.complete_chunk(part_number, chunk_size));
-
                     // ETag aus Response Headers extrahieren
                     match response.get_header("etag") {
-                        Ok(etag_vec) if !etag_vec.is_empty() => Ok(clean_etag(&etag_vec[0])),
+                        Ok(etag_vec) if !etag_vec.is_empty() => {
+                            // Chunk erst nach erfolgreich extrahiertem ETag als abgeschlossen markieren
+                            iosProgress::update_progress(|m| m.complete_chunk(part_number, chunk_size));
+                            Ok(clean_etag(&etag_vec[0]))
+                        }
                         _ => Err("No ETag in response".to_string()),
                     }
                 }

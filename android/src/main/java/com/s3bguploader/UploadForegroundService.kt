@@ -18,6 +18,7 @@ class UploadForegroundService : Service() {
     private val progressLock = Any()
     private var lastProgressMs = 0L
     private var lastPercentage = -1.0
+    @Volatile private var destroyed = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -87,6 +88,7 @@ class UploadForegroundService : Service() {
                     }
 
                     if (!shouldUpdate) return
+                    if (destroyed) return
 
                     val label = when (uploadState) {
                         UploadState.FINISHED -> "Upload abgeschlossen"
@@ -111,6 +113,18 @@ class UploadForegroundService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
+    }
+
+    override fun onDestroy() {
+        destroyed = true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIFICATION_ID)
+        super.onDestroy()
     }
 
     private fun updateNotification(text: String, progressPct: Int, indeterminate: Boolean) {
