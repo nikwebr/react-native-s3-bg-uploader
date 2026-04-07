@@ -31,7 +31,8 @@ private func rustProgressBridge(
     )
     DispatchQueue.main.async {
         if #available(iOS 26.0, *), let task = HybridS3BgUploader.sharedBgTask {
-            task.progress.completedUnitCount = Int64(percentage)
+            task.progress.totalUnitCount = Int64(totalBytes)
+            task.progress.completedUnitCount = Int64(uploadedBytes)
             task.updateTitle("Upload", subtitle: "\(Int(percentage))%")
         }
         HybridS3BgUploader.sharedProgressCallback?(progress)
@@ -78,8 +79,6 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
 
             HybridS3BgUploader.sharedBgTask = task
             task.expirationHandler = {}
-
-            task.progress.totalUnitCount = 100
 
             DispatchQueue.global(qos: .userInitiated).async {
                 if HybridS3BgUploader.sharedProgressCallback != nil {
