@@ -47,10 +47,13 @@ fn notify_progress(progress: &UploadProgress) {
     }
 }
 
+const NOTIFY_EVERY_BYTES: u64 = 256 * 1024; // alle 256 KB
+
 pub struct ProgressReader {
     inner: Cursor<Vec<u8>>,
     part_number: u32,
     bytes_read: u64,
+    last_notified: u64,
 }
 
 impl ProgressReader {
@@ -59,6 +62,7 @@ impl ProgressReader {
             inner: Cursor::new(data),
             part_number,
             bytes_read: 0,
+            last_notified: 0,
         }
     }
 }
@@ -68,7 +72,10 @@ impl Read for ProgressReader {
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.bytes_read += n as u64;
-            update_progress(|m| m.update_in_flight(self.part_number, self.bytes_read));
+            if self.bytes_read - self.last_notified >= NOTIFY_EVERY_BYTES {
+                self.last_notified = self.bytes_read;
+                update_progress(|m| m.update_in_flight(self.part_number, self.bytes_read));
+            }
         }
         Ok(n)
     }
@@ -79,6 +86,7 @@ impl Seek for ProgressReader {
         let new_pos = self.inner.seek(pos)?;
         // Reset bei Seek (für Retry-Szenarien)
         self.bytes_read = new_pos;
+        self.last_notified = new_pos;
         Ok(new_pos)
     }
 }

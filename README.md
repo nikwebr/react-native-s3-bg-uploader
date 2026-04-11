@@ -29,6 +29,7 @@ npm install react-native-s3-bg-uploader react-native-nitro-modules
 For native platforms:
 ```bash
 npm run build:ios
+npm run build:android
 ```
 
 For web:
@@ -42,11 +43,26 @@ npm run build:wasm
 ### Example
 ```bash
 npm run example:ios
+npm run example:android
 npm run example:web
 ```
 
 > [!IMPORTANT]  
 > The iOS example app does only work on a physical device and does not work on the simulator because the simulator does not support BGContinuedProcessingTask
+
+### Production Builds
+#### Android
+Follow the instructions [here](https://reactnative.dev/docs/signed-apk-android#generating-an-upload-key) to generate an upload key and to set required gradle variables.
+
+After that:
+```bash
+cd example
+npx react-native build-android --mode=release
+npm run android -- --mode="release"
+```
+
+#### iOS
+Change build configuration to production inside XCode: Open S3BackgroundUploaderExample.xcworkspace and edit the scheme.
 
 ## Troubleshooting
 ### ReferenceError: Can't find variable: wasm_bindgen

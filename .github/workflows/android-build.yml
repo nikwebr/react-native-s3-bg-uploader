@@ -59,7 +59,7 @@ jobs:
             ${{ runner.os }}-gradle-
 
       - name: Generate Nitro bindings
-        run: bun run native-codegen
+        run: bun run build:android
 
       - name: Run Gradle build
         working-directory: example/android

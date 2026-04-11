@@ -68,12 +68,59 @@ ensure_ios_deps() {
 }
 
 
-if [[ "$1" == "ios" ]] || [[ "$1" == "wasm" ]] || [[ "$1" == "all" ]]; then
+JNILIBS_DIR="$SCRIPT_DIR/../../android/src/main/jniLibs"
+
+ANDROID_ABIS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
+
+abi_to_rust_target() {
+    case "$1" in
+        "arm64-v8a")   echo "aarch64-linux-android" ;;
+        "armeabi-v7a") echo "armv7-linux-androideabi" ;;
+        "x86_64")      echo "x86_64-linux-android" ;;
+        "x86")         echo "i686-linux-android" ;;
+    esac
+}
+
+ensure_android_deps() {
+    echo -e "${BLUE}🔍 Checking Android dependencies...${NC}"
+
+    if ! command -v cargo-ndk &> /dev/null; then
+        echo -e "${BLUE}  cargo-ndk not found – installing...${NC}"
+        cargo install cargo-ndk
+    else
+        echo -e "${GREEN}✓ cargo-ndk $(cargo ndk --version 2>/dev/null | head -1)${NC}"
+    fi
+
+    local android_targets=(
+        "aarch64-linux-android"
+        "armv7-linux-androideabi"
+        "x86_64-linux-android"
+        "i686-linux-android"
+    )
+    local installed_targets
+    installed_targets=$(rustup target list --installed)
+    for target in "${android_targets[@]}"; do
+        if echo "$installed_targets" | grep -q "^$target$"; then
+            echo -e "${GREEN}✓ $target${NC}"
+        else
+            echo -e "${BLUE}  Installing $target...${NC}"
+            rustup target add "$target"
+        fi
+    done
+
+    echo ""
+}
+
+if [[ "$1" == "ios" ]] || [[ "$1" == "wasm" ]] || [[ "$1" == "android" ]] || [[ "$1" == "all" ]]; then
     ensure_deps
 fi
 
 if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
     ensure_ios_deps
+fi
+
+if [[ "$1" == "android" ]] || [[ "$1" == "all" ]]; then
+    ensure_android_deps
 fi
 
 # iOS Build (Device + Simulator, universal fat library)
@@ -181,6 +228,29 @@ PLISTEOF
     echo ""
 fi
 
+# Android Build (all ABIs via cargo-ndk)
+if [[ "$1" == "android" ]] || [[ "$1" == "all" ]]; then
+    echo -e "${BLUE}🤖 Building for Android (all ABIs)...${NC}"
+
+    for abi in "${ANDROID_ABIS[@]}"; do
+        rust_target=$(abi_to_rust_target "$abi")
+        echo -e "${BLUE}  Building $abi ($rust_target)...${NC}"
+        cargo ndk -t "$abi" build --features android --release
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}✗ cargo ndk failed for $abi${NC}"
+            exit 1
+        fi
+
+        dest_dir="$JNILIBS_DIR/$abi"
+        mkdir -p "$dest_dir"
+        cp "$TARGET_DIR/$rust_target/release/libuploader.so" "$dest_dir/libuploader.so"
+        echo -e "${GREEN}✓ $abi → android/src/main/jniLibs/$abi/libuploader.so${NC}"
+    done
+
+    echo -e "${GREEN}✓ Android build successful${NC}"
+    echo ""
+fi
+
 # WASM Build
 if [[ "$1" == "wasm" ]] || [[ "$1" == "all" ]]; then
     echo -e "${BLUE}🌐 Building for WASM...${NC}"
@@ -224,12 +294,13 @@ fi
 
 # Usage
 if [[ -z "$1" ]] || [[ "$1" == "help" ]]; then
-    echo "Usage: ./build.sh [ios|wasm|all]"
+    echo "Usage: ./build.sh [ios|android|wasm|all]"
     echo ""
     echo "Examples:"
-    echo "  ./build.sh ios    - Build only for iOS"
-    echo "  ./build.sh wasm   - Build only for WASM"
-    echo "  ./build.sh all    - Build for both platforms"
+    echo "  ./build.sh ios     - Build only for iOS"
+    echo "  ./build.sh android - Build only for Android (all ABIs)"
+    echo "  ./build.sh wasm    - Build only for WASM"
+    echo "  ./build.sh all     - Build for all platforms"
     exit 0
 fi
 
