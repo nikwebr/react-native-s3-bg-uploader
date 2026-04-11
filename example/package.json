@@ -34,7 +34,7 @@
     "@react-native/eslint-config": "0.84.1",
     "@react-native/metro-config": "0.84.1",
     "@react-native/typescript-config": "0.84.1",
-    "@types/jest": "^29.5.13",
+    "@types/jest": "^30.0.0",
     "babel-loader": "^10.1.1",
     "babel-plugin-module-resolver": "^5.0.2",
     "copy-webpack-plugin": "^14.0.0",
