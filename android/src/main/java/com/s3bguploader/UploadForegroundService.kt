@@ -73,13 +73,8 @@ class UploadForegroundService : Service() {
                     val shouldUpdate = synchronized(progressLock) {
                         when {
                             isTerminal -> true
-                            percentage > lastPercentage -> {
+                            (now - lastProgressMs) >= THROTTLE_MS && percentage >= lastPercentage -> {
                                 lastPercentage = percentage
-                                lastProgressMs = now
-                                true
-                            }
-                            // Zeit-Throttle: nur durchlassen wenn percentage nicht rückwärts geht
-                            percentage >= lastPercentage && (now - lastProgressMs) >= THROTTLE_MS -> {
                                 lastProgressMs = now
                                 true
                             }
@@ -97,12 +92,13 @@ class UploadForegroundService : Service() {
                     }
                     updateNotification(label, percentage.toInt(), indeterminate = uploadState == UploadState.RUNNING && percentage <= 0)
 
-                    mainHandler.post {
-                        progressCallback?.invoke(progress)
-                    }
-
                     if (isTerminal) {
+                        val cb = progressCallback
+                        progressCallback = null
+                        mainHandler.post { cb?.invoke(progress) }
                         stopSelf(startId)
+                    } else {
+                        mainHandler.post { progressCallback?.invoke(progress) }
                     }
                 }
             })
@@ -117,6 +113,7 @@ class UploadForegroundService : Service() {
 
     override fun onDestroy() {
         destroyed = true
+        progressCallback = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
