@@ -54,21 +54,22 @@ where
     update_fn(manager);
 }
 
+const NOTIFY_EVERY_BYTES: u64 = 256 * 1024; // alle 256 KB
+
 pub struct ProgressReader {
     inner: Cursor<Vec<u8>>,
     part_number: u32,
     bytes_read: u64,
-    total_size: u64,
+    last_notified: u64,
 }
 
 impl ProgressReader {
     pub fn new(data: Vec<u8>, part_number: u32) -> Self {
-        let total_size = data.len() as u64;
         Self {
             inner: Cursor::new(data),
             part_number,
             bytes_read: 0,
-            total_size,
+            last_notified: 0,
         }
     }
 }
@@ -78,7 +79,10 @@ impl Read for ProgressReader {
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.bytes_read += n as u64;
-            update_progress(|m| m.update_in_flight(self.part_number, self.bytes_read));
+            if self.bytes_read - self.last_notified >= NOTIFY_EVERY_BYTES {
+                self.last_notified = self.bytes_read;
+                update_progress(|m| m.update_in_flight(self.part_number, self.bytes_read));
+            }
         }
         Ok(n)
     }
@@ -87,8 +91,9 @@ impl Read for ProgressReader {
 impl Seek for ProgressReader {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let new_pos = self.inner.seek(pos)?;
-        // Reset bytes_read bei Seek (für Retry-Szenarien)
+        // Reset bei Seek (für Retry-Szenarien)
         self.bytes_read = new_pos;
+        self.last_notified = new_pos;
         Ok(new_pos)
     }
 }
