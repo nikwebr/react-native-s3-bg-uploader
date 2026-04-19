@@ -9,11 +9,18 @@ crate-type = ["staticlib", "cdylib"]
 [features]
 ios = ["nyquest"]
 android = ["jni", "reqwest", "reqwest/blocking", "reqwest/rustls-tls-webpki-roots", "android_logger", "log", "libc"]
-wasm = ["wasm-bindgen", "wasm-bindgen-file-reader", "web-sys", "wasm-bindgen-futures", "js-sys", "futures"]
+wasm = ["wasm-bindgen", "wasm-bindgen-file-reader", "web-sys", "wasm-bindgen-futures", "js-sys", "futures", "console_error_panic_hook", "rexie"]
 
 [dependencies]
+sha2 = "0.10"
+indexmap = { version = "2", features = ["serde"] }
+
+# Native persistence (iOS / Android)
+redb = { version = "2", optional = false }
+
 # https://github.com/rustwasm/wasm-bindgen
-wasm-bindgen = { version = "0.2.88", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
 
 # https://github.com/Badel2/wasm-bindgen-file-reader
 wasm-bindgen-file-reader = { version = "1.0.0", optional = true }
@@ -41,20 +48,23 @@ android_logger = { version = "0.14", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 
+# WASM persistence
+rexie = { version = "0.6", optional = true }
+
 # Allows us to access browser elements like the console via Rust
 # https://docs.rs/web-sys/latest/web_sys/
 [dependencies.web-sys]
 optional = true
 version = "0.3.60"
 # Log to the browser console from Rust code
-features = [ 
-    "console", 
-    "Headers", 
-    "Request", 
-    "RequestInit", 
-    "RequestMode", 
-    "Response", 
-    "Window", 
+features = [
+    "console",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Window",
     "WorkerGlobalScope",
     "XmlHttpRequest",
     "XmlHttpRequestUpload",

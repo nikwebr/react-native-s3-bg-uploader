@@ -1,41 +1,31 @@
-use crate::core::api::{CompleteRequest, UploadUrlsResponse};
-use crate::core::{complete_upload_endpoint, get_urls_endpoint, ChunkUploadResult};
+use std::collections::HashMap;
+use crate::core::api::{self, StartUploadResponse};
+use crate::core::ChunkUploadResult;
 
-pub fn fetch_upload_urls(
+pub fn start_upload(
     client: &nyquest::BlockingClient,
+    file_name: &str,
+    file_hash: &str,
     file_size: u64,
-) -> Result<UploadUrlsResponse, Box<dyn std::error::Error>> {
-    let url = get_urls_endpoint(file_size);
-    let request = nyquest::Request::post(url);
-    let response = client
-        .request(request)
-        .map_err(|e| format!("Failed to get upload URLs: {:?}", e))?;
-
-    let response_body = response
-        .text()
-        .map_err(|e| format!("Failed to read response body: {:?}", e))?;
-
-    serde_json::from_str(&response_body)
-        .map_err(|e| format!("Failed to parse upload URLs response: {:?}", e).into())
+    user_params: &HashMap<String, String>,
+) -> Result<StartUploadResponse, Box<dyn std::error::Error>> {
+    api::start_upload(client, file_name, file_hash, file_size, user_params)
 }
 
+pub fn fetch_upload_urls_batch(
+    client: &nyquest::BlockingClient,
+    file_key: &str,
+    upload_id: &str,
+    part_numbers: &[u32],
+) -> Result<HashMap<u32, String>, Box<dyn std::error::Error>> {
+    api::fetch_upload_urls_batch(client, file_key, upload_id, part_numbers)
+}
 
 pub fn complete_upload(
     client: &nyquest::BlockingClient,
-    upload_info: &UploadUrlsResponse,
+    file_key: &str,
+    upload_id: &str,
     results: Vec<ChunkUploadResult>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parts = CompleteRequest::from_upload_results(results);
-    let complete_url = complete_upload_endpoint(&upload_info.upload_id, &upload_info.key);
-    let body_json = parts.serialize()
-        .map_err(|e| format!("Failed to serialize complete request: {}", e))?;
-
-    let body = nyquest::Body::bytes(body_json.into_bytes(), "application/json");
-    let request = nyquest::Request::post(complete_url).with_body(body);
-
-    client
-        .request(request)
-        .map_err(|e| format!("Failed to complete upload: {:?}", e))?;
-
-    Ok(())
+    api::complete_upload(client, file_key, upload_id, results)
 }

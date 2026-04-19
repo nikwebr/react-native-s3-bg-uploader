@@ -8,18 +8,22 @@ import {
   ActivityIndicator,
   ScrollView,
   PermissionsAndroid,
+  TextInput,
 } from 'react-native';
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
 import { pick, isCancel, types } from '@react-native-documents/picker';
-import { UploadState } from '../src/specs/s3-bg-uploader.types';
+import type { UploadProgress, AggregateProgress } from '../src/specs/s3-bg-uploader.types';
 
-interface UploadProgress {
-  totalBytes: number;
-  uploadedBytes: number;
-  completedParts: number;
-  totalParts: number;
-  percentage: number;
-  state: UploadState;
+// ---------------------------------------------------------------------------
+// Config — point these at your own backend
+// ---------------------------------------------------------------------------
+const START_UPLOAD_API = 'https://development1.ysendit.com/upload/MobileS3/startUpload';
+const GET_UPLOAD_URLS_API = 'https://development1.ysendit.com/upload/MobileS3/getUploadUrls';
+const COMPLETE_API = 'https://development1.ysendit.com/upload/MobileS3/complete';
+
+let transferCounter = 0;
+function nextTransferId(): string {
+  return `transfer-${++transferCounter}`;
 }
 
 function formatBytes(bytes: number): string {
@@ -30,114 +34,230 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
-// Strip file:// prefix for native Rust C path
 function uriToPath(uri: string): string {
   return uri.startsWith('file://') ? decodeURIComponent(uri.slice(7)) : uri;
 }
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+interface QueuedFile {
+  id: string;
+  name: string;
+  // native path or web File object
+  path?: string;
+  webFile?: File;
+  transferId: string;
+  // filled once upload starts
+  fileKey?: string;
+  progress?: UploadProgress;
+}
+
+type SessionState = 'idle' | 'running' | 'paused';
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
 function App(): React.JSX.Element {
-  const [fileName, setFileName] = useState<string | null>(null);
-  const [nativePath, setNativePath] = useState<string | null>(null);
-  const [webFile, setWebFile] = useState<File | null>(null);
-  const [progress, setProgress] = useState<UploadProgress | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [uploadState, setUploadState] = useState<'idle' | 'success' | 'error'>('idle');
+  const [queue, setQueue] = useState<QueuedFile[]>([]);
+  const [sessionProgress, setSessionProgress] = useState<AggregateProgress | null>(null);
+  // transferId -> AggregateProgress
+  const [transferProgress, setTransferProgress] = useState<Record<string, AggregateProgress>>({});
+  const [sessionState, setSessionState] = useState<SessionState>('idle');
   const [errorMsg, setErrorMsg] = useState('');
+  const [transferIdInput, setTransferIdInput] = useState('transfer-1');
+
+  // Web only: hidden file input
   const webInputRef = useRef<HTMLInputElement | null>(null);
+  // pending transferId while web picker is open
+  const pendingTransferIdRef = useRef<string>('');
 
   useEffect(() => {
+    S3BgUploader.setConfig(START_UPLOAD_API, GET_UPLOAD_URLS_API, COMPLETE_API);
+    S3BgUploader.setTaskSubtitle(
+      '{percentage} | {uploadedSize}/{totalSize} | {completedTransfers}/{totalTransfers} transfers | {completedFiles}/{totalFiles} files',
+    );
+
     if (Platform.OS === 'android' && Platform.Version >= 33) {
       PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
     }
   }, []);
 
-  const handlePickNative = useCallback(async () => {
+  // ------------------------------------------------------------------
+  // Progress callback — kept alive for the whole upload session
+  // ------------------------------------------------------------------
+  const startListening = useCallback(() => {
+    S3BgUploader.setProgressCallback((fp, sessionAgg, transferAgg) => {
+      console.log("file", fp)
+      console.log("transfer", transferAgg)
+      console.log("session", sessionAgg)
+      setSessionProgress({ ...sessionAgg });
+      setTransferProgress((prev) => ({
+        ...prev,
+        [fp.transferId]: { ...transferAgg },
+      }));
+
+      setQueue((prev) =>
+        prev.map((item) => {
+          if (item.fileKey && item.fileKey === fp.fileKey) {
+            return { ...item, progress: { ...fp } };
+          }
+          return item;
+        }),
+      );
+
+      // Stop listening once everything is done
+      if (sessionAgg.state === 'COMPLETED') {
+        setSessionState('idle');
+        S3BgUploader.setProgressCallback(null);
+      } else if (sessionAgg.state === 'FAILED' || sessionAgg.state === 'PAUSED') {
+        // Keep session active so the user can resume
+        setSessionState((prev) => (prev === 'running' ? 'paused' : prev));
+      } else {
+        setSessionState('running');
+      }
+    });
+  }, []);
+
+  // ------------------------------------------------------------------
+  // Picking files
+  // ------------------------------------------------------------------
+  const handleAddFilesNative = useCallback(async () => {
     try {
-      const [result] = await pick({ mode: 'open', type: [types.allFiles], allowMultiSelection: false });
-      const uri = result.uri;
-      setNativePath(uriToPath(uri));
-      setFileName(result.name ?? uri);
-      setUploadState('idle');
-      setProgress(null);
+      const results = await pick({
+        mode: 'open',
+        type: [types.allFiles],
+        allowMultiSelection: true,
+      });
+      const newFiles: QueuedFile[] = results.map((r) => ({
+        id: `${Date.now()}-${Math.random()}`,
+        name: r.name ?? r.uri,
+        path: uriToPath(r.uri),
+        transferId: transferIdInput.trim() || nextTransferId(),
+      }));
+      setQueue((prev) => [...prev, ...newFiles]);
     } catch (e) {
       if (!isCancel(e)) {
         setErrorMsg((e as Error)?.message ?? String(e));
-        setUploadState('error');
       }
     }
-  }, []);
+  }, [transferIdInput]);
 
-  // Web: trigger hidden file input
-  const handlePickWeb = useCallback(() => {
+  const handleAddFilesWeb = useCallback(() => {
+    pendingTransferIdRef.current = transferIdInput.trim() || nextTransferId();
     webInputRef.current?.click();
-  }, []);
+  }, [transferIdInput]);
 
   const handleWebFileChange = useCallback(
     (event: React.ChangeEvent<HTMLInputElement>) => {
-      const file = event.target.files?.[0];
-      if (file) {
-        setWebFile(file);
-        setFileName(file.name);
-        setUploadState('idle');
-        setProgress(null);
-      }
+      const files = event.target.files;
+      if (!files || files.length === 0) return;
+      const newFiles: QueuedFile[] = Array.from(files).map((f) => ({
+        id: `${Date.now()}-${Math.random()}`,
+        name: f.name,
+        webFile: f,
+        transferId: pendingTransferIdRef.current,
+      }));
+      setQueue((prev) => [...prev, ...newFiles]);
+      // Reset so the same file can be picked again later
+      event.target.value = '';
     },
     [],
   );
 
-  const handlePick = Platform.OS === 'web' ? handlePickWeb : handlePickNative;
+  const handleAddFiles =
+    Platform.OS === 'web' ? handleAddFilesWeb : handleAddFilesNative;
 
-  const handleUpload = useCallback(async () => {
-    if (Platform.OS === 'web' && !webFile) {
-      setErrorMsg('Bitte zuerst eine Datei auswählen.');
-      setUploadState('error');
-      return;
-    }
-    if (Platform.OS !== 'web' && !nativePath) {
-      setErrorMsg('Bitte zuerst eine Datei auswählen.');
-      setUploadState('error');
-      return;
-    }
+  // ------------------------------------------------------------------
+  // Upload all queued files
+  // ------------------------------------------------------------------
+  const handleUploadAll = useCallback(async () => {
+    const pending = queue.filter((f) => !f.fileKey);
+    if (pending.length === 0) return;
 
-    setUploading(true);
-    setUploadState('idle');
-    setProgress(null);
     setErrorMsg('');
-
-    S3BgUploader.setProgressCallback((p: UploadProgress) => {
-      setProgress({ ...p });
-      console.log(p);
-      switch (p.state) {
-        case "FINISHED":
-          setUploadState('success');
-          setUploading(false);
-          S3BgUploader.setProgressCallback(null);
-          break;
-        case "FAILED":
-          setUploadState('error');
-           setUploading(false);
-          S3BgUploader.setProgressCallback(null);
-          break;
-        default:
-          break;
-      }
-    });
+    setSessionState('running');
+    startListening();
 
     try {
       if (Platform.OS === 'web') {
-        S3BgUploader.uploadFile(webFile!);
+        // Start all web uploads concurrently — wasm_start_file resolves quickly (~100ms)
+        await Promise.all(
+          pending.map(async (item) => {
+            const fileKey = await (S3BgUploader as any).uploadFile(item.webFile!, item.transferId);
+            setQueue((prev) =>
+              prev.map((q) => (q.id === item.id ? { ...q, fileKey } : q)),
+            );
+          }),
+        );
       } else {
-        S3BgUploader.uploadFile(nativePath!);
+        for (const item of pending) {
+          const fileKey = (S3BgUploader as any).uploadFile(item.path!, item.transferId);
+          setQueue((prev) =>
+            prev.map((q) => (q.id === item.id ? { ...q, fileKey } : q)),
+          );
+        }
       }
     } catch (e: unknown) {
       setErrorMsg((e as Error)?.message ?? String(e));
-      setUploadState('error');
+      setSessionState('idle');
+      S3BgUploader.setProgressCallback(null);
     }
-  }, [webFile, nativePath]);
+  }, [queue, startListening]);
 
-  const progressPercent = progress ? Math.round(progress.percentage) : 0;
-  const hasFile = Platform.OS === 'web' ? !!webFile : !!nativePath;
+  // ------------------------------------------------------------------
+  // Session controls
+  // ------------------------------------------------------------------
+  const handlePause = useCallback(() => {
+    S3BgUploader.pause();
+    setSessionState('paused');
+  }, []);
 
+  const handleResume = useCallback(() => {
+    S3BgUploader.resume();
+    setSessionState('running');
+  }, []);
+
+  const handleCancelAll = useCallback(() => {
+    S3BgUploader.cancel();
+    setQueue([]);
+    setSessionProgress(null);
+    setTransferProgress({});
+    setSessionState('idle');
+    S3BgUploader.setProgressCallback(null);
+  }, []);
+
+  // ------------------------------------------------------------------
+  // Per-file / per-transfer controls
+  // ------------------------------------------------------------------
+  const handleCancelFile = useCallback((item: QueuedFile) => {
+    if (item.fileKey) {
+      S3BgUploader.cancelFile(item.fileKey);
+    }
+    setQueue((prev) => prev.filter((q) => q.id !== item.id));
+  }, []);
+
+  const handleCancelTransfer = useCallback((transferId: string) => {
+    S3BgUploader.cancelTransfer(transferId);
+    setQueue((prev) => prev.filter((q) => q.transferId !== transferId));
+  }, []);
+
+  const handleRemoveQueued = useCallback((id: string) => {
+    setQueue((prev) => prev.filter((q) => q.id !== id));
+  }, []);
+
+  // ------------------------------------------------------------------
+  // Helpers
+  // ------------------------------------------------------------------
+  const sessionPercent = sessionProgress
+    ? Math.round(sessionProgress.percentage)
+    : 0;
+
+  const transferIds = Array.from(new Set(queue.map((f) => f.transferId)));
+
+  // ------------------------------------------------------------------
+  // Render
+  // ------------------------------------------------------------------
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>S3 Uploader</Text>
@@ -147,141 +267,383 @@ function App(): React.JSX.Element {
         <input
           ref={webInputRef}
           type="file"
+          multiple
           style={{ display: 'none' }}
-          onChange={handleWebFileChange as unknown as React.ChangeEventHandler<HTMLInputElement>}
+          onChange={
+            handleWebFileChange as unknown as React.ChangeEventHandler<HTMLInputElement>
+          }
         />
       )}
 
-      {/* Pick File Button */}
-      <TouchableOpacity
-        style={[styles.pickButton, uploading && styles.buttonDisabled]}
-        onPress={handlePick}
-        disabled={uploading}>
-        <Text style={styles.pickButtonText}>
-          {hasFile ? '📄 Andere Datei wählen' : '📂 Datei auswählen'}
+      {/* Transfer ID input + Add Files */}
+      <View style={styles.row}>
+        <TextInput
+          style={styles.transferInput}
+          value={transferIdInput}
+          onChangeText={setTransferIdInput}
+          placeholder="Transfer-ID"
+          placeholderTextColor="#aaa"
+          editable={sessionState === 'idle'}
+        />
+        <TouchableOpacity
+          style={[styles.addButton, sessionState === 'running' && styles.buttonDisabled]}
+          onPress={handleAddFiles}
+          disabled={sessionState === 'running'}>
+          <Text style={styles.addButtonText}>+ Dateien</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Queue list grouped by transfer */}
+      {transferIds.map((tid) => {
+        const filesInTransfer = queue.filter((f) => f.transferId === tid);
+        const tp = transferProgress[tid];
+        const tPct = tp ? Math.round(tp.percentage) : 0;
+        return (
+          <View key={tid} style={styles.transferBlock}>
+            <View style={styles.transferHeader}>
+              <View style={styles.transferHeaderLeft}>
+                <Text style={styles.transferLabel}>{tid}</Text>
+                {tp && (
+                  <Text style={styles.transferStats}>
+                    {tPct}% · {formatBytes(tp.uploadedSize)}/{formatBytes(tp.totalSize)}
+                    {'  '}{tp.completedFiles}/{tp.totalFiles} Dateien
+                  </Text>
+                )}
+                {tp && (
+                  <View style={styles.transferTrack}>
+                    <View
+                      style={[
+                        styles.transferFill,
+                        // eslint-disable-next-line react-native/no-inline-styles
+                        { width: `${tPct}%` as unknown as number },
+                        tp.state === 'COMPLETED' && styles.miniFillDone,
+                        tp.state === 'FAILED' && styles.miniFillFail,
+                      ]}
+                    />
+                  </View>
+                )}
+              </View>
+              <TouchableOpacity
+                style={styles.cancelTransferBtn}
+                onPress={() => handleCancelTransfer(tid)}>
+                <Text style={styles.cancelBtnText}>Abbrechen</Text>
+              </TouchableOpacity>
+            </View>
+
+            {filesInTransfer.map((item) => {
+              const pct = item.progress
+                ? Math.round(item.progress.percentage)
+                : 0;
+              const state = item.progress?.state;
+              const isActive = !!item.fileKey;
+              return (
+                <View key={item.id} style={styles.fileRow}>
+                  <View style={styles.fileInfo}>
+                    <Text style={styles.fileName} numberOfLines={1}>
+                      {item.name}
+                    </Text>
+                    {isActive && item.progress ? (
+                      <View style={styles.fileProgressRow}>
+                        <View style={styles.miniTrack}>
+                          <View
+                            style={[
+                              styles.miniFill,
+                              // eslint-disable-next-line react-native/no-inline-styles
+                              { width: `${pct}%` as unknown as number },
+                              state === 'COMPLETED' && styles.miniFillDone,
+                              state === 'FAILED' && styles.miniFillFail,
+                            ]}
+                          />
+                        </View>
+                        <Text style={styles.filePct}>{pct}%</Text>
+                        <Text style={styles.fileBytes}>
+                          {formatBytes(item.progress.uploadedBytes)}/{formatBytes(item.progress.totalBytes)}
+                        </Text>
+                        <Text style={styles.fileStateLabel}>{state}</Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.fileQueued}>Warteschlange</Text>
+                    )}
+                  </View>
+                  <TouchableOpacity
+                    style={styles.cancelFileBtn}
+                    onPress={() =>
+                      isActive
+                        ? handleCancelFile(item)
+                        : handleRemoveQueued(item.id)
+                    }>
+                    <Text style={styles.cancelFileBtnText}>✕</Text>
+                  </TouchableOpacity>
+                </View>
+              );
+            })}
+          </View>
+        );
+      })}
+
+      {queue.length === 0 && (
+        <Text style={styles.emptyHint}>
+          Wähle Dateien aus und weise sie einem Transfer zu.
         </Text>
-      </TouchableOpacity>
+      )}
 
-      {fileName ? (
-        <Text style={styles.fileLabel} numberOfLines={2}>
-          {fileName}
-        </Text>
-      ) : null}
-
-      {/* Upload Button */}
-      <TouchableOpacity
-        style={[
-          styles.uploadButton,
-          (!hasFile || uploading) && styles.buttonDisabled,
-          uploadState === 'success' && styles.uploadButtonSuccess,
-          uploadState === 'error' && styles.uploadButtonError,
-        ]}
-        onPress={handleUpload}
-        disabled={!hasFile || uploading}>
-        {uploading ? (
-          <ActivityIndicator color="#fff" />
-        ) : (
-          <Text style={styles.uploadButtonText}>
-            {uploadState === 'success'
-              ? '✓ Hochgeladen'
-              : uploadState === 'error'
-              ? '✗ Nochmal versuchen'
-              : 'Hochladen'}
-          </Text>
-        )}
-      </TouchableOpacity>
-
-      {/* Progress Bar */}
-      {(uploading || progress) ? (
-        <View style={styles.progressContainer}>
+      {/* Session progress bar */}
+      {sessionProgress && (
+        <View style={styles.sessionProgress}>
           <View style={styles.progressBarTrack}>
             <View
               style={[
                 styles.progressBarFill,
                 // eslint-disable-next-line react-native/no-inline-styles
-                { width: `${progressPercent}%` as unknown as number },
+                { width: `${sessionPercent}%` as unknown as number },
               ]}
             />
           </View>
-          <Text style={styles.progressPercent}>{progressPercent}%</Text>
-          {progress ? (
-            <Text style={styles.progressDetails}>
-              {formatBytes(progress.uploadedBytes)} / {formatBytes(progress.totalBytes)}
-              {'  ·  '}
-              {progress.completedParts}/{progress.totalParts} Parts
-            </Text>
-          ) : null}
+          <Text style={styles.progressPercent}>{sessionPercent}%</Text>
+          <Text style={styles.progressDetails}>
+            {formatBytes(sessionProgress.uploadedSize)} /{' '}
+            {formatBytes(sessionProgress.totalSize)}
+            {'  ·  '}
+            {sessionProgress.completedFiles}/{sessionProgress.totalFiles} Dateien
+          </Text>
         </View>
-      ) : null}
+      )}
 
-      {/* Error */}
-      {uploadState === 'error' && errorMsg ? (
+      {/* Action buttons */}
+      <View style={styles.actionRow}>
+        {/* Upload */}
+        <TouchableOpacity
+          style={[
+            styles.actionBtn,
+            styles.uploadBtn,
+            (queue.length === 0 || sessionState === 'running') &&
+              styles.buttonDisabled,
+          ]}
+          onPress={handleUploadAll}
+          disabled={queue.length === 0 || sessionState === 'running'}>
+          {sessionState === 'running' ? (
+            <ActivityIndicator color="#fff" />
+          ) : (
+            <Text style={styles.actionBtnText}>Hochladen</Text>
+          )}
+        </TouchableOpacity>
+
+        {/* Pause / Resume */}
+        {sessionState === 'running' && (
+          <TouchableOpacity
+            style={[styles.actionBtn, styles.pauseBtn]}
+            onPress={handlePause}>
+            <Text style={styles.actionBtnText}>Pause</Text>
+          </TouchableOpacity>
+        )}
+        {sessionState === 'paused' && (
+          <TouchableOpacity
+            style={[styles.actionBtn, styles.resumeBtn]}
+            onPress={handleResume}>
+            <Text style={styles.actionBtnText}>Fortsetzen</Text>
+          </TouchableOpacity>
+        )}
+
+        {/* Cancel all */}
+        {sessionState !== 'idle' && (
+          <TouchableOpacity
+            style={[styles.actionBtn, styles.cancelAllBtn]}
+            onPress={handleCancelAll}>
+            <Text style={styles.actionBtnText}>Alles abbrechen</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {errorMsg ? (
         <Text style={styles.errorText}>{errorMsg}</Text>
       ) : null}
     </ScrollView>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Styles
+// ---------------------------------------------------------------------------
 const styles = StyleSheet.create({
   container: {
     flexGrow: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 24,
+    padding: 20,
     backgroundColor: '#f0f2f5',
   },
   title: {
-    fontSize: 28,
+    fontSize: 26,
     fontWeight: '700',
-    marginBottom: 32,
-    color: '#111',
-  },
-  pickButton: {
-    borderWidth: 1.5,
-    borderColor: '#007AFF',
-    borderRadius: 10,
-    paddingVertical: 12,
-    paddingHorizontal: 28,
-    marginBottom: 12,
-  },
-  pickButtonText: {
-    color: '#007AFF',
-    fontSize: 16,
-    fontWeight: '500',
-  },
-  fileLabel: {
-    fontSize: 13,
-    color: '#555',
     marginBottom: 20,
-    maxWidth: 360,
+    color: '#111',
     textAlign: 'center',
   },
-  uploadButton: {
-    backgroundColor: '#007AFF',
-    paddingVertical: 14,
-    paddingHorizontal: 40,
-    borderRadius: 10,
-    minWidth: 200,
+  // Transfer ID + add button row
+  row: {
+    flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 28,
+    marginBottom: 16,
+    gap: 8,
   },
-  uploadButtonSuccess: {
-    backgroundColor: '#34C759',
+  transferInput: {
+    flex: 1,
+    height: 42,
+    borderWidth: 1.5,
+    borderColor: '#007AFF',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    fontSize: 14,
+    color: '#111',
+    backgroundColor: '#fff',
   },
-  uploadButtonError: {
-    backgroundColor: '#FF3B30',
+  addButton: {
+    backgroundColor: '#007AFF',
+    borderRadius: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
   },
-  uploadButtonText: {
+  addButtonText: {
     color: '#fff',
-    fontSize: 17,
+    fontSize: 15,
     fontWeight: '600',
   },
-  buttonDisabled: {
-    opacity: 0.5,
+  // Transfer block
+  transferBlock: {
+    backgroundColor: '#fff',
+    borderRadius: 10,
+    marginBottom: 12,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
   },
-  progressContainer: {
-    width: '100%',
-    maxWidth: 400,
+  transferHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#e8f0fe',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  transferHeaderLeft: {
+    flex: 1,
+    marginRight: 8,
+  },
+  transferStats: {
+    fontSize: 11,
+    color: '#4a6fa5',
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  transferTrack: {
+    height: 5,
+    backgroundColor: '#c5d5f0',
+    borderRadius: 3,
+    overflow: 'hidden',
+    marginBottom: 2,
+  },
+  transferFill: {
+    height: '100%',
+    backgroundColor: '#007AFF',
+    borderRadius: 3,
+  },
+  transferLabel: {
+    fontWeight: '700',
+    fontSize: 13,
+    color: '#1a3c7a',
+  },
+  cancelTransferBtn: {
+    backgroundColor: '#FF3B30',
+    borderRadius: 6,
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+  },
+  cancelBtnText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  // File row
+  fileRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#f0f0f0',
+  },
+  fileInfo: {
+    flex: 1,
+    marginRight: 8,
+  },
+  fileName: {
+    fontSize: 14,
+    color: '#222',
+    marginBottom: 4,
+  },
+  fileQueued: {
+    fontSize: 12,
+    color: '#999',
+  },
+  fileProgressRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  miniTrack: {
+    flex: 1,
+    height: 6,
+    backgroundColor: '#e0e0e0',
+    borderRadius: 3,
+    overflow: 'hidden',
+  },
+  miniFill: {
+    height: '100%',
+    backgroundColor: '#007AFF',
+    borderRadius: 3,
+  },
+  miniFillDone: {
+    backgroundColor: '#34C759',
+  },
+  miniFillFail: {
+    backgroundColor: '#FF3B30',
+  },
+  filePct: {
+    fontSize: 12,
+    color: '#555',
+    minWidth: 34,
+    textAlign: 'right',
+  },
+  fileBytes: {
+    fontSize: 11,
+    color: '#777',
+  },
+  fileStateLabel: {
+    fontSize: 11,
+    color: '#888',
+    minWidth: 70,
+  },
+  cancelFileBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: '#FF3B30',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  cancelFileBtnText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  // Empty hint
+  emptyHint: {
+    textAlign: 'center',
+    color: '#999',
+    marginVertical: 24,
+    fontSize: 14,
+  },
+  // Session progress
+  sessionProgress: {
+    marginVertical: 16,
     alignItems: 'center',
   },
   progressBarTrack: {
@@ -307,12 +669,46 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#666',
   },
+  // Action buttons
+  actionRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    justifyContent: 'center',
+    marginTop: 8,
+  },
+  actionBtn: {
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    minWidth: 120,
+    alignItems: 'center',
+  },
+  actionBtnText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  uploadBtn: {
+    backgroundColor: '#007AFF',
+  },
+  pauseBtn: {
+    backgroundColor: '#FF9500',
+  },
+  resumeBtn: {
+    backgroundColor: '#34C759',
+  },
+  cancelAllBtn: {
+    backgroundColor: '#FF3B30',
+  },
+  buttonDisabled: {
+    opacity: 0.45,
+  },
   errorText: {
-    marginTop: 12,
+    marginTop: 14,
     color: '#FF3B30',
     fontSize: 14,
     textAlign: 'center',
-    maxWidth: 360,
   },
 });
 

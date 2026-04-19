@@ -1,40 +1,31 @@
-use crate::core::api::{CompleteRequest, UploadUrlsResponse};
-use crate::core::{complete_upload_endpoint, get_urls_endpoint, ChunkUploadResult};
+use std::collections::HashMap;
+use crate::core::api::{self, StartUploadResponse};
+use crate::core::ChunkUploadResult;
 
-pub fn fetch_upload_urls(
+pub fn start_upload_android(
     client: &reqwest::blocking::Client,
+    file_name: &str,
+    file_hash: &str,
     file_size: u64,
-) -> Result<UploadUrlsResponse, Box<dyn std::error::Error>> {
-    let url = get_urls_endpoint(file_size);
-    let response = client
-        .post(&url)
-        .send()
-        .map_err(|e| format!("Failed to get upload URLs: {:?}", e))?;
-
-    let response_body = response
-        .text()
-        .map_err(|e| format!("Failed to read response body: {:?}", e))?;
-
-    serde_json::from_str(&response_body)
-        .map_err(|e| format!("Failed to parse upload URLs response: {:?}", e).into())
+    user_params: &HashMap<String, String>,
+) -> Result<StartUploadResponse, Box<dyn std::error::Error>> {
+    api::start_upload_android(client, file_name, file_hash, file_size, user_params)
 }
 
-pub fn complete_upload(
+pub fn fetch_upload_urls_batch_android(
     client: &reqwest::blocking::Client,
-    upload_info: &UploadUrlsResponse,
+    file_key: &str,
+    upload_id: &str,
+    part_numbers: &[u32],
+) -> Result<HashMap<u32, String>, Box<dyn std::error::Error>> {
+    api::fetch_upload_urls_batch_android(client, file_key, upload_id, part_numbers)
+}
+
+pub fn complete_upload_android(
+    client: &reqwest::blocking::Client,
+    file_key: &str,
+    upload_id: &str,
     results: Vec<ChunkUploadResult>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parts = CompleteRequest::from_upload_results(results);
-    let complete_url = complete_upload_endpoint(&upload_info.upload_id, &upload_info.key);
-    let body_json = parts.serialize()
-        .map_err(|e| format!("Failed to serialize complete request: {}", e))?;
-
-    client
-        .post(&complete_url)
-        .header("Content-Type", "application/json")
-        .body(body_json)
-        .send()
-        .map_err(|e| format!("Failed to complete upload: {:?}", e))?;
-
-    Ok(())
+    api::complete_upload_android(client, file_key, upload_id, results)
 }

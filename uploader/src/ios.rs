@@ -1,25 +1,21 @@
 pub mod progress;
 pub mod api;
 
-use std::os::raw::{c_char, c_ulonglong};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::io::{BufReader, Read, Seek, SeekFrom, Cursor};
 use std::fs::File;
-use std::sync::{Arc, Mutex};
+use std::io::BufReader;
+use std::os::raw::c_char;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread;
-use std::sync::Once;
 
-use crate::core::{
-    ChunkUploadResult,
-    MAX_CONCURRENT_UPLOADS, MAX_RETRIES,
-    get_urls_endpoint,
-    complete_upload_endpoint,
-    clean_etag
-};
-use crate::core::api::{CompleteRequest, UploadUrlsResponse};
-use crate::core::chunk::{self, ChunkInfo};
-use crate::core::progress::{ProgressNotifier, UploadStatus};
+use crate::core::{ChunkUploadResult, MAX_CONCURRENT_UPLOADS, MAX_RETRIES, clean_etag};
+use crate::core::chunk::ChunkInfo;
+use crate::core::config;
+use crate::core::hash::sha256_file;
 use crate::core::retry::{self, RetryPolicy};
+use crate::core::session::{self, UploadState};
 use crate::ios::progress::{self as iosProgress, ProgressReader};
 
 static INIT: Once = Once::new();
@@ -30,151 +26,361 @@ fn init_nyquest() {
     });
 }
 
-#[no_mangle]
-pub extern "C" fn add(one: i32, two: i32) -> i32 {
-    one + two
+// ---------------------------------------------------------------------------
+// Upload queue — background worker thread
+// ---------------------------------------------------------------------------
+
+struct UploadQueue {
+    pending: std::collections::VecDeque<String>,
 }
 
-#[no_mangle]
-pub extern "C" fn upload_file(path: *const c_char) -> i32 {
-    if path.is_null() {
-        return -1;
-    }
+static QUEUE: Mutex<UploadQueue> = Mutex::new(UploadQueue {
+    pending: std::collections::VecDeque::new(),
+});
+static QUEUE_SIGNAL: Condvar = Condvar::new();
+static WORKER_STARTED: Once = Once::new();
+pub(crate) static PAUSE_FLAG: AtomicBool = AtomicBool::new(false);
 
-    let c_str = unsafe { CStr::from_ptr(path) };
-    let file_path = match c_str.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return -1,
+fn start_worker_thread() {
+    WORKER_STARTED.call_once(|| {
+        thread::spawn(|| {
+            loop {
+                let file_key = {
+                    let mut q = QUEUE.lock().unwrap();
+                    loop {
+                        if let Some(k) = q.pending.pop_front() {
+                            break k;
+                        }
+                        q = QUEUE_SIGNAL.wait(q).unwrap();
+                    }
+                };
+                run_upload(&file_key);
+            }
+        });
+    });
+}
+
+fn enqueue_key(file_key: String) {
+    start_worker_thread();
+    let mut q = QUEUE.lock().unwrap();
+    q.pending.push_back(file_key);
+    QUEUE_SIGNAL.notify_one();
+}
+
+// ---------------------------------------------------------------------------
+// Core upload logic
+// ---------------------------------------------------------------------------
+
+fn run_upload(file_key: &str) {
+    init_nyquest();
+
+    let (file_path, transfer_id, upload_id, part_size_opt, completed_etags) = {
+        let sess = session::session();
+        let entry = match sess.files.get(file_key) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+        (
+            entry.file_path.clone(),
+            entry.transfer_id.clone(),
+            entry.upload_id.clone(),
+            entry.part_size,
+            entry.completed_chunk_etags.clone(),
+        )
     };
 
-    match upload_file_internal(&file_path) {
-        Ok(_) => 0,
-        Err(_) => -1,
+    // Recompute uploaded_bytes from committed ETags so progress is accurate
+    // after a force-quit where in-flight bytes may have been counted but not committed.
+    if let Some(ps) = part_size_opt {
+        let total_bytes = {
+            let sess = session::session();
+            sess.files.get(file_key).map(|e| e.total_bytes).unwrap_or(0)
+        };
+        let committed_bytes: u64 = completed_etags.iter().map(|(p, _)| {
+            let start = (*p as u64 - 1) * ps;
+            total_bytes.saturating_sub(start).min(ps)
+        }).sum();
+        session::session().set_file_uploaded_bytes(file_key, committed_bytes);
+    }
+
+    session::session().mark_file_state(file_key, UploadState::Running);
+    session::persist_session();
+
+    let result = upload_file_internal(
+        file_key,
+        &file_path,
+        &transfer_id,
+        upload_id,
+        part_size_opt,
+        completed_etags,
+    );
+
+    match result {
+        Ok(_) => {
+            session::session().mark_file_state(file_key, UploadState::Completed);
+            session::persist_session();
+            let (s_agg, t_agg) = {
+                let sess = session::session();
+                let tid = sess.files.get(file_key).map(|e| e.transfer_id.clone()).unwrap_or_default();
+                let s = sess.get_aggregate_progress(None);
+                let t = sess.get_aggregate_progress(Some(&tid));
+                (s, t)
+            };
+            iosProgress::progress_manager().set_status(file_key, UploadState::Completed, s_agg, t_agg);
+            if let Some(next_key) = session::session().next_pending_file() {
+                enqueue_key(next_key);
+            }
+        }
+        Err(e) if e.to_string() == "Upload paused" => {
+            session::session().mark_file_state(file_key, UploadState::Paused);
+            session::persist_session();
+        }
+        Err(e) => {
+            eprintln!("Upload failed for {}: {}", file_key, e);
+            session::session().mark_file_state(file_key, UploadState::Failed);
+            session::persist_session();
+            let (s_agg, t_agg) = {
+                let sess = session::session();
+                let tid = sess.files.get(file_key).map(|e| e.transfer_id.clone()).unwrap_or_default();
+                let s = sess.get_aggregate_progress(None);
+                let t = sess.get_aggregate_progress(Some(&tid));
+                (s, t)
+            };
+            iosProgress::progress_manager().set_status(file_key, UploadState::Failed, s_agg, t_agg);
+            // Don't auto-retry — resume_all() picks up Failed files when the user resumes.
+        }
     }
 }
 
-fn upload_file_internal(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    init_nyquest();
+fn upload_file_internal(
+    file_key: &str,
+    file_path: &str,
+    transfer_id: &str,
+    existing_upload_id: Option<String>,
+    existing_part_size: Option<u64>,
+    completed_etags: Vec<(u32, String)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = nyquest::ClientBuilder::default()
+        .request_timeout(std::time::Duration::from_secs(30))
+        .build_blocking()
+        .map_err(|e| format!("Failed to create client: {:?}", e))?;
 
     let file = File::open(file_path)?;
     let file_size = file.metadata()?.len();
 
-    // HTTP Client erstellen
-    let client = nyquest::ClientBuilder::default()
-        .build_blocking()
-        .map_err(|e| format!("Failed to create client: {:?}", e))?;
+    // Get or reuse upload_id / part_size
+    let (upload_id, part_size) = if let (Some(uid), Some(ps)) = (existing_upload_id, existing_part_size) {
+        (uid, ps)
+    } else {
+        // This shouldn't happen — startUploadApi should have been called before enqueue
+        return Err("Missing upload_id or part_size — startUploadApi must be called first".into());
+    };
 
-    // Upload URLs abrufen
-    let upload_info = api::fetch_upload_urls(&client, file_size)?;
+    let total_parts = ((file_size + part_size - 1) / part_size) as u32;
 
-    // Progress initialisieren
-    iosProgress::update_progress(|m| m.init(file_size, upload_info.chunk_count()));
+    // Determine which parts still need uploading
+    let done_parts: std::collections::HashSet<u32> =
+        completed_etags.iter().map(|(p, _)| *p).collect();
+    let remaining_parts: Vec<u32> = (1..=total_parts)
+        .filter(|p| !done_parts.contains(p))
+        .collect();
 
-    // Chunk-Infos generieren
-    let chunk_infos = chunk::generate_chunk_infos(file_size, &upload_info)
-        .map_err(|e| format!("Failed to generate chunk infos: {}", e))?;
+    if remaining_parts.is_empty() {
+        // All parts done — just complete
+        let all_results: Vec<ChunkUploadResult> = completed_etags
+            .into_iter()
+            .map(|(pn, etag)| ChunkUploadResult { part_number: pn, etag })
+            .collect();
+        return api::complete_upload(&client, file_key, &upload_id, all_results);
+    }
 
-    // Chunks parallel hochladen
-    let completed_parts = upload_chunks_parallel(file_path, &chunk_infos)
-        .map_err(|e| {
-            iosProgress::update_progress(|m| m.set_status(UploadStatus::Failed));
-            e
-        })?;
+    // Initialise progress manager
+    {
+        let already_completed_parts = done_parts.len() as u32;
+        let already_completed_bytes: u64 = done_parts.iter().map(|&p| {
+            let start = (p as u64 - 1) * part_size;
+            file_size.saturating_sub(start).min(part_size)
+        }).sum();
+        let (s_agg, t_agg) = {
+            let sess = session::session();
+            let s = sess.get_aggregate_progress(None);
+            let t = sess.get_aggregate_progress(Some(transfer_id));
+            (s, t)
+        };
+        iosProgress::progress_manager().init(
+            file_key.to_string(),
+            transfer_id.to_string(),
+            file_size,
+            total_parts,
+            already_completed_bytes,
+            already_completed_parts,
+            s_agg,
+            t_agg,
+        );
+    }
 
-    // Upload abschließen
-    api::complete_upload(&client, &upload_info, completed_parts)
-        .map_err(|e| {
-            iosProgress::update_progress(|m| m.set_status(UploadStatus::Failed));
-            e
-        })?;
+    // Fetch first URL batch and upload
+    let new_results = upload_parts_with_rolling_urls(
+        &client,
+        file_key,
+        file_path,
+        &upload_id,
+        part_size,
+        file_size,
+        remaining_parts,
+    )?;
 
-    iosProgress::update_progress(|m| m.set_status(UploadStatus::Finished));
-    Ok(())
+    // Combine with already-completed parts
+    let mut all_results: Vec<ChunkUploadResult> = completed_etags
+        .into_iter()
+        .map(|(pn, etag)| ChunkUploadResult { part_number: pn, etag })
+        .collect();
+    all_results.extend(new_results);
+
+    api::complete_upload(&client, file_key, &upload_id, all_results)
 }
 
-fn upload_chunks_parallel(
+fn upload_parts_with_rolling_urls(
+    client: &nyquest::BlockingClient,
+    file_key: &str,
     file_path: &str,
-    chunk_infos: &[ChunkInfo],
+    upload_id: &str,
+    part_size: u64,
+    file_size: u64,
+    parts_to_upload: Vec<u32>,
 ) -> Result<Vec<ChunkUploadResult>, Box<dyn std::error::Error>> {
-    let completed_parts = Arc::new(Mutex::new(Vec::new()));
-    let file_path_arc = Arc::new(file_path.to_string());
-    let chunk_infos_arc = Arc::new(chunk_infos.to_vec());
+    let completed_parts = Arc::new(Mutex::new(Vec::<ChunkUploadResult>::new()));
 
-    // Channel für Worker-Threads
-    let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(MAX_CONCURRENT_UPLOADS);
+    // Fetch all presigned URLs upfront — avoids the sender loop blocking on
+    // mid-upload API calls, which was causing workers to starve.
+    let url_map = api::fetch_upload_urls_batch(client, file_key, upload_id, &parts_to_upload)?;
+    let url_pool: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(url_map));
+    let parts_arc = Arc::new(parts_to_upload);
+
+    let (tx, rx) = std::sync::mpsc::channel::<usize>();
     let rx = Arc::new(Mutex::new(rx));
+    // Set when any worker aborts (pause OR error) — stops the sender loop early.
+    let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Set only when a non-pause upload error causes the abort.
+    let error_abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Worker Threads erstellen
     let mut handles = vec![];
     for _ in 0..MAX_CONCURRENT_UPLOADS {
         let rx = rx.clone();
-        let file_path = file_path_arc.clone();
-        let chunk_infos = chunk_infos_arc.clone();
-        let completed_parts = completed_parts.clone();
+        let parts = parts_arc.clone();
+        let url_pool = url_pool.clone();
+        let completed = completed_parts.clone();
+        let file_path = file_path.to_string();
+        let file_key_str = file_key.to_string();
+        let abort = abort.clone();
+        let error_abort = error_abort.clone();
 
         let handle = thread::spawn(move || {
             let client = nyquest::ClientBuilder::default()
+                .request_timeout(std::time::Duration::from_secs(300))
                 .build_blocking()
                 .expect("Failed to create client in worker thread");
 
             loop {
-                let work = {
-                    let receiver = rx.lock().unwrap();
-                    receiver.recv()
-                };
-
-                let chunk_index = match work {
+                let part_idx = match rx.lock().unwrap().recv() {
                     Ok(i) => i,
-                    Err(_) => break, // Channel closed
+                    Err(_) => break,
                 };
 
-                let chunk_info = &chunk_infos[chunk_index];
-
-                // Chunk aus Datei lesen
-                let chunk = match read_chunk_from_file(&file_path, &chunk_info) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        eprintln!("Failed to read chunk {}: {:?}", chunk_info.part_number, e);
-                        continue;
-                    }
-                };
-
-                // Upload mit Retry und Progress-Tracking
-                let etag = match upload_chunk_with_retry(&client, &chunk_info.url, &chunk, chunk_info.part_number) {
-                    Ok(tag) => tag,
-                    Err(e) => {
-                        eprintln!("Failed to upload part {}: {:?}", chunk_info.part_number, e);
-                        continue;
-                    }
-                };
-
-                // Completed part speichern
-                {
-                    let mut parts = completed_parts.lock().unwrap();
-                    parts.push(ChunkUploadResult {
-                        part_number: chunk_info.part_number,
-                        etag
-                    });
+                // Check pause before starting this chunk
+                if PAUSE_FLAG.load(Ordering::Relaxed) {
+                    abort.store(true, Ordering::Relaxed);
+                    break;
                 }
+
+                let part_number = parts[part_idx];
+                let url = {
+                    let pool = url_pool.lock().unwrap();
+                    pool.get(&part_number).cloned()
+                };
+
+                let url = match url {
+                    Some(u) => u,
+                    None => {
+                        eprintln!("No URL for part {}", part_number);
+                        continue;
+                    }
+                };
+
+                let chunk_info = ChunkInfo {
+                    part_number,
+                    start_pos: (part_number as u64 - 1) * part_size,
+                    chunk_size: {
+                        let start = (part_number as u64 - 1) * part_size;
+                        let remaining = file_size.saturating_sub(start);
+                        remaining.min(part_size)
+                    },
+                    url: url.clone(),
+                };
+
+                let chunk = match read_chunk_from_file(&file_path, &chunk_info) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("Failed to read chunk {}: {:?}", part_number, e);
+                        abort.store(true, Ordering::Relaxed);
+                        error_abort.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
+
+                let etag = match upload_chunk_with_retry(
+                    &client,
+                    &url,
+                    &chunk,
+                    part_number,
+                    &file_key_str,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        abort.store(true, Ordering::Relaxed);
+                        if e.to_string().contains("paused") || e.to_string().contains("Interrupted") {
+                            // pause — don't set error_abort
+                        } else {
+                            eprintln!("Failed to upload part {}: {:?}", part_number, e);
+                            error_abort.store(true, Ordering::Relaxed);
+                        }
+                        break;
+                    }
+                };
+
+                completed.lock().unwrap().push(ChunkUploadResult { part_number, etag });
             }
         });
-
         handles.push(handle);
     }
 
-    // Chunk-Indizes an Worker senden
-    for i in 0..chunk_infos.len() {
-        tx.send(i).ok();
+    // Send all work indices — URL pool is fully populated, no blocking prefetch needed.
+    for (idx, _) in parts_arc.iter().enumerate() {
+        if PAUSE_FLAG.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) {
+            break;
+        }
+        tx.send(idx).ok();
     }
-    drop(tx); // Sender closen
+    drop(tx);
 
-    // Auf alle Worker warten
     for handle in handles {
         handle.join().ok();
     }
 
-    let parts = completed_parts.lock().unwrap().clone();
-    Ok(parts)
+    if PAUSE_FLAG.load(Ordering::Relaxed) || (abort.load(Ordering::Relaxed) && !error_abort.load(Ordering::Relaxed)) {
+        return Err("Upload paused".into());
+    }
+
+    let results = completed_parts.lock().unwrap().clone();
+    if results.len() != parts_arc.len() {
+        return Err(format!(
+            "Only {}/{} parts uploaded successfully",
+            results.len(),
+            parts_arc.len()
+        )
+        .into());
+    }
+    Ok(results)
 }
 
 fn upload_chunk_with_retry(
@@ -182,35 +388,67 @@ fn upload_chunk_with_retry(
     url: &str,
     data: &[u8],
     part_number: u32,
+    file_key: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let chunk_size = data.len() as u64;
     let policy = RetryPolicy::new(MAX_RETRIES);
+    let file_key = file_key.to_string();
 
-    let result = retry::run_with_retry_string(
+    retry::run_with_retry_string(
         &policy,
         |_attempt| {
-            // Reset in-flight progress für diesen Chunk bei jedem Versuch
-            iosProgress::update_progress(|m| m.update_in_flight(part_number, 0));
+            let (s_agg, t_agg) = {
+                let sess = session::session();
+                let tid = sess.files.get(&file_key)
+                    .map(|e| e.transfer_id.clone())
+                    .unwrap_or_default();
+                let s = sess.get_aggregate_progress(None);
+                let t = sess.get_aggregate_progress(Some(&tid));
+                (s, t)
+            };
+            iosProgress::progress_manager().update_in_flight(&file_key, part_number, 0, s_agg, t_agg);
 
-            // ProgressReader für diesen Chunk erstellen
-            let progress_reader = ProgressReader::new(data.to_vec(), part_number);
-
-            // Body::stream mit dem ProgressReader verwenden
-            let body = nyquest::blocking::Body::stream(progress_reader, "application/octet-stream", chunk_size);
+            let progress_reader = ProgressReader::new(data.to_vec(), file_key.clone(), part_number);
+            let body = nyquest::blocking::Body::stream(
+                progress_reader,
+                "application/octet-stream",
+                chunk_size,
+            );
             let request = nyquest::Request::put(url.to_string()).with_body(body);
 
             match client.request(request) {
-                Ok(response) => {
-                    // ETag aus Response Headers extrahieren
-                    match response.get_header("etag") {
-                        Ok(etag_vec) if !etag_vec.is_empty() => {
-                            // Chunk erst nach erfolgreich extrahiertem ETag als abgeschlossen markieren
-                            iosProgress::update_progress(|m| m.complete_chunk(part_number, chunk_size));
-                            Ok(clean_etag(&etag_vec[0]))
-                        }
-                        _ => Err("No ETag in response".to_string()),
+                Ok(response) => match response.get_header("etag") {
+                    Ok(etag_vec) if !etag_vec.is_empty() => {
+                        let etag = clean_etag(&etag_vec[0]);
+                        // Update session FIRST so aggregate bytes are correct
+                        session::session().complete_chunk(
+                            &file_key,
+                            part_number,
+                            etag.clone(),
+                            chunk_size,
+                        );
+                        session::persist_session();
+                        // Then fire progress notifier (subtitle reads updated session bytes)
+                        let (s_agg, t_agg) = {
+                            let sess = session::session();
+                            let tid = sess.files.get(&file_key)
+                                .map(|e| e.transfer_id.clone())
+                                .unwrap_or_default();
+                            let s = sess.get_aggregate_progress(None);
+                            let t = sess.get_aggregate_progress(Some(&tid));
+                            (s, t)
+                        };
+                        iosProgress::progress_manager().complete_chunk(
+                            &file_key,
+                            part_number,
+                            chunk_size,
+                            s_agg,
+                            t_agg,
+                        );
+                        Ok(etag)
                     }
-                }
+                    _ => Err("No ETag in response".to_string()),
+                },
                 Err(e) => Err(format!("{:?}", e)),
             }
         },
@@ -221,13 +459,279 @@ fn upload_chunk_with_retry(
             );
             thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
         },
-    );
-
-    result.map_err(|e| e.into())
+    )
+    .map_err(|e| e.into())
 }
 
 fn read_chunk_from_file(path: &str, chunk: &ChunkInfo) -> std::io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     chunk.read(&mut reader)
+}
+
+// ---------------------------------------------------------------------------
+// C FFI exports
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn add(one: i32, two: i32) -> i32 {
+    one + two
+}
+
+#[no_mangle]
+pub extern "C" fn set_config(
+    start_upload_api: *const c_char,
+    get_upload_urls_api: *const c_char,
+    complete_api: *const c_char,
+) {
+    let s = unsafe { CStr::from_ptr(start_upload_api) }.to_str().unwrap_or("");
+    let g = unsafe { CStr::from_ptr(get_upload_urls_api) }.to_str().unwrap_or("");
+    let c = unsafe { CStr::from_ptr(complete_api) }.to_str().unwrap_or("");
+    config::set_config(s, g, c);
+}
+
+#[no_mangle]
+pub extern "C" fn set_storage_path(path: *const c_char) {
+    let p = unsafe { CStr::from_ptr(path) }.to_str().unwrap_or("");
+    session::set_storage_path(p);
+}
+
+/// Returns the S3 fileKey as a null-terminated C string (caller must free with free_string).
+/// Returns null on failure.
+#[no_mangle]
+pub extern "C" fn upload_file(
+    file_path: *const c_char,
+    transfer_id: *const c_char,
+    user_params_json: *const c_char, // JSON object string, may be null
+) -> *mut c_char {
+    if file_path.is_null() || transfer_id.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let tid = unsafe { CStr::from_ptr(transfer_id) }
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+
+    let user_params: HashMap<String, String> = if user_params_json.is_null() {
+        HashMap::new()
+    } else {
+        let json_str = unsafe { CStr::from_ptr(user_params_json) }
+            .to_str()
+            .unwrap_or("{}");
+        serde_json::from_str(json_str).unwrap_or_default()
+    };
+
+    match start_upload_and_enqueue(&path, &tid, user_params) {
+        Ok(file_key) => {
+            CString::new(file_key).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+        Err(e) => {
+            eprintln!("upload_file failed: {}", e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn start_upload_and_enqueue(
+    file_path: &str,
+    transfer_id: &str,
+    user_params: HashMap<String, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    init_nyquest();
+
+    let file_hash = sha256_file(file_path, transfer_id)?;
+
+    // Check dedup
+    {
+        let sess = session::session();
+        if let Some(entry) = sess.find_by_hash(&file_hash) {
+            if entry.state == UploadState::Completed {
+                return Ok(entry.file_key.clone());
+            }
+            if entry.is_resumable() {
+                let key = entry.file_key.clone();
+                drop(sess);
+                session::session().update_file_path(&key, file_path.to_string());
+                enqueue_key(key.clone());
+                return Ok(key);
+            }
+            // FAILED without upload_id — treat as new
+        }
+    }
+
+    // Call startUploadApi
+    let client = nyquest::ClientBuilder::default()
+        .request_timeout(std::time::Duration::from_secs(30))
+        .build_blocking()
+        .map_err(|e| format!("Failed to create client: {:?}", e))?;
+
+    let file_name = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+
+    let file_size = std::fs::metadata(file_path)?.len();
+
+    let start_resp =
+        api::start_upload(&client, &file_name, &file_hash, file_size, &user_params)?;
+
+    let file_key = start_resp.key.clone();
+
+    session::session().register_file(
+        file_key.clone(),
+        file_hash,
+        transfer_id.to_string(),
+        file_path.to_string(),
+        file_name,
+        file_size,
+        user_params,
+    );
+    session::session().set_upload_info(
+        &file_key,
+        start_resp.upload_id,
+        start_resp.part_size,
+        ((file_size + start_resp.part_size - 1) / start_resp.part_size) as u32,
+    );
+    session::persist_session();
+
+    enqueue_key(file_key.clone());
+    Ok(file_key)
+}
+
+#[no_mangle]
+pub extern "C" fn cancel_file(file_key: *const c_char) {
+    if file_key.is_null() {
+        return;
+    }
+    let key = unsafe { CStr::from_ptr(file_key) }.to_str().unwrap_or("");
+    session::session().cancel_file(key);
+    session::persist_session();
+}
+
+#[no_mangle]
+pub extern "C" fn cancel_transfer(transfer_id: *const c_char) {
+    if transfer_id.is_null() {
+        return;
+    }
+    let tid = unsafe { CStr::from_ptr(transfer_id) }.to_str().unwrap_or("");
+    session::session().cancel_transfer(tid);
+    session::persist_session();
+}
+
+#[no_mangle]
+pub extern "C" fn cancel_all() {
+    session::clear_session();
+}
+
+#[no_mangle]
+pub extern "C" fn pause_all() {
+    PAUSE_FLAG.store(true, Ordering::Relaxed);
+    session::session().pause_all();
+    session::persist_session();
+
+    // Fire Paused progress events immediately (before in-flight chunks abort),
+    // so the UI sees the state change without a progress regression — same as WASM.
+    let keys = iosProgress::progress_manager().tracked_file_keys();
+    for file_key in &keys {
+        let (s_agg, t_agg) = {
+            let sess = session::session();
+            let tid = sess.files.get(file_key).map(|e| e.transfer_id.clone()).unwrap_or_default();
+            let s = sess.get_aggregate_progress(None);
+            let t = sess.get_aggregate_progress(Some(&tid));
+            (s, t)
+        };
+        iosProgress::progress_manager().set_status(file_key, UploadState::Paused, s_agg, t_agg);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn resume_all() {
+    PAUSE_FLAG.store(false, Ordering::Relaxed);
+    // Drain stale keys queued before/during pause to avoid double-uploads.
+    QUEUE.lock().unwrap().pending.clear();
+    if let Some(next) = session::session().next_pending_file() {
+        enqueue_key(next);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn get_progress_json(
+    transfer_id: *const c_char, // nullable
+    file_key: *const c_char,    // nullable
+) -> *mut c_char {
+    let tid = if transfer_id.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(transfer_id) }.to_str().ok()
+    };
+    let fk = if file_key.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(file_key) }.to_str().ok()
+    };
+
+    let progress = session::session().get_progress(tid, fk);
+    let json: Vec<serde_json::Value> = progress.iter().map(|p| p.to_json()).collect();
+    let s = serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string());
+    CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn get_aggregate_progress_json(
+    transfer_id: *const c_char, // nullable
+) -> *mut c_char {
+    let tid = if transfer_id.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(transfer_id) }.to_str().ok()
+    };
+    let agg = session::session().get_aggregate_progress(tid);
+    let s = serde_json::to_string(&agg.to_json()).unwrap_or_else(|_| "{}".to_string());
+    CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn set_task_title(title: *const c_char) {
+    if title.is_null() {
+        return;
+    }
+    let t = unsafe { CStr::from_ptr(title) }.to_str().unwrap_or("");
+    session::session().title_template = t.to_string();
+}
+
+#[no_mangle]
+pub extern "C" fn set_task_subtitle(subtitle: *const c_char) {
+    if subtitle.is_null() {
+        return;
+    }
+    let s = unsafe { CStr::from_ptr(subtitle) }.to_str().unwrap_or("");
+    session::session().subtitle_template = s.to_string();
+}
+
+/// Returns the formatted title string (caller must free with free_string).
+#[no_mangle]
+pub extern "C" fn format_title_string() -> *mut c_char {
+    let s = session::session().format_title();
+    CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Returns the formatted subtitle string (caller must free with free_string).
+#[no_mangle]
+pub extern "C" fn format_subtitle_string() -> *mut c_char {
+    let s = session::session().format_subtitle();
+    CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Free a C string previously returned by upload_file / get_progress_json etc.
+#[no_mangle]
+pub extern "C" fn free_string(s: *mut c_char) {
+    if !s.is_null() {
+        unsafe { drop(CString::from_raw(s)) };
+    }
 }
