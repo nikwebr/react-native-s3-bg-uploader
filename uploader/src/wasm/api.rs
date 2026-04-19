@@ -1,11 +1,12 @@
-use js_sys::Promise;
 use std::collections::HashMap;
-use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Request, RequestInit, RequestMode, Response, XmlHttpRequest};
+use web_sys::{Request, RequestInit, RequestMode, Response};
 
-use crate::core::api::{CompleteRequest, StartUploadResponse, UploadUrlsBatchResponse};
+use crate::core::api::{
+    complete_upload_body, complete_upload_url, start_upload_body, upload_urls_batch_body,
+    StartUploadResponse, UploadUrlsBatchResponse,
+};
 use crate::core::config::get_config;
 use crate::core::ChunkUploadResult;
 
@@ -16,11 +17,7 @@ pub async fn start_upload(
     user_params: &HashMap<String, String>,
 ) -> Result<StartUploadResponse, String> {
     let url = get_config().start_upload_api.clone();
-    let mut body_map = user_params.clone();
-    body_map.insert("fileName".to_string(), file_name.to_string());
-    body_map.insert("fileHash".to_string(), file_hash.to_string());
-    body_map.insert("fileSize".to_string(), file_size.to_string());
-    let body = serde_json::to_string(&body_map).map_err(|e| e.to_string())?;
+    let body = start_upload_body(file_name, file_hash, file_size, user_params)?;
     fetch_json::<StartUploadResponse>(&url, "POST", Some(&body)).await
 }
 
@@ -30,9 +27,7 @@ pub async fn fetch_upload_urls_batch(
     part_numbers: &[u32],
 ) -> Result<HashMap<u32, String>, String> {
     let url = get_config().get_upload_urls_api.clone();
-    let body_map =
-        serde_json::json!({ "key": file_key, "uploadId": upload_id, "parts": part_numbers });
-    let body = serde_json::to_string(&body_map).map_err(|e| e.to_string())?;
+    let body = upload_urls_batch_body(file_key, upload_id, part_numbers)?;
     let resp: UploadUrlsBatchResponse = fetch_json(&url, "POST", Some(&body)).await?;
     Ok(resp.into_part_map())
 }
@@ -43,58 +38,11 @@ pub async fn complete_upload(
     results: Vec<ChunkUploadResult>,
 ) -> Result<(), String> {
     let base_url = get_config().complete_api.clone();
-    let url = format!("{}/{}/{}", base_url, upload_id, file_key);
-    let parts = CompleteRequest::from_upload_results(results);
-    let body = parts.serialize()?;
-    xhr_post_json(&url, &body).await
-}
-
-/// POST JSON via XHR — avoids the web-sys RequestInit body bug where the body
-/// is not reliably forwarded when using the Fetch API wrapper.
-async fn xhr_post_json(url: &str, body: &str) -> Result<(), String> {
-    let xhr = XmlHttpRequest::new().map_err(|e| format!("{:?}", e))?;
-    xhr.open("POST", url).map_err(|e| format!("{:?}", e))?;
-    xhr.set_request_header("Content-Type", "application/json")
-        .map_err(|e| format!("{:?}", e))?;
-
-    let body_owned = body.to_string();
-    let promise = Promise::new(&mut |resolve, reject| {
-        let xhr_clone = xhr.clone();
-        let reject_clone = reject.clone();
-
-        let onload = Closure::wrap(Box::new(move || {
-            let status = xhr_clone.status().unwrap_or(0);
-            if status >= 200 && status < 300 {
-                resolve.call1(&JsValue::NULL, &JsValue::NULL).ok();
-            } else {
-                reject_clone
-                    .call1(
-                        &JsValue::NULL,
-                        &JsValue::from_str(&format!("HTTP {}", status)),
-                    )
-                    .ok();
-            }
-        }) as Box<dyn FnMut()>);
-
-        let onerror = Closure::wrap(Box::new(move || {
-            reject
-                .call1(&JsValue::NULL, &JsValue::from_str("Network error"))
-                .ok();
-        }) as Box<dyn FnMut()>);
-
-        xhr.set_onload(Some(onload.as_ref().unchecked_ref()));
-        xhr.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-        onload.forget();
-        onerror.forget();
-    });
-
-    xhr.send_with_opt_str(Some(&body_owned))
-        .map_err(|e| format!("{:?}", e))?;
-
-    JsFuture::from(promise)
+    let url = complete_upload_url(&base_url, upload_id, file_key);
+    let body = complete_upload_body(results)?;
+    fetch_json::<serde_json::Value>(&url, "POST", Some(&body))
         .await
         .map(|_| ())
-        .map_err(|e| format!("complete_upload XHR failed: {:?}", e))
 }
 
 async fn fetch_request(request: &Request) -> Result<JsValue, JsValue> {

@@ -62,6 +62,41 @@ impl CompleteRequest {
     }
 }
 
+pub fn start_upload_body(
+    file_name: &str,
+    file_hash: &str,
+    file_size: u64,
+    user_params: &HashMap<String, String>,
+) -> Result<String, String> {
+    let mut body_map = user_params.clone();
+    body_map.insert("fileName".to_string(), file_name.to_string());
+    body_map.insert("fileHash".to_string(), file_hash.to_string());
+    body_map.insert("fileSize".to_string(), file_size.to_string());
+    serde_json::to_string(&body_map)
+        .map_err(|e| format!("Failed to serialize start_upload body: {}", e))
+}
+
+pub fn upload_urls_batch_body(
+    key: &str,
+    upload_id: &str,
+    part_numbers: &[u32],
+) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({
+        "key": key,
+        "uploadId": upload_id,
+        "parts": part_numbers
+    }))
+    .map_err(|e| format!("Failed to serialize batch url body: {}", e))
+}
+
+pub fn complete_upload_body(results: Vec<ChunkUploadResult>) -> Result<String, String> {
+    CompleteRequest::from_upload_results(results).serialize()
+}
+
+pub fn complete_upload_url(base_url: &str, upload_id: &str, key: &str) -> String {
+    format!("{}/{}/{}", base_url, upload_id, key)
+}
+
 impl ChunkUploadResult {
     fn to_complete_part(&self) -> CompletePart {
         CompletePart {
@@ -84,13 +119,7 @@ pub fn start_upload(
     user_params: &HashMap<String, String>,
 ) -> Result<StartUploadResponse, Box<dyn std::error::Error>> {
     let url = get_config().start_upload_api.clone();
-    let mut body_map = user_params.clone();
-    body_map.insert("fileName".to_string(), file_name.to_string());
-    body_map.insert("fileHash".to_string(), file_hash.to_string());
-    body_map.insert("fileSize".to_string(), file_size.to_string());
-
-    let body_json = serde_json::to_string(&body_map)
-        .map_err(|e| format!("Failed to serialize start_upload body: {}", e))?;
+    let body_json = start_upload_body(file_name, file_hash, file_size, user_params)?;
 
     let body = nyquest::Body::bytes(body_json.into_bytes(), "application/json");
     let request = nyquest::Request::post(url).with_body(body);
@@ -112,9 +141,7 @@ pub fn fetch_upload_urls_batch(
     part_numbers: &[u32],
 ) -> Result<HashMap<u32, String>, Box<dyn std::error::Error>> {
     let url = get_config().get_upload_urls_api.clone();
-    let body_map = serde_json::json!({ "key": key, "uploadId": upload_id, "parts": part_numbers });
-    let body_json = serde_json::to_string(&body_map)
-        .map_err(|e| format!("Failed to serialize batch url body: {}", e))?;
+    let body_json = upload_urls_batch_body(key, upload_id, part_numbers)?;
 
     let body = nyquest::Body::bytes(body_json.into_bytes(), "application/json");
     let request = nyquest::Request::post(url).with_body(body);
@@ -141,12 +168,9 @@ pub fn complete_upload(
     results: Vec<ChunkUploadResult>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = get_config().complete_api.clone();
-    let parts = CompleteRequest::from_upload_results(results);
-    let body_json = parts
-        .serialize()
-        .map_err(|e| format!("Failed to serialize complete request: {}", e))?;
+    let body_json = complete_upload_body(results)?;
     let body = nyquest::Body::bytes(body_json.into_bytes(), "application/json");
-    let request = nyquest::Request::post(format!("{}/{}/{}", url, upload_id, key)).with_body(body);
+    let request = nyquest::Request::post(complete_upload_url(&url, upload_id, key)).with_body(body);
     client
         .request(request)
         .map_err(|e| format!("complete_upload request failed: {:?}", e))?;
@@ -166,14 +190,15 @@ pub fn start_upload_android(
     user_params: &HashMap<String, String>,
 ) -> Result<StartUploadResponse, Box<dyn std::error::Error>> {
     let url = get_config().start_upload_api.clone();
-    let mut body_map = user_params.clone();
-    body_map.insert("fileName".to_string(), file_name.to_string());
-    body_map.insert("fileHash".to_string(), file_hash.to_string());
-    body_map.insert("fileSize".to_string(), file_size.to_string());
-
     let response = client
         .post(&url)
-        .json(&body_map)
+        .body(start_upload_body(
+            file_name,
+            file_hash,
+            file_size,
+            user_params,
+        )?)
+        .header("Content-Type", "application/json")
         .send()
         .map_err(|e| format!("start_upload request failed: {:?}", e))?;
     let text = response
@@ -191,10 +216,10 @@ pub fn fetch_upload_urls_batch_android(
     part_numbers: &[u32],
 ) -> Result<HashMap<u32, String>, Box<dyn std::error::Error>> {
     let url = get_config().get_upload_urls_api.clone();
-    let body_map = serde_json::json!({ "key": key, "uploadId": upload_id, "parts": part_numbers });
     let response = client
         .post(&url)
-        .json(&body_map)
+        .body(upload_urls_batch_body(key, upload_id, part_numbers)?)
+        .header("Content-Type", "application/json")
         .send()
         .map_err(|e| format!("fetch_upload_urls_batch request failed: {:?}", e))?;
     let text = response
@@ -217,12 +242,9 @@ pub fn complete_upload_android(
     results: Vec<ChunkUploadResult>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = get_config().complete_api.clone();
-    let parts = CompleteRequest::from_upload_results(results);
-    let body_json = parts
-        .serialize()
-        .map_err(|e| format!("Failed to serialize complete request: {}", e))?;
+    let body_json = complete_upload_body(results)?;
     client
-        .post(format!("{}/{}/{}", url, upload_id, key))
+        .post(complete_upload_url(&url, upload_id, key))
         .header("Content-Type", "application/json")
         .body(body_json)
         .send()
