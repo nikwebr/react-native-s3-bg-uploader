@@ -1,25 +1,26 @@
 pub mod progress;
-pub mod api;
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::os::unix::io::{FromRawFd, RawFd};
-use std::sync::{Arc, Condvar, Mutex, Once};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread;
 
-use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
+use jni::JNIEnv;
 
-use crate::core::{ChunkUploadResult, MAX_CONCURRENT_UPLOADS, MAX_RETRIES, clean_etag};
+use crate::android::progress::{self as androidProgress, ProgressReader};
+use crate::core::api;
 use crate::core::chunk::ChunkInfo;
 use crate::core::config;
 use crate::core::hash::sha256_fd;
 use crate::core::retry::{self, RetryPolicy};
 use crate::core::session::{self, UploadState};
-use crate::android::progress::{self as androidProgress, ProgressReader};
+use crate::core::upload::{self, StartDecision};
+use crate::core::{clean_etag, ChunkUploadResult, MAX_CONCURRENT_UPLOADS, MAX_RETRIES};
 
 fn init_logging() {
     let _ = android_logger::init_once(
@@ -81,7 +82,10 @@ fn start_worker_thread() {
 
 fn enqueue(file_key: String, raw_fd: RawFd) {
     start_worker_thread();
-    QUEUE.lock().unwrap().push_back(PendingUpload { file_key, raw_fd });
+    QUEUE
+        .lock()
+        .unwrap()
+        .push_back(PendingUpload { file_key, raw_fd });
     QUEUE_SIGNAL.notify_one();
 }
 
@@ -90,31 +94,28 @@ fn enqueue(file_key: String, raw_fd: RawFd) {
 // ---------------------------------------------------------------------------
 
 fn run_upload(file_key: &str, raw_fd: RawFd) {
-    let (transfer_id, upload_id, part_size_opt, completed_etags) = {
+    let transfer_id = {
         let sess = session::session();
         let entry = match sess.files.get(file_key) {
             Some(e) => e.clone(),
             None => {
-                unsafe { libc::close(raw_fd); }
+                unsafe {
+                    libc::close(raw_fd);
+                }
                 return;
             }
         };
-        (entry.transfer_id.clone(), entry.upload_id.clone(), entry.part_size, entry.completed_chunk_etags.clone())
+        entry.transfer_id
     };
 
     session::session().mark_file_state(file_key, UploadState::Running);
     session::persist_session();
 
-    let result = upload_file_internal(
-        file_key,
-        &transfer_id,
-        raw_fd,
-        upload_id,
-        part_size_opt,
-        completed_etags,
-    );
+    let result = upload_file_internal(file_key, &transfer_id, raw_fd);
 
-    unsafe { libc::close(raw_fd); }
+    unsafe {
+        libc::close(raw_fd);
+    }
 
     match result {
         Ok(_) => session::session().mark_file_state(file_key, UploadState::Completed),
@@ -141,54 +142,37 @@ fn upload_file_internal(
     file_key: &str,
     transfer_id: &str,
     raw_fd: RawFd,
-    existing_upload_id: Option<String>,
-    existing_part_size: Option<u64>,
-    completed_etags: Vec<(u32, String)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = unsafe { File::from_raw_fd(dup_fd(raw_fd)?) };
     let file_size = file.metadata()?.len();
+    let prepared = upload::prepare_upload(file_key, file_size)?;
+    session::session().set_file_uploaded_bytes(file_key, prepared.committed_bytes);
 
-    let (upload_id, part_size) = match (existing_upload_id, existing_part_size) {
-        (Some(uid), Some(ps)) => (uid, ps),
-        _ => return Err("Missing upload_id or part_size".into()),
-    };
-
-    let total_parts = ((file_size + part_size - 1) / part_size) as u32;
-    let done_parts: std::collections::HashSet<u32> =
-        completed_etags.iter().map(|(p, _)| *p).collect();
-    let remaining_parts: Vec<u32> = (1..=total_parts)
-        .filter(|p| !done_parts.contains(p))
-        .collect();
-
-    if remaining_parts.is_empty() {
+    if prepared.remaining_parts.is_empty() {
         let client = build_client();
-        let all_results = completed_etags
-            .into_iter()
-            .map(|(pn, etag)| ChunkUploadResult { part_number: pn, etag })
-            .collect();
-        return api::complete_upload_android(&client, file_key, &upload_id, all_results);
+        return api::complete_upload_android(
+            &client,
+            file_key,
+            &prepared.upload_id,
+            upload::combine_upload_results(prepared.completed_etags, Vec::new()),
+        );
     }
 
-    // Init progress manager
     {
         let (s_agg, t_agg) = {
             let sess = session::session();
-            let s = sess.get_aggregate_progress(None);
-            let t = sess.get_aggregate_progress(Some(transfer_id));
-            (s, t)
+            (
+                sess.get_aggregate_progress(None),
+                sess.get_aggregate_progress(Some(transfer_id)),
+            )
         };
-        let already_completed_parts = done_parts.len() as u32;
-        let already_completed_bytes: u64 = done_parts.iter().map(|&p| {
-            let start = (p as u64 - 1) * part_size;
-            file_size.saturating_sub(start).min(part_size)
-        }).sum();
         androidProgress::progress_manager().init(
             file_key.to_string(),
             transfer_id.to_string(),
             file_size,
-            total_parts,
-            already_completed_bytes,
-            already_completed_parts,
+            prepared.total_parts,
+            prepared.committed_bytes,
+            prepared.done_parts.len() as u32,
             s_agg,
             t_agg,
         );
@@ -199,19 +183,18 @@ fn upload_file_internal(
         &client,
         file_key,
         raw_fd,
-        &upload_id,
-        part_size,
+        &prepared.upload_id,
+        prepared.part_size,
         file_size,
-        remaining_parts,
+        prepared.remaining_parts,
     )?;
 
-    let mut all_results: Vec<ChunkUploadResult> = completed_etags
-        .into_iter()
-        .map(|(pn, etag)| ChunkUploadResult { part_number: pn, etag })
-        .collect();
-    all_results.extend(new_results);
-
-    api::complete_upload_android(&client, file_key, &upload_id, all_results)
+    api::complete_upload_android(
+        &client,
+        file_key,
+        &prepared.upload_id,
+        upload::combine_upload_results(prepared.completed_etags, new_results),
+    )
 }
 
 fn upload_parts_with_rolling_urls(
@@ -229,8 +212,11 @@ fn upload_parts_with_rolling_urls(
     let parts_len = parts_arc.len();
 
     let prefetch = |part_numbers: &[u32]| -> Result<(), Box<dyn std::error::Error>> {
-        if part_numbers.is_empty() { return Ok(()); }
-        let batch = api::fetch_upload_urls_batch_android(client, file_key, upload_id, part_numbers)?;
+        if part_numbers.is_empty() {
+            return Ok(());
+        }
+        let batch =
+            api::fetch_upload_urls_batch_android(client, file_key, upload_id, part_numbers)?;
         url_pool.lock().unwrap().extend(batch);
         Ok(())
     };
@@ -259,27 +245,45 @@ fn upload_parts_with_rolling_urls(
                 let url = url_pool.lock().unwrap().get(&part_number).cloned();
                 let url = match url {
                     Some(u) => u,
-                    None => { log::error!("No URL for part {}", part_number); continue; }
+                    None => {
+                        log::error!("No URL for part {}", part_number);
+                        continue;
+                    }
                 };
 
                 let chunk_info = ChunkInfo {
                     part_number,
                     start_pos: (part_number as u64 - 1) * part_size,
-                    chunk_size: (file_size.saturating_sub((part_number as u64 - 1) * part_size)).min(part_size),
+                    chunk_size: upload::part_size_for(part_number, part_size, file_size),
                     url: url.clone(),
                 };
 
                 let chunk = match read_chunk_from_fd(raw_fd, &chunk_info) {
                     Ok(d) => d,
-                    Err(e) => { log::error!("Failed to read chunk {}: {:?}", part_number, e); continue; }
+                    Err(e) => {
+                        log::error!("Failed to read chunk {}: {:?}", part_number, e);
+                        continue;
+                    }
                 };
 
-                let etag = match upload_chunk_with_retry(&client, &url, &chunk, part_number, &file_key_str) {
+                let etag = match upload_chunk_with_retry(
+                    &client,
+                    &url,
+                    &chunk,
+                    part_number,
+                    &file_key_str,
+                ) {
                     Ok(t) => t,
-                    Err(e) => { log::error!("Failed to upload part {}: {:?}", part_number, e); continue; }
+                    Err(e) => {
+                        log::error!("Failed to upload part {}: {:?}", part_number, e);
+                        continue;
+                    }
                 };
 
-                completed.lock().unwrap().push(ChunkUploadResult { part_number, etag });
+                completed
+                    .lock()
+                    .unwrap()
+                    .push(ChunkUploadResult { part_number, etag });
             }
         });
         handles.push(handle);
@@ -298,7 +302,9 @@ fn upload_parts_with_rolling_urls(
     }
     drop(tx);
 
-    for handle in handles { handle.join().ok(); }
+    for handle in handles {
+        handle.join().ok();
+    }
 
     let results = completed_parts.lock().unwrap().clone();
     if results.len() != parts_arc.len() {
@@ -323,12 +329,22 @@ fn upload_chunk_with_retry(
         |_attempt| {
             let (s_agg, t_agg) = {
                 let sess = session::session();
-                let tid = sess.files.get(&file_key).map(|e| e.transfer_id.clone()).unwrap_or_default();
+                let tid = sess
+                    .files
+                    .get(&file_key)
+                    .map(|e| e.transfer_id.clone())
+                    .unwrap_or_default();
                 let s = sess.get_aggregate_progress(None);
                 let t = sess.get_aggregate_progress(Some(&tid));
                 (s, t)
             };
-            androidProgress::progress_manager().update_in_flight(&file_key, part_number, 0, s_agg, t_agg);
+            androidProgress::progress_manager().update_in_flight(
+                &file_key,
+                part_number,
+                0,
+                s_agg,
+                t_agg,
+            );
 
             let progress_reader = ProgressReader::new(data.to_vec(), file_key.clone(), part_number);
             let response = client
@@ -338,28 +354,47 @@ fn upload_chunk_with_retry(
                 .send()
                 .map_err(|e| format!("{:?}", e))?;
 
-            let etag = response.headers().get("etag")
+            let etag = response
+                .headers()
+                .get("etag")
                 .and_then(|v| v.to_str().ok())
                 .map(clean_etag)
                 .ok_or_else(|| "No ETag in response".to_string())?;
 
             let (s_agg, t_agg) = {
                 let sess = session::session();
-                let tid = sess.files.get(&file_key).map(|e| e.transfer_id.clone()).unwrap_or_default();
+                let tid = sess
+                    .files
+                    .get(&file_key)
+                    .map(|e| e.transfer_id.clone())
+                    .unwrap_or_default();
                 let s = sess.get_aggregate_progress(None);
                 let t = sess.get_aggregate_progress(Some(&tid));
                 (s, t)
             };
-            androidProgress::progress_manager().complete_chunk(&file_key, part_number, chunk_size, s_agg, t_agg);
+            androidProgress::progress_manager().complete_chunk(
+                &file_key,
+                part_number,
+                chunk_size,
+                s_agg,
+                t_agg,
+            );
             session::session().complete_chunk(&file_key, part_number, etag.clone(), chunk_size);
             session::persist_session();
             Ok(etag)
         },
         |attempt, err, delay_ms| {
-            log::warn!("Upload attempt {} failed for part {}: {}, retrying in {}ms", attempt, part_number, err, delay_ms);
+            log::warn!(
+                "Upload attempt {} failed for part {}: {}, retrying in {}ms",
+                attempt,
+                part_number,
+                err,
+                delay_ms
+            );
             thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
         },
-    ).map_err(|e| e.into())
+    )
+    .map_err(|e| e.into())
 }
 
 fn read_chunk_from_fd(raw_fd: RawFd, chunk: &ChunkInfo) -> std::io::Result<Vec<u8>> {
@@ -380,9 +415,18 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetConfig(
     get_upload_urls_api: JString,
     complete_api: JString,
 ) {
-    let s: String = env.get_string(&start_upload_api).map(|s| s.into()).unwrap_or_default();
-    let g: String = env.get_string(&get_upload_urls_api).map(|s| s.into()).unwrap_or_default();
-    let c: String = env.get_string(&complete_api).map(|s| s.into()).unwrap_or_default();
+    let s: String = env
+        .get_string(&start_upload_api)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let g: String = env
+        .get_string(&get_upload_urls_api)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let c: String = env
+        .get_string(&complete_api)
+        .map(|s| s.into())
+        .unwrap_or_default();
     config::set_config(&s, &g, &c);
 }
 
@@ -412,7 +456,10 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetTaskSub
     _class: JClass,
     subtitle: JString,
 ) {
-    let s: String = env.get_string(&subtitle).map(|s| s.into()).unwrap_or_default();
+    let s: String = env
+        .get_string(&subtitle)
+        .map(|s| s.into())
+        .unwrap_or_default();
     session::session().subtitle_template = s;
 }
 
@@ -427,114 +474,164 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeUploadFile
 ) -> jstring {
     init_logging();
 
-    let tid: String = env.get_string(&transfer_id).map(|s| s.into()).unwrap_or_default();
-    let params_str: String = env.get_string(&user_params_json).map(|s| s.into()).unwrap_or_else(|_| "{}".to_string());
-    let user_params: HashMap<String, String> = serde_json::from_str(&params_str).unwrap_or_default();
+    let tid: String = env
+        .get_string(&transfer_id)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let params_str: String = env
+        .get_string(&user_params_json)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| "{}".to_string());
+    let user_params: HashMap<String, String> =
+        serde_json::from_str(&params_str).unwrap_or_default();
 
     let raw_fd = fd as RawFd;
 
     // Compute hash and call startUploadApi
     let file_hash = match sha256_fd(raw_fd, &tid) {
         Ok(h) => h,
-        Err(e) => { log::error!("sha256_fd failed: {}", e); return empty_jstring(&mut env); }
-    };
-
-    let file_key = {
-        let sess = session::session();
-        if let Some(entry) = sess.find_by_hash(&file_hash) {
-            if entry.state == UploadState::Completed {
-                let k = entry.file_key.clone();
-                drop(sess);
-                return env.new_string(&k).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env));
-            }
-            if entry.is_resumable() {
-                let k = entry.file_key.clone();
-                drop(sess);
-                let dup = match dup_fd(raw_fd) { Ok(f) => f, Err(_) => return empty_jstring(&mut env) };
-                enqueue(k.clone(), dup);
-                return env.new_string(&k).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env));
-            }
+        Err(e) => {
+            log::error!("sha256_fd failed: {}", e);
+            return empty_jstring(&mut env);
         }
-        drop(sess);
-
-        let dup_for_size = match dup_fd(raw_fd) { Ok(f) => f, Err(_) => return empty_jstring(&mut env) };
-        let file_size = unsafe { let f = File::from_raw_fd(dup_for_size); f.metadata().map(|m| m.len()).unwrap_or(0) };
-
-        let client = build_client();
-        let start_resp = match api::start_upload_android(
-            &client, "file", &file_hash, file_size, &user_params,
-        ) {
-            Ok(r) => r,
-            Err(e) => { log::error!("startUploadApi failed: {}", e); return empty_jstring(&mut env); }
-        };
-
-        let fk = start_resp.key.clone();
-        session::session().register_file(
-            fk.clone(), file_hash, tid.clone(), String::new(), "file".to_string(),
-            file_size, user_params,
-        );
-        session::session().set_upload_info(
-            &fk, start_resp.upload_id, start_resp.part_size,
-            ((file_size + start_resp.part_size - 1) / start_resp.part_size) as u32,
-        );
-        session::persist_session();
-        fk
     };
 
-    let dup = match dup_fd(raw_fd) { Ok(f) => f, Err(_) => return empty_jstring(&mut env) };
+    let file_key = match upload::start_decision(&file_hash) {
+        StartDecision::Completed { file_key } => {
+            return env
+                .new_string(&file_key)
+                .map(|s| s.into_raw())
+                .unwrap_or(empty_jstring(&mut env));
+        }
+        StartDecision::Resume { file_key } => {
+            let dup = match dup_fd(raw_fd) {
+                Ok(f) => f,
+                Err(_) => return empty_jstring(&mut env),
+            };
+            enqueue(file_key.clone(), dup);
+            return env
+                .new_string(&file_key)
+                .map(|s| s.into_raw())
+                .unwrap_or(empty_jstring(&mut env));
+        }
+        StartDecision::StartNew => {
+            let dup_for_size = match dup_fd(raw_fd) {
+                Ok(f) => f,
+                Err(_) => return empty_jstring(&mut env),
+            };
+            let file_size = unsafe {
+                let f = File::from_raw_fd(dup_for_size);
+                f.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+
+            let client = build_client();
+            let start_resp = match api::start_upload_android(
+                &client,
+                "file",
+                &file_hash,
+                file_size,
+                &user_params,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("startUploadApi failed: {}", e);
+                    return empty_jstring(&mut env);
+                }
+            };
+
+            let file_key = upload::register_started_upload(
+                file_hash,
+                &tid,
+                String::new(),
+                "file".to_string(),
+                file_size,
+                user_params,
+                start_resp,
+            );
+            session::persist_session();
+            file_key
+        }
+    };
+
+    let dup = match dup_fd(raw_fd) {
+        Ok(f) => f,
+        Err(_) => return empty_jstring(&mut env),
+    };
     enqueue(file_key.clone(), dup);
 
-    env.new_string(&file_key).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env))
+    env.new_string(&file_key)
+        .map(|s| s.into_raw())
+        .unwrap_or(empty_jstring(&mut env))
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetFormattedTitle(
-    mut env: JNIEnv, _class: JClass,
+    mut env: JNIEnv,
+    _class: JClass,
 ) -> jstring {
     let s = session::session().format_title();
-    env.new_string(&s).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env))
+    env.new_string(&s)
+        .map(|s| s.into_raw())
+        .unwrap_or(empty_jstring(&mut env))
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetFormattedSubtitle(
-    mut env: JNIEnv, _class: JClass,
+    mut env: JNIEnv,
+    _class: JClass,
 ) -> jstring {
     let s = session::session().format_subtitle();
-    env.new_string(&s).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env))
+    env.new_string(&s)
+        .map(|s| s.into_raw())
+        .unwrap_or(empty_jstring(&mut env))
 }
 
 fn empty_jstring(env: &mut JNIEnv) -> jstring {
-    env.new_string("").map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    env.new_string("")
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelFile(
-    mut env: JNIEnv, _class: JClass, file_key: JString,
+    mut env: JNIEnv,
+    _class: JClass,
+    file_key: JString,
 ) {
-    let k: String = env.get_string(&file_key).map(|s| s.into()).unwrap_or_default();
+    let k: String = env
+        .get_string(&file_key)
+        .map(|s| s.into())
+        .unwrap_or_default();
     session::session().cancel_file(&k);
     session::persist_session();
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelTransfer(
-    mut env: JNIEnv, _class: JClass, transfer_id: JString,
+    mut env: JNIEnv,
+    _class: JClass,
+    transfer_id: JString,
 ) {
-    let t: String = env.get_string(&transfer_id).map(|s| s.into()).unwrap_or_default();
+    let t: String = env
+        .get_string(&transfer_id)
+        .map(|s| s.into())
+        .unwrap_or_default();
     session::session().cancel_transfer(&t);
     session::persist_session();
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelAll(
-    _env: JNIEnv, _class: JClass,
+    _env: JNIEnv,
+    _class: JClass,
 ) {
     session::clear_session();
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativePauseAll(
-    _env: JNIEnv, _class: JClass,
+    _env: JNIEnv,
+    _class: JClass,
 ) {
     PAUSE_FLAG.store(true, Ordering::Relaxed);
     session::session().pause_all();
@@ -543,12 +640,14 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativePauseAll(
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeResumeAll(
-    _env: JNIEnv, _class: JClass,
+    _env: JNIEnv,
+    _class: JClass,
 ) {
     PAUSE_FLAG.store(false, Ordering::Relaxed);
     let file_keys: Vec<String> = {
         let sess = session::session();
-        sess.files.values()
+        sess.files
+            .values()
             .filter(|e| e.state == UploadState::Paused || e.state == UploadState::Failed)
             .map(|e| e.file_key.clone())
             .collect()
@@ -561,36 +660,51 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeResumeAll(
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetProgressJson(
-    mut env: JNIEnv, _class: JClass,
+    mut env: JNIEnv,
+    _class: JClass,
     transfer_id: JString,
     file_key: JString,
 ) -> jstring {
-    let tid: Option<String> = env.get_string(&transfer_id).map(|s| s.into()).ok()
+    let tid: Option<String> = env
+        .get_string(&transfer_id)
+        .map(|s| s.into())
+        .ok()
         .filter(|s: &String| !s.is_empty());
-    let fk: Option<String> = env.get_string(&file_key).map(|s| s.into()).ok()
+    let fk: Option<String> = env
+        .get_string(&file_key)
+        .map(|s| s.into())
+        .ok()
         .filter(|s: &String| !s.is_empty());
     let progress = session::session().get_progress(tid.as_deref(), fk.as_deref());
     let json: Vec<_> = progress.iter().map(|p| p.to_json()).collect();
     let s = serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string());
-    env.new_string(&s).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env))
+    env.new_string(&s)
+        .map(|s| s.into_raw())
+        .unwrap_or(empty_jstring(&mut env))
 }
 
 /// Returns live per-file progress JSON, merging in-flight bytes from ProgressManager.
 /// Files no longer in ProgressManager (completed/not-started) fall back to session data.
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetLiveProgressJson(
-    mut env: JNIEnv, _class: JClass,
+    mut env: JNIEnv,
+    _class: JClass,
     transfer_id: JString,
     file_key: JString,
 ) -> jstring {
-    let tid: Option<String> = env.get_string(&transfer_id).map(|s| s.into()).ok()
+    let tid: Option<String> = env
+        .get_string(&transfer_id)
+        .map(|s| s.into())
+        .ok()
         .filter(|s: &String| !s.is_empty());
-    let fk: Option<String> = env.get_string(&file_key).map(|s| s.into()).ok()
+    let fk: Option<String> = env
+        .get_string(&file_key)
+        .map(|s| s.into())
+        .ok()
         .filter(|s: &String| !s.is_empty());
 
     // Live entries from ProgressManager (in-flight tracking).
-    let live = androidProgress::progress_manager()
-        .get_live_progress(tid.as_deref(), fk.as_deref());
+    let live = androidProgress::progress_manager().get_live_progress(tid.as_deref(), fk.as_deref());
     let live_keys: std::collections::HashSet<String> =
         live.iter().map(|p| p.file_key.clone()).collect();
 
@@ -605,42 +719,63 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetLivePro
 
     let json: Vec<_> = merged.iter().map(|p| p.to_json()).collect();
     let s = serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string());
-    env.new_string(&s).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env))
+    env.new_string(&s)
+        .map(|s| s.into_raw())
+        .unwrap_or(empty_jstring(&mut env))
 }
 
 /// Returns live aggregate progress JSON, merging in-flight bytes from ProgressManager on top of session baseline.
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetLiveAggregateProgressJson(
-    mut env: JNIEnv, _class: JClass,
+    mut env: JNIEnv,
+    _class: JClass,
     transfer_id: JString,
 ) -> jstring {
-    let tid: Option<String> = env.get_string(&transfer_id).map(|s| s.into()).ok()
+    let tid: Option<String> = env
+        .get_string(&transfer_id)
+        .map(|s| s.into())
+        .ok()
         .filter(|s: &String| !s.is_empty());
     let (session_agg, transfer_agg, current_tid) = {
         let sess = session::session();
         let s = sess.get_aggregate_progress(None);
         let t = sess.get_aggregate_progress(tid.as_deref());
-        let ctid = tid.clone().unwrap_or_else(|| {
-            sess.current_transfer_id.clone().unwrap_or_default()
-        });
+        let ctid = tid
+            .clone()
+            .unwrap_or_else(|| sess.current_transfer_id.clone().unwrap_or_default());
         (s, t, ctid)
     };
-    let (live_session, live_transfer) = androidProgress::progress_manager()
-        .get_live_aggregate(session_agg, transfer_agg, &current_tid);
+    let (live_session, live_transfer) = androidProgress::progress_manager().get_live_aggregate(
+        session_agg,
+        transfer_agg,
+        &current_tid,
+    );
     // Return the aggregate scoped to the requested transfer (or session if none).
-    let result = if tid.is_some() { live_transfer } else { live_session };
+    let result = if tid.is_some() {
+        live_transfer
+    } else {
+        live_session
+    };
     let s = serde_json::to_string(&result.to_json()).unwrap_or_else(|_| "{}".to_string());
-    env.new_string(&s).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env))
+    env.new_string(&s)
+        .map(|s| s.into_raw())
+        .unwrap_or(empty_jstring(&mut env))
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetAggregateProgressJson(
-    mut env: JNIEnv, _class: JClass,
+    mut env: JNIEnv,
+    _class: JClass,
     transfer_id: JString,
 ) -> jstring {
-    let tid: Option<String> = env.get_string(&transfer_id).map(|s| s.into()).ok()
+    let tid: Option<String> = env
+        .get_string(&transfer_id)
+        .map(|s| s.into())
+        .ok()
         .filter(|s: &String| !s.is_empty());
     let agg = session::session().get_aggregate_progress(tid.as_deref());
     let s = serde_json::to_string(&agg.to_json()).unwrap_or_else(|_| "{}".to_string());
-    env.new_string(&s).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env))
+    env.new_string(&s)
+        .map(|s| s.into_raw())
+        .unwrap_or(empty_jstring(&mut env))
 }

@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-use crate::core::ChunkUploadResult;
 #[cfg(any(feature = "ios", feature = "android"))]
 use crate::core::config::get_config;
+use crate::core::ChunkUploadResult;
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
@@ -55,7 +55,8 @@ impl CompleteRequest {
     }
 
     pub fn from_upload_results(results: Vec<ChunkUploadResult>) -> Self {
-        let mut parts: Vec<CompletePart> = results.into_iter().map(|r| r.to_complete_part()).collect();
+        let mut parts: Vec<CompletePart> =
+            results.into_iter().map(|r| r.to_complete_part()).collect();
         parts.sort_by_key(|p| p.part_number);
         CompleteRequest { parts }
     }
@@ -123,8 +124,12 @@ pub fn fetch_upload_urls_batch(
     let text = response
         .text()
         .map_err(|e| format!("fetch_upload_urls_batch read body failed: {:?}", e))?;
-    let parsed: UploadUrlsBatchResponse = serde_json::from_str(&text)
-        .map_err(|e| format!("fetch_upload_urls_batch parse failed: {:?} body={}", e, text))?;
+    let parsed: UploadUrlsBatchResponse = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "fetch_upload_urls_batch parse failed: {:?} body={}",
+            e, text
+        )
+    })?;
     Ok(parsed.into_part_map())
 }
 
@@ -195,8 +200,12 @@ pub fn fetch_upload_urls_batch_android(
     let text = response
         .text()
         .map_err(|e| format!("fetch_upload_urls_batch read body failed: {:?}", e))?;
-    let parsed: UploadUrlsBatchResponse = serde_json::from_str(&text)
-        .map_err(|e| format!("fetch_upload_urls_batch parse failed: {:?} body={}", e, text))?;
+    let parsed: UploadUrlsBatchResponse = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "fetch_upload_urls_batch parse failed: {:?} body={}",
+            e, text
+        )
+    })?;
     Ok(parsed.into_part_map())
 }
 

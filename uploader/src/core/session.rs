@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, OnceLock};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 // ---------------------------------------------------------------------------
 // State enums
@@ -120,7 +120,10 @@ impl FileEntry {
     pub fn is_resumable(&self) -> bool {
         matches!(
             self.state,
-            UploadState::NotStarted | UploadState::Failed | UploadState::Paused | UploadState::Running
+            UploadState::NotStarted
+                | UploadState::Failed
+                | UploadState::Paused
+                | UploadState::Running
         ) && self.upload_id.is_some()
     }
 }
@@ -356,7 +359,11 @@ impl Session {
 
     pub fn complete_chunk(&mut self, file_key: &str, part_number: u32, etag: String, size: u64) {
         if let Some(entry) = self.files.get_mut(file_key) {
-            if !entry.completed_chunk_etags.iter().any(|(p, _)| *p == part_number) {
+            if !entry
+                .completed_chunk_etags
+                .iter()
+                .any(|(p, _)| *p == part_number)
+            {
                 entry.completed_chunk_etags.push((part_number, etag));
                 entry.completed_parts += 1;
                 entry.uploaded_bytes = (entry.uploaded_bytes + size).min(entry.total_bytes);
@@ -644,7 +651,9 @@ pub fn clear_session() {
     #[cfg(not(target_arch = "wasm32"))]
     native_clear();
     #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(async { let _ = idb_clear().await; });
+    wasm_bindgen_futures::spawn_local(async {
+        let _ = idb_clear().await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -731,7 +740,12 @@ async fn idb_save(json: &str) -> rexie::Result<()> {
     let db = open_idb().await?;
     let tx = db.transaction(&[IDB_STORE], rexie::TransactionMode::ReadWrite)?;
     let store = tx.store(IDB_STORE)?;
-    store.put(&wasm_bindgen::JsValue::from_str(json), Some(&wasm_bindgen::JsValue::from_str("data"))).await?;
+    store
+        .put(
+            &wasm_bindgen::JsValue::from_str(json),
+            Some(&wasm_bindgen::JsValue::from_str("data")),
+        )
+        .await?;
     tx.done().await?;
     Ok(())
 }
@@ -739,9 +753,14 @@ async fn idb_save(json: &str) -> rexie::Result<()> {
 #[cfg(target_arch = "wasm32")]
 pub async fn idb_load() -> Option<Session> {
     let db = open_idb().await.ok()?;
-    let tx = db.transaction(&[IDB_STORE], rexie::TransactionMode::ReadOnly).ok()?;
+    let tx = db
+        .transaction(&[IDB_STORE], rexie::TransactionMode::ReadOnly)
+        .ok()?;
     let store = tx.store(IDB_STORE).ok()?;
-    let val = store.get(wasm_bindgen::JsValue::from_str("data")).await.ok()??;
+    let val = store
+        .get(wasm_bindgen::JsValue::from_str("data"))
+        .await
+        .ok()??;
     Session::from_json(&val.as_string()?)
 }
 

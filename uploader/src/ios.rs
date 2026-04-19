@@ -1,5 +1,4 @@
 pub mod progress;
-pub mod api;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -10,12 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread;
 
-use crate::core::{ChunkUploadResult, MAX_CONCURRENT_UPLOADS, MAX_RETRIES, clean_etag};
+use crate::core::api;
 use crate::core::chunk::ChunkInfo;
 use crate::core::config;
 use crate::core::hash::sha256_file;
 use crate::core::retry::{self, RetryPolicy};
 use crate::core::session::{self, UploadState};
+use crate::core::upload::{self, StartDecision};
+use crate::core::{clean_etag, ChunkUploadResult, MAX_CONCURRENT_UPLOADS, MAX_RETRIES};
 use crate::ios::progress::{self as iosProgress, ProgressReader};
 
 static INIT: Once = Once::new();
@@ -43,19 +44,17 @@ pub(crate) static PAUSE_FLAG: AtomicBool = AtomicBool::new(false);
 
 fn start_worker_thread() {
     WORKER_STARTED.call_once(|| {
-        thread::spawn(|| {
-            loop {
-                let file_key = {
-                    let mut q = QUEUE.lock().unwrap();
-                    loop {
-                        if let Some(k) = q.pending.pop_front() {
-                            break k;
-                        }
-                        q = QUEUE_SIGNAL.wait(q).unwrap();
+        thread::spawn(|| loop {
+            let file_key = {
+                let mut q = QUEUE.lock().unwrap();
+                loop {
+                    if let Some(k) = q.pending.pop_front() {
+                        break k;
                     }
-                };
-                run_upload(&file_key);
-            }
+                    q = QUEUE_SIGNAL.wait(q).unwrap();
+                }
+            };
+            run_upload(&file_key);
         });
     });
 }
@@ -74,46 +73,19 @@ fn enqueue_key(file_key: String) {
 fn run_upload(file_key: &str) {
     init_nyquest();
 
-    let (file_path, transfer_id, upload_id, part_size_opt, completed_etags) = {
+    let file_path = {
         let sess = session::session();
         let entry = match sess.files.get(file_key) {
             Some(e) => e.clone(),
             None => return,
         };
-        (
-            entry.file_path.clone(),
-            entry.transfer_id.clone(),
-            entry.upload_id.clone(),
-            entry.part_size,
-            entry.completed_chunk_etags.clone(),
-        )
+        entry.file_path
     };
-
-    // Recompute uploaded_bytes from committed ETags so progress is accurate
-    // after a force-quit where in-flight bytes may have been counted but not committed.
-    if let Some(ps) = part_size_opt {
-        let total_bytes = {
-            let sess = session::session();
-            sess.files.get(file_key).map(|e| e.total_bytes).unwrap_or(0)
-        };
-        let committed_bytes: u64 = completed_etags.iter().map(|(p, _)| {
-            let start = (*p as u64 - 1) * ps;
-            total_bytes.saturating_sub(start).min(ps)
-        }).sum();
-        session::session().set_file_uploaded_bytes(file_key, committed_bytes);
-    }
 
     session::session().mark_file_state(file_key, UploadState::Running);
     session::persist_session();
 
-    let result = upload_file_internal(
-        file_key,
-        &file_path,
-        &transfer_id,
-        upload_id,
-        part_size_opt,
-        completed_etags,
-    );
+    let result = upload_file_internal(file_key, &file_path);
 
     match result {
         Ok(_) => {
@@ -121,12 +93,21 @@ fn run_upload(file_key: &str) {
             session::persist_session();
             let (s_agg, t_agg) = {
                 let sess = session::session();
-                let tid = sess.files.get(file_key).map(|e| e.transfer_id.clone()).unwrap_or_default();
+                let tid = sess
+                    .files
+                    .get(file_key)
+                    .map(|e| e.transfer_id.clone())
+                    .unwrap_or_default();
                 let s = sess.get_aggregate_progress(None);
                 let t = sess.get_aggregate_progress(Some(&tid));
                 (s, t)
             };
-            iosProgress::progress_manager().set_status(file_key, UploadState::Completed, s_agg, t_agg);
+            iosProgress::progress_manager().set_status(
+                file_key,
+                UploadState::Completed,
+                s_agg,
+                t_agg,
+            );
             if let Some(next_key) = session::session().next_pending_file() {
                 enqueue_key(next_key);
             }
@@ -141,7 +122,11 @@ fn run_upload(file_key: &str) {
             session::persist_session();
             let (s_agg, t_agg) = {
                 let sess = session::session();
-                let tid = sess.files.get(file_key).map(|e| e.transfer_id.clone()).unwrap_or_default();
+                let tid = sess
+                    .files
+                    .get(file_key)
+                    .map(|e| e.transfer_id.clone())
+                    .unwrap_or_default();
                 let s = sess.get_aggregate_progress(None);
                 let t = sess.get_aggregate_progress(Some(&tid));
                 (s, t)
@@ -152,14 +137,7 @@ fn run_upload(file_key: &str) {
     }
 }
 
-fn upload_file_internal(
-    file_key: &str,
-    file_path: &str,
-    transfer_id: &str,
-    existing_upload_id: Option<String>,
-    existing_part_size: Option<u64>,
-    completed_etags: Vec<(u32, String)>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn upload_file_internal(file_key: &str, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let client = nyquest::ClientBuilder::default()
         .request_timeout(std::time::Duration::from_secs(30))
         .build_blocking()
@@ -167,77 +145,55 @@ fn upload_file_internal(
 
     let file = File::open(file_path)?;
     let file_size = file.metadata()?.len();
+    let prepared = upload::prepare_upload(file_key, file_size)?;
+    session::session().set_file_uploaded_bytes(file_key, prepared.committed_bytes);
+    let transfer_id = prepared.transfer_id.clone();
 
-    // Get or reuse upload_id / part_size
-    let (upload_id, part_size) = if let (Some(uid), Some(ps)) = (existing_upload_id, existing_part_size) {
-        (uid, ps)
-    } else {
-        // This shouldn't happen — startUploadApi should have been called before enqueue
-        return Err("Missing upload_id or part_size — startUploadApi must be called first".into());
-    };
-
-    let total_parts = ((file_size + part_size - 1) / part_size) as u32;
-
-    // Determine which parts still need uploading
-    let done_parts: std::collections::HashSet<u32> =
-        completed_etags.iter().map(|(p, _)| *p).collect();
-    let remaining_parts: Vec<u32> = (1..=total_parts)
-        .filter(|p| !done_parts.contains(p))
-        .collect();
-
-    if remaining_parts.is_empty() {
-        // All parts done — just complete
-        let all_results: Vec<ChunkUploadResult> = completed_etags
-            .into_iter()
-            .map(|(pn, etag)| ChunkUploadResult { part_number: pn, etag })
-            .collect();
-        return api::complete_upload(&client, file_key, &upload_id, all_results);
+    if prepared.remaining_parts.is_empty() {
+        return api::complete_upload(
+            &client,
+            file_key,
+            &prepared.upload_id,
+            upload::combine_upload_results(prepared.completed_etags, Vec::new()),
+        );
     }
 
-    // Initialise progress manager
     {
-        let already_completed_parts = done_parts.len() as u32;
-        let already_completed_bytes: u64 = done_parts.iter().map(|&p| {
-            let start = (p as u64 - 1) * part_size;
-            file_size.saturating_sub(start).min(part_size)
-        }).sum();
         let (s_agg, t_agg) = {
             let sess = session::session();
-            let s = sess.get_aggregate_progress(None);
-            let t = sess.get_aggregate_progress(Some(transfer_id));
-            (s, t)
+            (
+                sess.get_aggregate_progress(None),
+                sess.get_aggregate_progress(Some(&transfer_id)),
+            )
         };
         iosProgress::progress_manager().init(
             file_key.to_string(),
-            transfer_id.to_string(),
+            transfer_id.clone(),
             file_size,
-            total_parts,
-            already_completed_bytes,
-            already_completed_parts,
+            prepared.total_parts,
+            prepared.committed_bytes,
+            prepared.done_parts.len() as u32,
             s_agg,
             t_agg,
         );
     }
 
-    // Fetch first URL batch and upload
     let new_results = upload_parts_with_rolling_urls(
         &client,
         file_key,
         file_path,
-        &upload_id,
-        part_size,
+        &prepared.upload_id,
+        prepared.part_size,
         file_size,
-        remaining_parts,
+        prepared.remaining_parts,
     )?;
 
-    // Combine with already-completed parts
-    let mut all_results: Vec<ChunkUploadResult> = completed_etags
-        .into_iter()
-        .map(|(pn, etag)| ChunkUploadResult { part_number: pn, etag })
-        .collect();
-    all_results.extend(new_results);
-
-    api::complete_upload(&client, file_key, &upload_id, all_results)
+    api::complete_upload(
+        &client,
+        file_key,
+        &prepared.upload_id,
+        upload::combine_upload_results(prepared.completed_etags, new_results),
+    )
 }
 
 fn upload_parts_with_rolling_urls(
@@ -338,7 +294,8 @@ fn upload_parts_with_rolling_urls(
                     Ok(t) => t,
                     Err(e) => {
                         abort.store(true, Ordering::Relaxed);
-                        if e.to_string().contains("paused") || e.to_string().contains("Interrupted") {
+                        if e.to_string().contains("paused") || e.to_string().contains("Interrupted")
+                        {
                             // pause — don't set error_abort
                         } else {
                             eprintln!("Failed to upload part {}: {:?}", part_number, e);
@@ -348,7 +305,10 @@ fn upload_parts_with_rolling_urls(
                     }
                 };
 
-                completed.lock().unwrap().push(ChunkUploadResult { part_number, etag });
+                completed
+                    .lock()
+                    .unwrap()
+                    .push(ChunkUploadResult { part_number, etag });
             }
         });
         handles.push(handle);
@@ -367,7 +327,9 @@ fn upload_parts_with_rolling_urls(
         handle.join().ok();
     }
 
-    if PAUSE_FLAG.load(Ordering::Relaxed) || (abort.load(Ordering::Relaxed) && !error_abort.load(Ordering::Relaxed)) {
+    if PAUSE_FLAG.load(Ordering::Relaxed)
+        || (abort.load(Ordering::Relaxed) && !error_abort.load(Ordering::Relaxed))
+    {
         return Err("Upload paused".into());
     }
 
@@ -399,14 +361,22 @@ fn upload_chunk_with_retry(
         |_attempt| {
             let (s_agg, t_agg) = {
                 let sess = session::session();
-                let tid = sess.files.get(&file_key)
+                let tid = sess
+                    .files
+                    .get(&file_key)
                     .map(|e| e.transfer_id.clone())
                     .unwrap_or_default();
                 let s = sess.get_aggregate_progress(None);
                 let t = sess.get_aggregate_progress(Some(&tid));
                 (s, t)
             };
-            iosProgress::progress_manager().update_in_flight(&file_key, part_number, 0, s_agg, t_agg);
+            iosProgress::progress_manager().update_in_flight(
+                &file_key,
+                part_number,
+                0,
+                s_agg,
+                t_agg,
+            );
 
             let progress_reader = ProgressReader::new(data.to_vec(), file_key.clone(), part_number);
             let body = nyquest::blocking::Body::stream(
@@ -431,7 +401,9 @@ fn upload_chunk_with_retry(
                         // Then fire progress notifier (subtitle reads updated session bytes)
                         let (s_agg, t_agg) = {
                             let sess = session::session();
-                            let tid = sess.files.get(&file_key)
+                            let tid = sess
+                                .files
+                                .get(&file_key)
                                 .map(|e| e.transfer_id.clone())
                                 .unwrap_or_default();
                             let s = sess.get_aggregate_progress(None);
@@ -484,9 +456,15 @@ pub extern "C" fn set_config(
     get_upload_urls_api: *const c_char,
     complete_api: *const c_char,
 ) {
-    let s = unsafe { CStr::from_ptr(start_upload_api) }.to_str().unwrap_or("");
-    let g = unsafe { CStr::from_ptr(get_upload_urls_api) }.to_str().unwrap_or("");
-    let c = unsafe { CStr::from_ptr(complete_api) }.to_str().unwrap_or("");
+    let s = unsafe { CStr::from_ptr(start_upload_api) }
+        .to_str()
+        .unwrap_or("");
+    let g = unsafe { CStr::from_ptr(get_upload_urls_api) }
+        .to_str()
+        .unwrap_or("");
+    let c = unsafe { CStr::from_ptr(complete_api) }
+        .to_str()
+        .unwrap_or("");
     config::set_config(s, g, c);
 }
 
@@ -527,9 +505,9 @@ pub extern "C" fn upload_file(
     };
 
     match start_upload_and_enqueue(&path, &tid, user_params) {
-        Ok(file_key) => {
-            CString::new(file_key).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
-        }
+        Ok(file_key) => CString::new(file_key)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
         Err(e) => {
             eprintln!("upload_file failed: {}", e);
             std::ptr::null_mut()
@@ -546,25 +524,16 @@ fn start_upload_and_enqueue(
 
     let file_hash = sha256_file(file_path, transfer_id)?;
 
-    // Check dedup
-    {
-        let sess = session::session();
-        if let Some(entry) = sess.find_by_hash(&file_hash) {
-            if entry.state == UploadState::Completed {
-                return Ok(entry.file_key.clone());
-            }
-            if entry.is_resumable() {
-                let key = entry.file_key.clone();
-                drop(sess);
-                session::session().update_file_path(&key, file_path.to_string());
-                enqueue_key(key.clone());
-                return Ok(key);
-            }
-            // FAILED without upload_id — treat as new
+    match upload::start_decision(&file_hash) {
+        StartDecision::Completed { file_key } => return Ok(file_key),
+        StartDecision::Resume { file_key } => {
+            session::session().update_file_path(&file_key, file_path.to_string());
+            enqueue_key(file_key.clone());
+            return Ok(file_key);
         }
+        StartDecision::StartNew => {}
     }
 
-    // Call startUploadApi
     let client = nyquest::ClientBuilder::default()
         .request_timeout(std::time::Duration::from_secs(30))
         .build_blocking()
@@ -578,25 +547,15 @@ fn start_upload_and_enqueue(
 
     let file_size = std::fs::metadata(file_path)?.len();
 
-    let start_resp =
-        api::start_upload(&client, &file_name, &file_hash, file_size, &user_params)?;
-
-    let file_key = start_resp.key.clone();
-
-    session::session().register_file(
-        file_key.clone(),
+    let start_resp = api::start_upload(&client, &file_name, &file_hash, file_size, &user_params)?;
+    let file_key = upload::register_started_upload(
         file_hash,
-        transfer_id.to_string(),
+        transfer_id,
         file_path.to_string(),
         file_name,
         file_size,
         user_params,
-    );
-    session::session().set_upload_info(
-        &file_key,
-        start_resp.upload_id,
-        start_resp.part_size,
-        ((file_size + start_resp.part_size - 1) / start_resp.part_size) as u32,
+        start_resp,
     );
     session::persist_session();
 
@@ -619,7 +578,9 @@ pub extern "C" fn cancel_transfer(transfer_id: *const c_char) {
     if transfer_id.is_null() {
         return;
     }
-    let tid = unsafe { CStr::from_ptr(transfer_id) }.to_str().unwrap_or("");
+    let tid = unsafe { CStr::from_ptr(transfer_id) }
+        .to_str()
+        .unwrap_or("");
     session::session().cancel_transfer(tid);
     session::persist_session();
 }
@@ -641,7 +602,11 @@ pub extern "C" fn pause_all() {
     for file_key in &keys {
         let (s_agg, t_agg) = {
             let sess = session::session();
-            let tid = sess.files.get(file_key).map(|e| e.transfer_id.clone()).unwrap_or_default();
+            let tid = sess
+                .files
+                .get(file_key)
+                .map(|e| e.transfer_id.clone())
+                .unwrap_or_default();
             let s = sess.get_aggregate_progress(None);
             let t = sess.get_aggregate_progress(Some(&tid));
             (s, t)
@@ -679,7 +644,9 @@ pub extern "C" fn get_progress_json(
     let progress = session::session().get_progress(tid, fk);
     let json: Vec<serde_json::Value> = progress.iter().map(|p| p.to_json()).collect();
     let s = serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string());
-    CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(s)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -693,7 +660,9 @@ pub extern "C" fn get_aggregate_progress_json(
     };
     let agg = session::session().get_aggregate_progress(tid);
     let s = serde_json::to_string(&agg.to_json()).unwrap_or_else(|_| "{}".to_string());
-    CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(s)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -718,14 +687,18 @@ pub extern "C" fn set_task_subtitle(subtitle: *const c_char) {
 #[no_mangle]
 pub extern "C" fn format_title_string() -> *mut c_char {
     let s = session::session().format_title();
-    CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(s)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Returns the formatted subtitle string (caller must free with free_string).
 #[no_mangle]
 pub extern "C" fn format_subtitle_string() -> *mut c_char {
     let s = session::session().format_subtitle();
-    CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(s)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Free a C string previously returned by upload_file / get_progress_json etc.

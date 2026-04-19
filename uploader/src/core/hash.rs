@@ -10,8 +10,8 @@ pub fn sha256_file(path: &str, transfer_id: &str) -> Result<String, String> {
     let mut hasher = Sha256::new();
     hasher.update(transfer_id.as_bytes());
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("Failed to open file for hashing: {}", e))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("Failed to open file for hashing: {}", e))?;
 
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {
@@ -60,12 +60,9 @@ pub fn sha256_fd(raw_fd: std::os::unix::io::RawFd, transfer_id: &str) -> Result<
 /// Compute SHA-256 of (transfer_id || file content) for a web_sys::File.
 /// Reads the entire file via wasm-bindgen-file-reader.
 #[cfg(feature = "wasm")]
-pub async fn sha256_web_file(
-    file: &web_sys::File,
-    transfer_id: &str,
-) -> Result<String, String> {
-    use wasm_bindgen_file_reader::WebSysFile;
+pub async fn sha256_web_file(file: &web_sys::File, transfer_id: &str) -> Result<String, String> {
     use std::io::Read;
+    use wasm_bindgen_file_reader::WebSysFile;
 
     let mut hasher = Sha256::new();
     hasher.update(transfer_id.as_bytes());

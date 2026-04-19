@@ -22,30 +22,30 @@ use std::os::raw::c_char;
 #[repr(C)]
 pub struct ProgressEvent {
     // per-file
-    pub file_key:                    *const c_char,
-    pub transfer_id:                 *const c_char,
-    pub total_bytes:                 u64,
-    pub uploaded_bytes:              u64,
-    pub completed_parts:             u32,
-    pub total_parts:                 u32,
-    pub percentage:                  f64,
-    pub state:                       *const c_char,
+    pub file_key: *const c_char,
+    pub transfer_id: *const c_char,
+    pub total_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub completed_parts: u32,
+    pub total_parts: u32,
+    pub percentage: f64,
+    pub state: *const c_char,
     // transfer aggregate
-    pub transfer_percentage:         f64,
-    pub transfer_total_size:         u64,
-    pub transfer_uploaded_size:      u64,
-    pub transfer_total_files:        u32,
-    pub transfer_completed_files:    u32,
-    pub transfer_state:              *const c_char,
+    pub transfer_percentage: f64,
+    pub transfer_total_size: u64,
+    pub transfer_uploaded_size: u64,
+    pub transfer_total_files: u32,
+    pub transfer_completed_files: u32,
+    pub transfer_state: *const c_char,
     // session aggregate
-    pub session_percentage:          f64,
-    pub session_total_size:          u64,
-    pub session_uploaded_size:       u64,
-    pub session_total_transfers:     u32,
+    pub session_percentage: f64,
+    pub session_total_size: u64,
+    pub session_uploaded_size: u64,
+    pub session_total_transfers: u32,
     pub session_completed_transfers: u32,
-    pub session_total_files:         u32,
-    pub session_completed_files:     u32,
-    pub session_state:               *const c_char,
+    pub session_total_files: u32,
+    pub session_completed_files: u32,
+    pub session_state: *const c_char,
 }
 
 pub type ProgressCallback = extern "C" fn(*const ProgressEvent);
@@ -204,14 +204,12 @@ fn log_to_browser(log_msg: String) {
 
  */
 
-
-
 #[cfg(test)]
 mod tests {
 
     #[test]
     fn it_works() {
         //let result = fibonacci(0);
-       // assert_eq!(result, 0);
+        // assert_eq!(result, 0);
     }
 }

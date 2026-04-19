@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 
 use crate::core::progress::{ProgressManager, ProgressNotifier};
 use crate::core::session::{AggregateProgress, FileProgress};
@@ -17,10 +17,30 @@ use crate::core::session::{AggregateProgress, FileProgress};
 ///   session_completed_transfers, session_total_files, session_completed_files, session_state)
 pub type AndroidProgressCallback = Box<
     dyn Fn(
-            &str, &str, u64, u64, u32, u32, f64, &str,
-            f64, u64, u64, u32, u32, &str,
-            f64, u64, u64, u32, u32, u32, u32, &str,
-        ) + Send + Sync,
+            &str,
+            &str,
+            u64,
+            u64,
+            u32,
+            u32,
+            f64,
+            &str,
+            f64,
+            u64,
+            u64,
+            u32,
+            u32,
+            &str,
+            f64,
+            u64,
+            u64,
+            u32,
+            u32,
+            u32,
+            u32,
+            &str,
+        ) + Send
+        + Sync,
 >;
 
 static PROGRESS_CALLBACK: Mutex<Option<AndroidProgressCallback>> = Mutex::new(None);
@@ -102,7 +122,10 @@ impl ProgressReader {
 impl Read for ProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if crate::android::PAUSE_FLAG.load(Ordering::Relaxed) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "paused"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "paused",
+            ));
         }
         let n = self.inner.read(buf)?;
         if n > 0 {
@@ -112,14 +135,22 @@ impl Read for ProgressReader {
                 use crate::core::session;
                 let (s_agg, t_agg) = {
                     let sess = session::session();
-                    let tid = sess.files.get(&self.file_key)
+                    let tid = sess
+                        .files
+                        .get(&self.file_key)
                         .map(|e| e.transfer_id.clone())
                         .unwrap_or_default();
                     let s = sess.get_aggregate_progress(None);
                     let t = sess.get_aggregate_progress(Some(&tid));
                     (s, t)
                 };
-                progress_manager().update_in_flight(&self.file_key, self.part_number, self.bytes_read, s_agg, t_agg);
+                progress_manager().update_in_flight(
+                    &self.file_key,
+                    self.part_number,
+                    self.bytes_read,
+                    s_agg,
+                    t_agg,
+                );
             }
         }
         Ok(n)

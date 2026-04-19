@@ -2,9 +2,9 @@ use std::ffi::CString;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::sync::{Mutex, OnceLock};
 
-use crate::{ProgressCallback, ProgressEvent};
 use crate::core::progress::{ProgressManager, ProgressNotifier};
 use crate::core::session::{AggregateProgress, FileProgress};
+use crate::{ProgressCallback, ProgressEvent};
 
 pub static PROGRESS_CALLBACK: Mutex<Option<ProgressCallback>> = Mutex::new(None);
 static PROGRESS_MANAGER: OnceLock<ProgressManager<IosProgressNotifier>> = OnceLock::new();
@@ -20,35 +20,35 @@ impl ProgressNotifier for IosProgressNotifier {
     ) {
         let cb = PROGRESS_CALLBACK.lock().unwrap();
         if let Some(callback) = *cb {
-            let file_key    = CString::new(fp.file_key.as_str()).unwrap_or_default();
+            let file_key = CString::new(fp.file_key.as_str()).unwrap_or_default();
             let transfer_id = CString::new(fp.transfer_id.as_str()).unwrap_or_default();
-            let state       = CString::new(fp.state.as_str()).unwrap_or_default();
-            let t_state     = CString::new(transfer_agg.state.as_str()).unwrap_or_default();
-            let s_state     = CString::new(session_agg.state.as_str()).unwrap_or_default();
+            let state = CString::new(fp.state.as_str()).unwrap_or_default();
+            let t_state = CString::new(transfer_agg.state.as_str()).unwrap_or_default();
+            let s_state = CString::new(session_agg.state.as_str()).unwrap_or_default();
 
             let event = ProgressEvent {
-                file_key:                    file_key.as_ptr(),
-                transfer_id:                 transfer_id.as_ptr(),
-                total_bytes:                 fp.total_bytes,
-                uploaded_bytes:              fp.uploaded_bytes,
-                completed_parts:             fp.completed_parts,
-                total_parts:                 fp.total_parts,
-                percentage:                  fp.percentage,
-                state:                       state.as_ptr(),
-                transfer_percentage:         transfer_agg.percentage,
-                transfer_total_size:         transfer_agg.total_size,
-                transfer_uploaded_size:      transfer_agg.uploaded_size,
-                transfer_total_files:        transfer_agg.total_files,
-                transfer_completed_files:    transfer_agg.completed_files,
-                transfer_state:              t_state.as_ptr(),
-                session_percentage:          session_agg.percentage,
-                session_total_size:          session_agg.total_size,
-                session_uploaded_size:       session_agg.uploaded_size,
-                session_total_transfers:     session_agg.total_transfers.unwrap_or(0),
+                file_key: file_key.as_ptr(),
+                transfer_id: transfer_id.as_ptr(),
+                total_bytes: fp.total_bytes,
+                uploaded_bytes: fp.uploaded_bytes,
+                completed_parts: fp.completed_parts,
+                total_parts: fp.total_parts,
+                percentage: fp.percentage,
+                state: state.as_ptr(),
+                transfer_percentage: transfer_agg.percentage,
+                transfer_total_size: transfer_agg.total_size,
+                transfer_uploaded_size: transfer_agg.uploaded_size,
+                transfer_total_files: transfer_agg.total_files,
+                transfer_completed_files: transfer_agg.completed_files,
+                transfer_state: t_state.as_ptr(),
+                session_percentage: session_agg.percentage,
+                session_total_size: session_agg.total_size,
+                session_uploaded_size: session_agg.uploaded_size,
+                session_total_transfers: session_agg.total_transfers.unwrap_or(0),
                 session_completed_transfers: session_agg.completed_transfers.unwrap_or(0),
-                session_total_files:         session_agg.total_files,
-                session_completed_files:     session_agg.completed_files,
-                session_state:               s_state.as_ptr(),
+                session_total_files: session_agg.total_files,
+                session_completed_files: session_agg.completed_files,
+                session_state: s_state.as_ptr(),
             };
             callback(&event);
         }
@@ -88,7 +88,10 @@ impl ProgressReader {
 impl Read for ProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if crate::ios::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "paused"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "paused",
+            ));
         }
         let n = self.inner.read(buf)?;
         if n > 0 {
@@ -98,7 +101,9 @@ impl Read for ProgressReader {
                 use crate::core::session;
                 let (session_agg, transfer_agg) = {
                     let sess = session::session();
-                    let tid = sess.files.get(&self.file_key)
+                    let tid = sess
+                        .files
+                        .get(&self.file_key)
                         .map(|e| e.transfer_id.clone())
                         .unwrap_or_default();
                     let s = sess.get_aggregate_progress(None);
@@ -106,7 +111,13 @@ impl Read for ProgressReader {
                     (s, t)
                 };
                 let pm = progress_manager();
-                pm.update_in_flight(&self.file_key, self.part_number, self.bytes_read, session_agg, transfer_agg);
+                pm.update_in_flight(
+                    &self.file_key,
+                    self.part_number,
+                    self.bytes_read,
+                    session_agg,
+                    transfer_agg,
+                );
             }
         }
         Ok(n)

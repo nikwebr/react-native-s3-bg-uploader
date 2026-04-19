@@ -130,10 +130,9 @@ impl<N: ProgressNotifier> ProgressManager<N> {
 
             session_agg.uploaded_size = session_agg.uploaded_size.saturating_add(delta);
             if session_agg.total_size > 0 {
-                session_agg.percentage = ((session_agg.uploaded_size as f64
-                    / session_agg.total_size as f64)
-                    * 100.0)
-                    .min(100.0);
+                session_agg.percentage =
+                    ((session_agg.uploaded_size as f64 / session_agg.total_size as f64) * 100.0)
+                        .min(100.0);
             }
 
             if p.transfer_id == current_transfer_id {

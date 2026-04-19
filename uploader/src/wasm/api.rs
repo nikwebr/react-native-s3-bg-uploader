@@ -1,9 +1,9 @@
+use js_sys::Promise;
 use std::collections::HashMap;
-use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Request, RequestInit, RequestMode, Response, XmlHttpRequest};
-use js_sys::Promise;
 
 use crate::core::api::{CompleteRequest, StartUploadResponse, UploadUrlsBatchResponse};
 use crate::core::config::get_config;
@@ -30,7 +30,8 @@ pub async fn fetch_upload_urls_batch(
     part_numbers: &[u32],
 ) -> Result<HashMap<u32, String>, String> {
     let url = get_config().get_upload_urls_api.clone();
-    let body_map = serde_json::json!({ "key": file_key, "uploadId": upload_id, "parts": part_numbers });
+    let body_map =
+        serde_json::json!({ "key": file_key, "uploadId": upload_id, "parts": part_numbers });
     let body = serde_json::to_string(&body_map).map_err(|e| e.to_string())?;
     let resp: UploadUrlsBatchResponse = fetch_json(&url, "POST", Some(&body)).await?;
     Ok(resp.into_part_map())
@@ -67,13 +68,18 @@ async fn xhr_post_json(url: &str, body: &str) -> Result<(), String> {
                 resolve.call1(&JsValue::NULL, &JsValue::NULL).ok();
             } else {
                 reject_clone
-                    .call1(&JsValue::NULL, &JsValue::from_str(&format!("HTTP {}", status)))
+                    .call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str(&format!("HTTP {}", status)),
+                    )
                     .ok();
             }
         }) as Box<dyn FnMut()>);
 
         let onerror = Closure::wrap(Box::new(move || {
-            reject.call1(&JsValue::NULL, &JsValue::from_str("Network error")).ok();
+            reject
+                .call1(&JsValue::NULL, &JsValue::from_str("Network error"))
+                .ok();
         }) as Box<dyn FnMut()>);
 
         xhr.set_onload(Some(onload.as_ref().unchecked_ref()));
@@ -115,14 +121,18 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
 
     let request = Request::new_with_str_and_init(url, &opts)
         .map_err(|e| format!("Failed to create request: {:?}", e))?;
-    request.headers().set("Content-Type", "application/json")
+    request
+        .headers()
+        .set("Content-Type", "application/json")
         .map_err(|_| "Failed to set Content-Type header")?;
 
     let resp_value = fetch_request(&request)
         .await
         .map_err(|e| format!("Fetch failed: {:?}", e))?;
 
-    let resp: Response = resp_value.dyn_into().map_err(|_| "Not a Response".to_string())?;
+    let resp: Response = resp_value
+        .dyn_into()
+        .map_err(|_| "Not a Response".to_string())?;
     if !resp.ok() {
         return Err(format!("HTTP error: {}", resp.status()));
     }

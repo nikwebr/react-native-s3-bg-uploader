@@ -10,7 +10,9 @@ pub struct ChunkInfo {
 }
 
 impl ChunkInfo {
-    pub fn read<R>(&self, reader: &mut R) -> std::io::Result<Vec<u8>> where R: Read + Seek
+    pub fn read<R>(&self, reader: &mut R) -> std::io::Result<Vec<u8>>
+    where
+        R: Read + Seek,
     {
         reader.seek(SeekFrom::Start(self.start_pos))?;
 

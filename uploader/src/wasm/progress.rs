@@ -59,21 +59,61 @@ pub fn progress_manager() -> &'static ProgressManager<WasmProgressNotifier> {
 pub fn file_progress_to_js(fp: &FileProgress) -> JsValue {
     let obj = js_sys::Object::new();
     js_sys::Reflect::set(&obj, &"fileKey".into(), &JsValue::from_str(&fp.file_key)).ok();
-    js_sys::Reflect::set(&obj, &"transferId".into(), &JsValue::from_str(&fp.transfer_id)).ok();
-    js_sys::Reflect::set(&obj, &"totalBytes".into(), &JsValue::from_f64(fp.total_bytes as f64)).ok();
-    js_sys::Reflect::set(&obj, &"uploadedBytes".into(), &JsValue::from_f64(fp.uploaded_bytes as f64)).ok();
-    js_sys::Reflect::set(&obj, &"completedParts".into(), &JsValue::from(fp.completed_parts)).ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"transferId".into(),
+        &JsValue::from_str(&fp.transfer_id),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"totalBytes".into(),
+        &JsValue::from_f64(fp.total_bytes as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"uploadedBytes".into(),
+        &JsValue::from_f64(fp.uploaded_bytes as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"completedParts".into(),
+        &JsValue::from(fp.completed_parts),
+    )
+    .ok();
     js_sys::Reflect::set(&obj, &"totalParts".into(), &JsValue::from(fp.total_parts)).ok();
-    js_sys::Reflect::set(&obj, &"percentage".into(), &JsValue::from_f64(fp.percentage)).ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"percentage".into(),
+        &JsValue::from_f64(fp.percentage),
+    )
+    .ok();
     js_sys::Reflect::set(&obj, &"state".into(), &JsValue::from_str(fp.state.as_str())).ok();
     obj.into()
 }
 
 pub fn aggregate_to_js(agg: &AggregateProgress) -> JsValue {
     let obj = js_sys::Object::new();
-    js_sys::Reflect::set(&obj, &"percentage".into(), &JsValue::from_f64(agg.percentage)).ok();
-    js_sys::Reflect::set(&obj, &"totalSize".into(), &JsValue::from_f64(agg.total_size as f64)).ok();
-    js_sys::Reflect::set(&obj, &"uploadedSize".into(), &JsValue::from_f64(agg.uploaded_size as f64)).ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"percentage".into(),
+        &JsValue::from_f64(agg.percentage),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"totalSize".into(),
+        &JsValue::from_f64(agg.total_size as f64),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"uploadedSize".into(),
+        &JsValue::from_f64(agg.uploaded_size as f64),
+    )
+    .ok();
     if let Some(t) = agg.total_transfers {
         js_sys::Reflect::set(&obj, &"totalTransfers".into(), &JsValue::from(t)).ok();
     }
@@ -81,7 +121,17 @@ pub fn aggregate_to_js(agg: &AggregateProgress) -> JsValue {
         js_sys::Reflect::set(&obj, &"completedTransfers".into(), &JsValue::from(c)).ok();
     }
     js_sys::Reflect::set(&obj, &"totalFiles".into(), &JsValue::from(agg.total_files)).ok();
-    js_sys::Reflect::set(&obj, &"completedFiles".into(), &JsValue::from(agg.completed_files)).ok();
-    js_sys::Reflect::set(&obj, &"state".into(), &JsValue::from_str(agg.state.as_str())).ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"completedFiles".into(),
+        &JsValue::from(agg.completed_files),
+    )
+    .ok();
+    js_sys::Reflect::set(
+        &obj,
+        &"state".into(),
+        &JsValue::from_str(agg.state.as_str()),
+    )
+    .ok();
     obj.into()
 }
