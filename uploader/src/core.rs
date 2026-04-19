@@ -4,6 +4,7 @@ pub mod config;
 pub mod hash;
 pub mod progress;
 pub mod retry;
+pub mod runtime;
 pub mod session;
 pub mod upload;
 

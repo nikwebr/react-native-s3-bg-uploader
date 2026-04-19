@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use crate::core::progress::{ProgressManager, ProgressNotifier};
+use crate::core::runtime;
 use crate::core::session::{AggregateProgress, FileProgress};
 
 // ---------------------------------------------------------------------------
@@ -132,24 +133,11 @@ impl Read for ProgressReader {
             self.bytes_read += n as u64;
             if self.bytes_read - self.last_notified >= NOTIFY_EVERY_BYTES {
                 self.last_notified = self.bytes_read;
-                use crate::core::session;
-                let (s_agg, t_agg) = {
-                    let sess = session::session();
-                    let tid = sess
-                        .files
-                        .get(&self.file_key)
-                        .map(|e| e.transfer_id.clone())
-                        .unwrap_or_default();
-                    let s = sess.get_aggregate_progress(None);
-                    let t = sess.get_aggregate_progress(Some(&tid));
-                    (s, t)
-                };
-                progress_manager().update_in_flight(
+                runtime::update_in_flight(
+                    progress_manager(),
                     &self.file_key,
                     self.part_number,
                     self.bytes_read,
-                    s_agg,
-                    t_agg,
                 );
             }
         }
