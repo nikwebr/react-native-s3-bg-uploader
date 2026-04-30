@@ -1,199 +1,206 @@
-use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
 use std::os::unix::io::{FromRawFd, RawFd};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
-use crate::android::progress::{self as androidProgress, ProgressReader};
-use crate::android::{build_client, dup_fd, PAUSE_FLAG};
-use crate::core::api;
+use async_trait::async_trait;
+
+use crate::android::progress::{self as androidProgress, AndroidProgressNotifier, ProgressReader};
+use crate::android::AndroidNetwork;
+use crate::android::{build_client, dup_fd, enqueue, enqueue_front, PAUSE_FLAG};
+use crate::core::api::ApiClient;
 use crate::core::chunk::ChunkInfo;
-use crate::core::runtime;
 use crate::core::session::{self, UploadState};
-use crate::core::upload;
-use crate::core::{clean_etag, ChunkUploadResult, MAX_CONCURRENT_UPLOADS, MAX_RETRIES};
+use crate::native::NativeApiClient;
+use crate::core::runtime;
+use crate::core::upload::PreparedUpload;
+use crate::native::upload_engine::{
+    self, BlockingEngineConfig, BlockingPlatformAdapter, BlockingPrefetch, BlockingWorker,
+};
+use crate::core::upload_orchestrator::{self, UploadBackend, UploadOutcome};
+use crate::core::{clean_etag, MAX_RETRIES};
 
 pub(super) fn run_upload(file_key: &str, raw_fd: RawFd) {
+    use crate::core::session;
     if !session::session().files.contains_key(file_key) {
         unsafe { libc::close(raw_fd) };
         return;
     }
 
-    runtime::mark_state_persist(file_key, UploadState::Running);
-    let result = upload_file_internal(file_key, raw_fd);
-
-    unsafe { libc::close(raw_fd) };
-
-    match result {
-        Ok(_) => session::session().mark_file_state(file_key, UploadState::Completed),
-        Err(e) => {
-            if PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
-                log::info!("Upload paused for {}", file_key);
-                session::session().mark_file_state(file_key, UploadState::Paused);
-            } else {
-                log::error!("Upload failed for {}: {}", file_key, e);
-                session::session().mark_file_state(file_key, UploadState::Failed);
-            }
-        }
-    }
-    session::persist_session();
-}
-
-fn upload_file_internal(file_key: &str, raw_fd: RawFd) -> Result<(), Box<dyn std::error::Error>> {
-    let file = unsafe { File::from_raw_fd(dup_fd(raw_fd)?) };
-    let file_size = file.metadata()?.len();
-    let prepared = upload::prepare_upload(file_key, file_size)?;
-    session::session().set_file_uploaded_bytes(file_key, prepared.committed_bytes);
-
-    if prepared.remaining_parts.is_empty() {
-        let client = build_client();
-        return api::complete_upload_android(
-            &client,
-            file_key,
-            &prepared.upload_id,
-            upload::combine_upload_results(prepared.completed_etags, Vec::new()),
-        );
-    }
-
-    runtime::init_progress(
-        androidProgress::progress_manager(),
-        file_key,
-        file_size,
-        prepared.total_parts,
-        prepared.committed_bytes,
-        prepared.done_parts.len() as u32,
-    );
-
-    let client = build_client();
-    let new_results = upload_parts_with_rolling_urls(
-        &client,
-        file_key,
+    let backend = AndroidUploadBackend {
+        file_key: file_key.to_string(),
         raw_fd,
-        &prepared.upload_id,
-        prepared.part_size,
-        file_size,
-        prepared.remaining_parts,
-    )?;
-
-    api::complete_upload_android(
-        &client,
-        file_key,
-        &prepared.upload_id,
-        upload::combine_upload_results(prepared.completed_etags, new_results),
-    )
-}
-
-fn upload_parts_with_rolling_urls(
-    client: &reqwest::blocking::Client,
-    file_key: &str,
-    raw_fd: RawFd,
-    upload_id: &str,
-    part_size: u64,
-    file_size: u64,
-    parts_to_upload: Vec<u32>,
-) -> Result<Vec<ChunkUploadResult>, Box<dyn std::error::Error>> {
-    let completed_parts = Arc::new(Mutex::new(Vec::<ChunkUploadResult>::new()));
-    let url_pool: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    let parts_arc = Arc::new(parts_to_upload);
-    let parts_len = parts_arc.len();
-
-    let prefetch = |part_numbers: &[u32]| -> Result<(), Box<dyn std::error::Error>> {
-        if part_numbers.is_empty() {
-            return Ok(());
-        }
-        let batch =
-            api::fetch_upload_urls_batch_android(client, file_key, upload_id, part_numbers)?;
-        url_pool.lock().unwrap().extend(batch);
-        Ok(())
+        api: NativeApiClient {
+            network: AndroidNetwork {
+                client: build_client(),
+            },
+        },
     };
 
-    prefetch(&parts_arc[..MAX_CONCURRENT_UPLOADS.min(parts_len)])?;
+    let outcome = pollster::block_on(upload_orchestrator::run_upload(&backend));
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(MAX_CONCURRENT_UPLOADS);
-    let rx = Arc::new(Mutex::new(rx));
-    let mut handles = vec![];
-
-    for _ in 0..MAX_CONCURRENT_UPLOADS {
-        let rx = rx.clone();
-        let parts = parts_arc.clone();
-        let url_pool = url_pool.clone();
-        let completed = completed_parts.clone();
-        let file_key_str = file_key.to_string();
-
-        let handle = thread::spawn(move || {
-            let client = build_client();
-            loop {
-                let part_idx = match rx.lock().unwrap().recv() {
-                    Ok(i) => i,
-                    Err(_) => break,
-                };
-                let part_number = parts[part_idx];
-                let url = match url_pool.lock().unwrap().get(&part_number).cloned() {
-                    Some(u) => u,
-                    None => {
-                        log::error!("No URL for part {}", part_number);
-                        continue;
-                    }
-                };
-
-                let chunk_info = ChunkInfo {
-                    part_number,
-                    start_pos: (part_number as u64 - 1) * part_size,
-                    chunk_size: upload::part_size_for(part_number, part_size, file_size),
-                    url: url.clone(),
-                };
-
-                let chunk = match read_chunk_from_fd(raw_fd, &chunk_info) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::error!("Failed to read chunk {}: {:?}", part_number, e);
-                        continue;
-                    }
-                };
-
-                let etag = match upload_chunk_with_retry(
-                    &client,
-                    &url,
-                    &chunk,
-                    part_number,
-                    &file_key_str,
-                ) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        log::error!("Failed to upload part {}: {:?}", part_number, e);
-                        continue;
-                    }
-                };
-
-                completed
-                    .lock()
-                    .unwrap()
-                    .push(ChunkUploadResult { part_number, etag });
-            }
-        });
-        handles.push(handle);
-    }
-
-    for (idx, _) in parts_arc.iter().enumerate() {
-        if idx > 0 && idx % MAX_CONCURRENT_UPLOADS == 0 && idx < parts_len {
-            let batch_end = (idx + MAX_CONCURRENT_UPLOADS).min(parts_len);
-            let next: Vec<u32> = parts_arc[idx..batch_end].to_vec();
-            let _ = prefetch(&next);
+    if matches!(outcome, UploadOutcome::Paused) {
+        let should_reenqueue = session::session()
+            .files
+            .get(file_key)
+            .map(|e| matches!(e.state, UploadState::Paused | UploadState::NotStarted))
+            .unwrap_or(false);
+        if should_reenqueue {
+            // Re-enqueue at the front so this partially-uploaded file resumes before
+            // not-yet-started files that are still waiting in the queue.
+            enqueue_front(file_key.to_string(), raw_fd);
+        } else {
+            unsafe { libc::close(raw_fd) };
         }
-        tx.send(idx).ok();
+    } else {
+        unsafe { libc::close(raw_fd) };
     }
-    drop(tx);
+}
 
-    for handle in handles {
-        handle.join().ok();
+struct AndroidUploadBackend {
+    file_key: String,
+    raw_fd: RawFd,
+    api: NativeApiClient<AndroidNetwork>,
+}
+
+#[async_trait(?Send)]
+impl UploadBackend for AndroidUploadBackend {
+    type Notifier = AndroidProgressNotifier;
+
+    fn progress_manager(&self) -> &crate::core::progress::ProgressManager<Self::Notifier> {
+        androidProgress::progress_manager()
     }
 
-    let results = completed_parts.lock().unwrap().clone();
-    if results.len() != parts_arc.len() {
-        return Err(format!("Only {}/{} parts uploaded", results.len(), parts_arc.len()).into());
+    fn file_key(&self) -> &str {
+        &self.file_key
     }
-    Ok(results)
+
+    fn is_paused(&self) -> bool {
+        PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn total_bytes(&self) -> Result<u64, String> {
+        let file = unsafe { File::from_raw_fd(dup_fd(self.raw_fd).map_err(|e| e.to_string())?) };
+        Ok(file.metadata().map_err(|e| e.to_string())?.len())
+    }
+
+    async fn upload_parts(
+        &self,
+        prepared: &PreparedUpload,
+        total_bytes: u64,
+    ) -> Result<Vec<crate::core::ChunkUploadResult>, String> {
+        let adapter = Arc::new(AndroidAdapter {
+            raw_fd: self.raw_fd,
+            file_key: self.file_key.clone(),
+            upload_id: prepared.upload_id.clone(),
+            network: self.api.network.clone(),
+        });
+        upload_engine::run_blocking_upload(
+            adapter,
+            BlockingEngineConfig {
+                prefetch: BlockingPrefetch::Rolling,
+                fail_fast: true,
+            },
+            &self.file_key,
+            prepared.part_size,
+            total_bytes,
+            prepared.remaining_parts.clone(),
+        )
+    }
+
+    async fn complete_upload(
+        &self,
+        upload_id: &str,
+        results: Vec<crate::core::ChunkUploadResult>,
+    ) -> Result<(), String> {
+        self.api
+            .complete_upload(&self.file_key, upload_id, results)
+            .await
+    }
+}
+
+struct AndroidAdapter {
+    raw_fd: RawFd,
+    file_key: String,
+    upload_id: String,
+    network: AndroidNetwork,
+}
+
+impl BlockingPlatformAdapter for AndroidAdapter {
+    fn is_paused(&self) -> bool {
+        PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn fetch_urls(&self, parts: &[u32]) -> Result<std::collections::HashMap<u32, String>, String> {
+        pollster::block_on(
+            NativeApiClient { network: self.network.clone() }
+                .fetch_upload_urls_batch(&self.file_key, &self.upload_id, parts),
+        )
+    }
+
+    fn make_worker(&self) -> Result<Box<dyn BlockingWorker>, String> {
+        Ok(Box::new(AndroidWorker {
+            client: build_client(),
+            raw_fd: self.raw_fd,
+        }))
+    }
+
+    fn on_missing_url(&self, part_number: u32) {
+        log::error!("No URL for part {}", part_number);
+    }
+
+    fn on_read_error(&self, part_number: u32, error: &str) {
+        log::error!("Failed to read chunk {}: {}", part_number, error);
+    }
+
+    fn on_upload_error(&self, part_number: u32, error: &str) {
+        log::error!("Failed to upload part {}: {}", part_number, error);
+    }
+}
+
+struct AndroidWorker {
+    client: reqwest::blocking::Client,
+    raw_fd: RawFd,
+}
+
+impl BlockingWorker for AndroidWorker {
+    fn read_chunk(&self, chunk: &ChunkInfo) -> Result<Vec<u8>, String> {
+        // Use pread so concurrent workers don't corrupt each other's file position.
+        // libc::dup shares the underlying file offset, so BufReader+seek across
+        // multiple threads would interleave seeks and produce wrong/truncated data.
+        let mut buffer = vec![0u8; chunk.chunk_size as usize];
+        let mut total_read: usize = 0;
+        while total_read < chunk.chunk_size as usize {
+            let remaining = chunk.chunk_size as usize - total_read;
+            let offset = (chunk.start_pos + total_read as u64) as libc::off_t;
+            let n = unsafe {
+                libc::pread(
+                    self.raw_fd,
+                    buffer[total_read..].as_mut_ptr() as *mut libc::c_void,
+                    remaining,
+                    offset,
+                )
+            };
+            match n {
+                -1 => return Err(std::io::Error::last_os_error().to_string()),
+                0 => break, // EOF
+                n => total_read += n as usize,
+            }
+        }
+        buffer.truncate(total_read);
+        Ok(buffer)
+    }
+
+    fn upload_chunk(
+        &self,
+        url: &str,
+        data: &[u8],
+        part_number: u32,
+        file_key: &str,
+    ) -> Result<String, String> {
+        upload_chunk_with_retry(&self.client, url, data, part_number, file_key)
+            .map_err(|e| e.to_string())
+    }
 }
 
 fn upload_chunk_with_retry(
@@ -210,6 +217,10 @@ fn upload_chunk_with_retry(
     crate::core::retry::run_with_retry_string(
         &policy,
         |_attempt| {
+            if crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("paused".to_string());
+            }
+
             runtime::update_in_flight(
                 androidProgress::progress_manager(),
                 &file_key,
@@ -218,12 +229,20 @@ fn upload_chunk_with_retry(
             );
 
             let progress_reader = ProgressReader::new(data.to_vec(), file_key.clone(), part_number);
-            let response = client
+            let response = match client
                 .put(url)
                 .header("Content-Length", chunk_size.to_string())
                 .body(reqwest::blocking::Body::new(progress_reader))
                 .send()
-                .map_err(|e| format!("{:?}", e))?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err("paused".to_string());
+                    }
+                    return Err(format!("{:?}", e));
+                }
+            };
 
             let etag = response
                 .headers()
@@ -249,14 +268,10 @@ fn upload_chunk_with_retry(
                 err,
                 delay_ms
             );
-            thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
+            if !crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
+            }
         },
     )
     .map_err(|e| e.into())
-}
-
-fn read_chunk_from_fd(raw_fd: RawFd, chunk: &ChunkInfo) -> std::io::Result<Vec<u8>> {
-    let file = unsafe { File::from_raw_fd(dup_fd(raw_fd)?) };
-    let mut reader = BufReader::new(file);
-    chunk.read(&mut reader)
 }

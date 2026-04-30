@@ -1,191 +1,141 @@
-use std::collections::HashMap;
-
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use js_sys::Promise;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_file_reader::WebSysFile;
 use wasm_bindgen_futures::JsFuture;
 
+use async_trait::async_trait;
+
 use crate::core::chunk::ChunkInfo;
 use crate::core::runtime;
-use crate::core::session;
-use crate::core::upload;
-use crate::core::{clean_etag, ChunkUploadResult, MAX_CONCURRENT_UPLOADS, MAX_RETRIES};
-use crate::wasm::api;
-use crate::wasm::progress as wasmProgress;
-use crate::wasm::{is_pause_requested, UploadOutcome};
+use crate::core::upload::PreparedUpload;
+use crate::wasm::upload_engine::{self, AsyncPlatformAdapter};
+use crate::core::upload_orchestrator::{self, UploadBackend, UploadOutcome};
+use crate::core::{clean_etag, MAX_RETRIES};
+use crate::wasm::api::WasmApiClient;
+use crate::wasm::progress::{self as wasmProgress, WasmProgressNotifier};
+use crate::wasm::is_pause_requested;
 
 pub(super) async fn run_upload(file_key: &str, file: web_sys::File) -> UploadOutcome {
-    let file_size = file.size() as u64;
-    let prepared = match upload::prepare_upload(file_key, file_size) {
-        Ok(prepared) => prepared,
-        Err(err) => return UploadOutcome::Failed(err),
+    let backend = WasmUploadBackend {
+        file_key: file_key.to_string(),
+        file: std::sync::Arc::new(file),
+        api: WasmApiClient,
     };
-    session::session().set_file_uploaded_bytes(file_key, prepared.committed_bytes);
+    upload_orchestrator::run_upload(&backend).await
+}
 
-    if prepared.remaining_parts.is_empty() {
-        return match api::complete_upload(
-            file_key,
-            &prepared.upload_id,
-            upload::combine_upload_results(prepared.completed_etags, Vec::new()),
+struct WasmUploadBackend {
+    file_key: String,
+    file: std::sync::Arc<web_sys::File>,
+    api: WasmApiClient,
+}
+
+#[async_trait(?Send)]
+impl UploadBackend for WasmUploadBackend {
+    type Notifier = WasmProgressNotifier;
+
+    fn progress_manager(&self) -> &crate::core::progress::ProgressManager<Self::Notifier> {
+        wasmProgress::progress_manager()
+    }
+
+    fn file_key(&self) -> &str {
+        &self.file_key
+    }
+
+    fn is_paused(&self) -> bool {
+        is_pause_requested()
+    }
+
+    fn on_session_completed(&self) {
+        wasmProgress::progress_manager().clear();
+    }
+
+    fn total_bytes(&self) -> Result<u64, String> {
+        Ok(self.file.size() as u64)
+    }
+
+    async fn upload_parts(
+        &self,
+        prepared: &PreparedUpload,
+        total_bytes: u64,
+    ) -> Result<Vec<crate::core::ChunkUploadResult>, String> {
+        let adapter = std::sync::Arc::new(WasmAdapter {
+            file_key: self.file_key.clone(),
+            upload_id: prepared.upload_id.clone(),
+        });
+        upload_engine::run_async_upload(
+            adapter,
+            self.file.clone(),
+            &self.file_key,
+            prepared.part_size,
+            total_bytes,
+            prepared.remaining_parts.clone(),
         )
         .await
-        {
-            Ok(_) => UploadOutcome::Completed,
-            Err(e) => UploadOutcome::Failed(e),
-        };
     }
 
-    runtime::init_progress(
-        wasmProgress::progress_manager(),
-        file_key,
-        file_size,
-        prepared.total_parts,
-        prepared.committed_bytes,
-        prepared.done_parts.len() as u32,
-    );
-
-    let first_batch: Vec<u32> = prepared
-        .remaining_parts
-        .iter()
-        .take(MAX_CONCURRENT_UPLOADS)
-        .cloned()
-        .collect();
-    let mut url_pool: HashMap<u32, String> =
-        match api::fetch_upload_urls_batch(file_key, &prepared.upload_id, &first_batch).await {
-            Ok(urls) => urls,
-            Err(e) => return UploadOutcome::Failed(e),
-        };
-
-    let file_arc = std::sync::Arc::new(file);
-    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-    let mut next_idx = 0;
-    let parts_len = prepared.remaining_parts.len();
-    let completed_parts = std::sync::Arc::new(std::sync::Mutex::new(
-        upload::combine_upload_results(prepared.completed_etags, Vec::new()),
-    ));
-
-    let push_chunk =
-        |idx: usize,
-         url_pool: &mut HashMap<u32, String>,
-         file_arc: &std::sync::Arc<web_sys::File>,
-         completed_parts: &std::sync::Arc<std::sync::Mutex<Vec<ChunkUploadResult>>>,
-         in_flight: &mut FuturesUnordered<_>| {
-            let part_number = prepared.remaining_parts[idx];
-            if let Some(url) = url_pool.remove(&part_number) {
-                in_flight.push(upload_chunk_task(
-                    file_arc.clone(),
-                    part_number,
-                    prepared.part_size,
-                    file_size,
-                    url,
-                    file_key.to_string(),
-                    completed_parts.clone(),
-                ));
-                true
-            } else {
-                false
-            }
-        };
-
-    while next_idx < parts_len && in_flight.len() < MAX_CONCURRENT_UPLOADS {
-        push_chunk(
-            next_idx,
-            &mut url_pool,
-            &file_arc,
-            &completed_parts,
-            &mut in_flight,
-        );
-        next_idx += 1;
-    }
-
-    while let Some(result) = in_flight.next().await {
-        if let Err(e) = result {
-            if is_pause_requested() {
-                while in_flight.next().await.is_some() {}
-                return UploadOutcome::Paused;
-            }
-            while in_flight.next().await.is_some() {}
-            return UploadOutcome::Failed(e);
-        }
-
-        if is_pause_requested() {
-            while in_flight.next().await.is_some() {}
-            return UploadOutcome::Paused;
-        }
-
-        if next_idx < parts_len {
-            if url_pool.len() < MAX_CONCURRENT_UPLOADS {
-                let prefetch_parts: Vec<u32> = prepared
-                    .remaining_parts
-                    .iter()
-                    .skip(next_idx)
-                    .take(MAX_CONCURRENT_UPLOADS)
-                    .cloned()
-                    .collect();
-                if !prefetch_parts.is_empty() {
-                    let new_urls = api::fetch_upload_urls_batch(
-                        file_key,
-                        &prepared.upload_id,
-                        &prefetch_parts,
-                    )
-                    .await
-                    .unwrap_or_default();
-                    url_pool.extend(new_urls);
-                }
-            }
-
-            let _ = push_chunk(
-                next_idx,
-                &mut url_pool,
-                &file_arc,
-                &completed_parts,
-                &mut in_flight,
-            );
-            next_idx += 1;
-        }
-    }
-
-    let all_results = completed_parts.lock().unwrap().clone();
-    match api::complete_upload(file_key, &prepared.upload_id, all_results).await {
-        Ok(_) => UploadOutcome::Completed,
-        Err(e) => UploadOutcome::Failed(e),
+    async fn complete_upload(
+        &self,
+        upload_id: &str,
+        results: Vec<crate::core::ChunkUploadResult>,
+    ) -> Result<(), String> {
+        use crate::core::api::ApiClient;
+        self.api.complete_upload(&self.file_key, upload_id, results).await
     }
 }
 
-async fn upload_chunk_task(
-    file: std::sync::Arc<web_sys::File>,
-    part_number: u32,
-    part_size: u64,
-    file_size: u64,
-    url: String,
+struct WasmAdapter {
     file_key: String,
-    completed_parts: std::sync::Arc<std::sync::Mutex<Vec<ChunkUploadResult>>>,
-) -> Result<(), String> {
-    let start_pos = (part_number as u64 - 1) * part_size;
-    let chunk_size = upload::part_size_for(part_number, part_size, file_size);
-    let chunk_info = ChunkInfo {
-        part_number,
-        start_pos,
-        chunk_size,
-        url: url.clone(),
-    };
+    upload_id: String,
+}
 
-    let chunk = read_chunk_from_web_file(&file, &chunk_info)?;
-    let etag = upload_chunk_with_retry(&url, &chunk, part_number, &file_key).await?;
+impl AsyncPlatformAdapter for WasmAdapter {
+    fn is_paused(&self) -> bool {
+        is_pause_requested()
+    }
 
-    runtime::complete_chunk(
-        wasmProgress::progress_manager(),
-        &file_key,
-        part_number,
-        etag.clone(),
-        chunk_size,
-    );
-    completed_parts
-        .lock()
-        .unwrap()
-        .push(ChunkUploadResult { part_number, etag });
-    Ok(())
+    fn fetch_urls(
+        &self,
+        parts: Vec<u32>,
+    ) -> futures::future::LocalBoxFuture<
+        'static,
+        Result<std::collections::HashMap<u32, String>, String>,
+    > {
+        let file_key = self.file_key.clone();
+        let upload_id = self.upload_id.clone();
+        async move {
+            use crate::core::api::ApiClient;
+            WasmApiClient.fetch_upload_urls_batch(&file_key, &upload_id, &parts).await
+        }
+        .boxed_local()
+    }
+
+    fn read_chunk(&self, file: &web_sys::File, chunk: &ChunkInfo) -> Result<Vec<u8>, String> {
+        read_chunk_from_web_file(file, chunk)
+    }
+
+    fn upload_chunk(
+        &self,
+        url: String,
+        data: Vec<u8>,
+        part_number: u32,
+        file_key: String,
+    ) -> futures::future::LocalBoxFuture<'static, Result<String, String>> {
+        async move {
+            let chunk_size = data.len() as u64;
+            let etag = upload_chunk_with_retry(&url, &data, part_number, &file_key).await?;
+            runtime::complete_chunk(
+                wasmProgress::progress_manager(),
+                &file_key,
+                part_number,
+                etag.clone(),
+                chunk_size,
+            );
+            Ok(etag)
+        }
+        .boxed_local()
+    }
 }
 
 async fn upload_chunk_with_retry(

@@ -14,6 +14,8 @@ wasm = ["wasm-bindgen", "wasm-bindgen-file-reader", "web-sys", "wasm-bindgen-fut
 [dependencies]
 sha2 = "0.10"
 indexmap = { version = "2", features = ["serde"] }
+async-trait = "0.1"
+pollster = "0.4"
 
 # Native persistence (iOS / Android)
 redb = { version = "2", optional = false }
@@ -58,16 +60,18 @@ optional = true
 version = "0.3.60"
 # Log to the browser console from Rust code
 features = [
+    "Blob",
     "console",
+    "Crypto",
     "Headers",
     "Request",
     "RequestInit",
     "RequestMode",
     "Response",
+    "SubtleCrypto",
     "Window",
     "WorkerGlobalScope",
     "XmlHttpRequest",
     "XmlHttpRequestUpload",
     "ProgressEvent"
 ]
-

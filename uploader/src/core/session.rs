@@ -75,6 +75,8 @@ pub struct FileEntry {
     pub part_size: Option<u64>,
     /// ETags for already-confirmed parts; used to skip on resume.
     pub completed_chunk_etags: Vec<(u32, String)>,
+    #[serde(default)]
+    pub run_version: u64,
     /// Extra params forwarded to startUploadApi.
     pub user_params: HashMap<String, String>,
 }
@@ -103,6 +105,7 @@ impl FileEntry {
             upload_id: None,
             part_size: None,
             completed_chunk_etags: Vec::new(),
+            run_version: 0,
             user_params,
         }
     }
@@ -351,6 +354,16 @@ impl Session {
         }
     }
 
+    pub fn run_version(&self, file_key: &str) -> Option<u64> {
+        self.files.get(file_key).map(|entry| entry.run_version)
+    }
+
+    pub fn bump_run_version(&mut self, file_key: &str) -> Option<u64> {
+        let entry = self.files.get_mut(file_key)?;
+        entry.run_version = entry.run_version.saturating_add(1);
+        Some(entry.run_version)
+    }
+
     pub fn set_file_uploaded_bytes(&mut self, file_key: &str, uploaded_bytes: u64) {
         if let Some(entry) = self.files.get_mut(file_key) {
             entry.uploaded_bytes = uploaded_bytes.min(entry.total_bytes);
@@ -433,7 +446,7 @@ impl Session {
 
     pub fn pause_all(&mut self) {
         for entry in self.files.values_mut() {
-            if entry.state == UploadState::Running {
+            if matches!(entry.state, UploadState::Running | UploadState::NotStarted) {
                 entry.state = UploadState::Paused;
             }
         }
@@ -612,164 +625,86 @@ pub fn human_bytes(bytes: u64) -> String {
 // Global session singleton
 // ---------------------------------------------------------------------------
 
+pub trait SessionStore: Send + Sync {
+    fn load(&self) -> Option<Session>;
+    fn save(&self, json: &str);
+    fn clear(&self);
+    fn set_storage_path(&self, _path: &str) {}
+}
+
+static STORE: OnceLock<Box<dyn SessionStore>> = OnceLock::new();
 static SESSION: OnceLock<Mutex<Session>> = OnceLock::new();
+
+pub fn register_store(store: impl SessionStore + 'static) {
+    let _ = STORE.set(Box::new(store));
+}
 
 pub fn session() -> MutexGuard<'static, Session> {
     SESSION
         .get_or_init(|| {
-            #[cfg(not(target_arch = "wasm32"))]
-            let s = native_load().unwrap_or_else(Session::new);
-            #[cfg(target_arch = "wasm32")]
-            let s = Session::new();
-            Mutex::new(s)
+            let initial = STORE.get()
+                .and_then(|s| s.load())
+                .unwrap_or_else(Session::new);
+            Mutex::new(initial)
         })
         .lock()
         .unwrap()
 }
 
-/// Persist the current session state.
 pub fn persist_session() {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
+    if let Some(store) = STORE.get() {
         if let Some(json) = session().to_json() {
-            native_save(&json);
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(json) = session().to_json() {
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = idb_save(&json).await;
-            });
+            store.save(&json);
         }
     }
 }
 
-/// Clear all session data and wipe the persistent store.
+pub fn cancel_file(key: &str) {
+    session().cancel_file(key);
+    persist_session();
+}
+
+pub fn cancel_transfer(tid: &str) {
+    session().cancel_transfer(tid);
+    persist_session();
+}
+
+pub fn pause_all() {
+    session().pause_all();
+    persist_session();
+}
+
+pub fn resume_all() {
+    let file_keys: Vec<String> = session()
+        .files
+        .values()
+        .filter(|e| e.state == UploadState::Paused || e.state == UploadState::Failed)
+        .map(|e| e.file_key.clone())
+        .collect();
+    for key in &file_keys {
+        session().bump_run_version(key);
+        session().mark_file_state(key, UploadState::NotStarted);
+    }
+    persist_session();
+}
+
+pub fn file_run_version(file_key: &str) -> Option<u64> {
+    session().run_version(file_key)
+}
+
+pub fn is_current_run(file_key: &str, run_version: u64) -> bool {
+    file_run_version(file_key) == Some(run_version)
+}
+
 pub fn clear_session() {
     session().cancel_all();
-    #[cfg(not(target_arch = "wasm32"))]
-    native_clear();
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(async {
-        let _ = idb_clear().await;
-    });
+    if let Some(store) = STORE.get() {
+        store.clear();
+    }
 }
-
-// ---------------------------------------------------------------------------
-// Native persistence — redb
-// ---------------------------------------------------------------------------
-
-#[cfg(not(target_arch = "wasm32"))]
-static DB: OnceLock<Mutex<redb::Database>> = OnceLock::new();
-#[cfg(not(target_arch = "wasm32"))]
-static STORE_PATH: Mutex<String> = Mutex::new(String::new());
-#[cfg(not(target_arch = "wasm32"))]
-const SESSION_TABLE: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("session");
 
 pub fn set_storage_path(path: &str) {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        *STORE_PATH.lock().unwrap() = path.to_string();
+    if let Some(store) = STORE.get() {
+        store.set_storage_path(path);
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn db() -> std::sync::MutexGuard<'static, redb::Database> {
-    DB.get_or_init(|| {
-        let base = STORE_PATH.lock().unwrap().clone();
-        let path = if base.is_empty() {
-            "s3_uploader.redb".to_string()
-        } else {
-            format!("{}/s3_uploader.redb", base)
-        };
-        Mutex::new(redb::Database::create(&path).expect("redb open failed"))
-    })
-    .lock()
-    .unwrap()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn native_load() -> Option<Session> {
-    let txn = db().begin_read().ok()?;
-    let table = txn.open_table(SESSION_TABLE).ok()?;
-    let guard = table.get("data").ok()??;
-    Session::from_json(guard.value())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn native_save(json: &str) {
-    if let Ok(txn) = db().begin_write() {
-        if let Ok(mut table) = txn.open_table(SESSION_TABLE) {
-            let _ = table.insert("data", json);
-        }
-        let _ = txn.commit();
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn native_clear() {
-    if let Ok(txn) = db().begin_write() {
-        if let Ok(mut table) = txn.open_table(SESSION_TABLE) {
-            let _ = table.remove("data");
-        }
-        let _ = txn.commit();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WASM persistence — IndexedDB via rexie
-// ---------------------------------------------------------------------------
-
-#[cfg(target_arch = "wasm32")]
-const IDB_NAME: &str = "s3_bg_uploader";
-#[cfg(target_arch = "wasm32")]
-const IDB_STORE: &str = "session";
-
-#[cfg(target_arch = "wasm32")]
-async fn open_idb() -> rexie::Result<rexie::Rexie> {
-    rexie::Rexie::builder(IDB_NAME)
-        .version(1)
-        .add_object_store(rexie::ObjectStore::new(IDB_STORE).auto_increment(false))
-        .build()
-        .await
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn idb_save(json: &str) -> rexie::Result<()> {
-    let db = open_idb().await?;
-    let tx = db.transaction(&[IDB_STORE], rexie::TransactionMode::ReadWrite)?;
-    let store = tx.store(IDB_STORE)?;
-    store
-        .put(
-            &wasm_bindgen::JsValue::from_str(json),
-            Some(&wasm_bindgen::JsValue::from_str("data")),
-        )
-        .await?;
-    tx.done().await?;
-    Ok(())
-}
-
-#[cfg(target_arch = "wasm32")]
-pub async fn idb_load() -> Option<Session> {
-    let db = open_idb().await.ok()?;
-    let tx = db
-        .transaction(&[IDB_STORE], rexie::TransactionMode::ReadOnly)
-        .ok()?;
-    let store = tx.store(IDB_STORE).ok()?;
-    let val = store
-        .get(wasm_bindgen::JsValue::from_str("data"))
-        .await
-        .ok()??;
-    Session::from_json(&val.as_string()?)
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn idb_clear() -> rexie::Result<()> {
-    let db = open_idb().await?;
-    let tx = db.transaction(&[IDB_STORE], rexie::TransactionMode::ReadWrite)?;
-    let store = tx.store(IDB_STORE)?;
-    store.clear().await?;
-    tx.done().await?;
-    Ok(())
 }

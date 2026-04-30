@@ -1,5 +1,4 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use crate::core::progress::{ProgressManager, ProgressNotifier};
@@ -122,11 +121,8 @@ impl ProgressReader {
 
 impl Read for ProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if crate::android::PAUSE_FLAG.load(Ordering::Relaxed) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "paused",
-            ));
+        if crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "paused"));
         }
         let n = self.inner.read(buf)?;
         if n > 0 {

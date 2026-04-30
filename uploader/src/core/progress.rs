@@ -225,7 +225,10 @@ impl<N: ProgressNotifier> ProgressManager<N> {
     ) {
         let mut lock = self.progress.lock().unwrap();
         if let Some(p) = lock.get_mut(file_key) {
-            p.status = status;
+            p.status = status.clone();
+            if status == UploadState::Paused {
+                p.in_flight_progress.clear();
+            }
             let fp = p.to_file_progress();
             let tid = p.transfer_id.clone();
             let (s, t) = Self::build_aggregates(&lock, session_agg, transfer_agg, &tid);

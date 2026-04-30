@@ -25,6 +25,21 @@ pub fn aggregate_snapshot_for_file(
     (transfer_id, session_agg, transfer_agg)
 }
 
+pub fn pause_all<N: ProgressNotifier>(manager: &ProgressManager<N>) {
+    session::pause_all();
+    let paused_keys: Vec<String> = {
+        let sess = session::session();
+        manager
+            .tracked_file_keys()
+            .into_iter()
+            .filter(|k| sess.files.get(k).map_or(false, |e| e.state == UploadState::Paused))
+            .collect()
+    };
+    for file_key in &paused_keys {
+        set_status(manager, file_key, UploadState::Paused);
+    }
+}
+
 pub fn mark_state_persist(file_key: &str, state: UploadState) {
     session::session().mark_file_state(file_key, state);
     session::persist_session();

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::core::api::StartUploadResponse;
+use crate::core::api::{ApiClient, StartUploadResponse};
 use crate::core::session::{self, UploadState};
 use crate::core::ChunkUploadResult;
 
@@ -8,6 +8,24 @@ pub enum StartDecision {
     Completed { file_key: String },
     Resume { file_key: String },
     StartNew,
+}
+
+pub enum StartResult {
+    AlreadyCompleted(String),
+    Resumed(String),
+    Started(String),
+}
+
+impl StartResult {
+    pub fn file_key(&self) -> &str {
+        match self {
+            StartResult::AlreadyCompleted(k) | StartResult::Resumed(k) | StartResult::Started(k) => k,
+        }
+    }
+
+    pub fn should_upload(&self) -> bool {
+        !matches!(self, StartResult::AlreadyCompleted(_))
+    }
 }
 
 pub struct PreparedUpload {
@@ -31,6 +49,32 @@ pub fn start_decision(file_hash: &str) -> StartDecision {
             file_key: entry.file_key.clone(),
         },
         _ => StartDecision::StartNew,
+    }
+}
+
+pub async fn start_and_register<A: ApiClient>(
+    file_hash: String,
+    transfer_id: &str,
+    file_path: String,
+    file_name: String,
+    file_size: u64,
+    user_params: HashMap<String, String>,
+    api: &A,
+) -> Result<StartResult, String> {
+    match start_decision(&file_hash) {
+        StartDecision::Completed { file_key } => Ok(StartResult::AlreadyCompleted(file_key)),
+        StartDecision::Resume { file_key } => Ok(StartResult::Resumed(file_key)),
+        StartDecision::StartNew => {
+            let start_resp = api
+                .start_upload(&file_name, &file_hash, file_size, &user_params)
+                .await
+                .map_err(|e| e.to_string())?;
+            let file_key = register_started_upload(
+                file_hash, transfer_id, file_path, file_name, file_size, user_params, start_resp,
+            );
+            session::persist_session();
+            Ok(StartResult::Started(file_key))
+        }
     }
 }
 

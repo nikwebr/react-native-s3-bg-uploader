@@ -14,7 +14,6 @@ import { UPLOADER_JS_CODE, UPLOADER_WASM_BASE64 } from './web/wasm-assets'
 // no bundler configuration required by consumers.
 // ---------------------------------------------------------------------------
 
-const STORAGE_KEY = 's3_bg_uploader_session'
 
 function buildWorkerSource(jsCode: string, wasmBase64: string): string {
   return `
@@ -30,9 +29,6 @@ const _wasmReady = wasm_bindgen(_wasmBytes.buffer);
 const sessionReady = _wasmReady.then(function() {
   return wasm_bindgen.wasm_load_session();
 });
-
-/* Cache of fileKey -> File for resume support */
-const _fileCache = {};
 
 onmessage = async function (e) {
   await sessionReady;
@@ -75,12 +71,7 @@ onmessage = async function (e) {
 
     case 'uploadFile': {
       try {
-        // Phase 1 (fast ~100ms): hash + startUploadApi + register in session
-        const fileKey = await wasm.wasm_start_file(payload.file, payload.transferId, payload.userParams ?? null);
-        // Cache the File object for resume support
-        _fileCache[fileKey] = payload.file;
-        // Phase 2 (fire-and-forget): chunk uploads run sequentially in Rust queue
-        wasm.wasm_run_file(fileKey, payload.file);
+        const fileKey = await wasm.upload_file(payload.file, payload.transferId, payload.userParams ?? null);
         postMessage({ type: 'result', requestId, ok: true, value: fileKey });
       } catch (err) {
         postMessage({ type: 'result', requestId, ok: false, error: String(err) });
@@ -89,7 +80,6 @@ onmessage = async function (e) {
     }
 
     case 'cancelFile': {
-      delete _fileCache[payload.fileKey];
       wasm.wasm_cancel_file(payload.fileKey);
       postMessage({ type: 'ack', requestId });
       break;
@@ -102,7 +92,6 @@ onmessage = async function (e) {
     }
 
     case 'cancelAll': {
-      for (const key in _fileCache) delete _fileCache[key];
       wasm.wasm_cancel_all();
       postMessage({ type: 'ack', requestId });
       break;
@@ -115,13 +104,7 @@ onmessage = async function (e) {
     }
 
     case 'resume': {
-      // Re-enqueue all paused files using their cached File objects
-      const progress = wasm.wasm_get_progress(undefined, undefined);
-      for (const entry of progress) {
-        if (entry.state === 'PAUSED' && _fileCache[entry.fileKey]) {
-          wasm.wasm_run_file(entry.fileKey, _fileCache[entry.fileKey]);
-        }
-      }
+      wasm.wasm_resume_all();
       postMessage({ type: 'ack', requestId });
       break;
     }

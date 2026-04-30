@@ -2,13 +2,15 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
-use crate::core::api;
-use crate::core::hash::sha256_file;
+use crate::native::NativeSessionStore;
 use crate::core::runtime;
-use crate::core::session::{self, UploadState};
-use crate::core::upload::{self, StartDecision};
+use crate::core::session::{self, register_store, UploadState};
 use crate::ios::progress as iosProgress;
-use crate::ios::{enqueue_key, init_nyquest, PAUSE_FLAG, QUEUE};
+use crate::ios::{PAUSE_FLAG, QUEUE};
+
+fn ensure_store() {
+    register_store(NativeSessionStore);
+}
 
 #[no_mangle]
 pub extern "C" fn add(one: i32, two: i32) -> i32 {
@@ -21,6 +23,7 @@ pub extern "C" fn set_config(
     get_upload_urls_api: *const c_char,
     complete_api: *const c_char,
 ) {
+    ensure_store();
     let s = unsafe { CStr::from_ptr(start_upload_api) }
         .to_str()
         .unwrap_or("");
@@ -35,6 +38,7 @@ pub extern "C" fn set_config(
 
 #[no_mangle]
 pub extern "C" fn set_storage_path(path: *const c_char) {
+    ensure_store();
     let p = unsafe { CStr::from_ptr(path) }.to_str().unwrap_or("");
     session::set_storage_path(p);
 }
@@ -67,7 +71,7 @@ pub extern "C" fn upload_file(
         serde_json::from_str(json_str).unwrap_or_default()
     };
 
-    match start_upload_and_enqueue(&path, &tid, user_params) {
+    match super::start_and_enqueue(&path, &tid, user_params) {
         Ok(file_key) => CString::new(file_key)
             .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut()),
@@ -78,62 +82,13 @@ pub extern "C" fn upload_file(
     }
 }
 
-fn start_upload_and_enqueue(
-    file_path: &str,
-    transfer_id: &str,
-    user_params: HashMap<String, String>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    init_nyquest();
-
-    let file_hash = sha256_file(file_path, transfer_id)?;
-
-    match upload::start_decision(&file_hash) {
-        StartDecision::Completed { file_key } => return Ok(file_key),
-        StartDecision::Resume { file_key } => {
-            session::session().update_file_path(&file_key, file_path.to_string());
-            enqueue_key(file_key.clone());
-            return Ok(file_key);
-        }
-        StartDecision::StartNew => {}
-    }
-
-    let client = nyquest::ClientBuilder::default()
-        .request_timeout(std::time::Duration::from_secs(30))
-        .build_blocking()
-        .map_err(|e| format!("Failed to create client: {:?}", e))?;
-
-    let file_name = std::path::Path::new(file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file")
-        .to_string();
-
-    let file_size = std::fs::metadata(file_path)?.len();
-
-    let start_resp = api::start_upload(&client, &file_name, &file_hash, file_size, &user_params)?;
-    let file_key = upload::register_started_upload(
-        file_hash,
-        transfer_id,
-        file_path.to_string(),
-        file_name,
-        file_size,
-        user_params,
-        start_resp,
-    );
-    session::persist_session();
-
-    enqueue_key(file_key.clone());
-    Ok(file_key)
-}
-
 #[no_mangle]
 pub extern "C" fn cancel_file(file_key: *const c_char) {
     if file_key.is_null() {
         return;
     }
     let key = unsafe { CStr::from_ptr(file_key) }.to_str().unwrap_or("");
-    session::session().cancel_file(key);
-    session::persist_session();
+    session::cancel_file(key);
 }
 
 #[no_mangle]
@@ -144,8 +99,7 @@ pub extern "C" fn cancel_transfer(transfer_id: *const c_char) {
     let tid = unsafe { CStr::from_ptr(transfer_id) }
         .to_str()
         .unwrap_or("");
-    session::session().cancel_transfer(tid);
-    session::persist_session();
+    session::cancel_transfer(tid);
 }
 
 #[no_mangle]
@@ -156,24 +110,30 @@ pub extern "C" fn cancel_all() {
 #[no_mangle]
 pub extern "C" fn pause_all() {
     PAUSE_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
-    session::session().pause_all();
-    session::persist_session();
-
-    for file_key in &iosProgress::progress_manager().tracked_file_keys() {
-        runtime::set_status(
-            iosProgress::progress_manager(),
-            file_key,
-            UploadState::Paused,
-        );
-    }
+    runtime::pause_all(iosProgress::progress_manager());
 }
 
 #[no_mangle]
 pub extern "C" fn resume_all() {
+    let resumed_keys: Vec<String> = {
+        let sess = session::session();
+        sess.files
+            .values()
+            .filter(|e| e.state == UploadState::Paused || e.state == UploadState::Failed)
+            .map(|e| e.file_key.clone())
+            .collect()
+    };
     PAUSE_FLAG.store(false, std::sync::atomic::Ordering::Relaxed);
-    QUEUE.lock().unwrap().pending.clear();
-    if let Some(next) = session::session().next_pending_file() {
-        enqueue_key(next);
+    session::resume_all();
+    for key in &resumed_keys {
+        iosProgress::progress_manager().remove(key);
+    }
+    let mut queue = QUEUE.lock().unwrap();
+    queue.pending.clear();
+    queue.pending_keys.clear();
+    drop(queue);
+    if let Some(file_key) = session::session().next_pending_file() {
+        crate::ios::enqueue_key(file_key);
     }
 }
 

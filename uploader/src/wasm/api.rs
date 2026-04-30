@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -5,44 +6,52 @@ use web_sys::{Request, RequestInit, RequestMode, Response};
 
 use crate::core::api::{
     complete_upload_body, complete_upload_url, start_upload_body, upload_urls_batch_body,
-    StartUploadResponse, UploadUrlsBatchResponse,
+    ApiClient, StartUploadResponse, UploadUrlsBatchResponse,
 };
 use crate::core::config::get_config;
 use crate::core::ChunkUploadResult;
 
-pub async fn start_upload(
-    file_name: &str,
-    file_hash: &str,
-    file_size: u64,
-    user_params: &HashMap<String, String>,
-) -> Result<StartUploadResponse, String> {
-    let url = get_config().start_upload_api.clone();
-    let body = start_upload_body(file_name, file_hash, file_size, user_params)?;
-    fetch_json::<StartUploadResponse>(&url, "POST", Some(&body)).await
-}
+pub struct WasmApiClient;
 
-pub async fn fetch_upload_urls_batch(
-    file_key: &str,
-    upload_id: &str,
-    part_numbers: &[u32],
-) -> Result<HashMap<u32, String>, String> {
-    let url = get_config().get_upload_urls_api.clone();
-    let body = upload_urls_batch_body(file_key, upload_id, part_numbers)?;
-    let resp: UploadUrlsBatchResponse = fetch_json(&url, "POST", Some(&body)).await?;
-    Ok(resp.into_part_map())
-}
+#[async_trait(?Send)]
+impl ApiClient for WasmApiClient {
+    async fn start_upload(
+        &self,
+        file_name: &str,
+        file_hash: &str,
+        file_size: u64,
+        user_params: &HashMap<String, String>,
+    ) -> Result<StartUploadResponse, String> {
+        let url = get_config().start_upload_api.clone();
+        let body = start_upload_body(file_name, file_hash, file_size, user_params)?;
+        fetch_json::<StartUploadResponse>(&url, "POST", Some(&body)).await
+    }
 
-pub async fn complete_upload(
-    file_key: &str,
-    upload_id: &str,
-    results: Vec<ChunkUploadResult>,
-) -> Result<(), String> {
-    let base_url = get_config().complete_api.clone();
-    let url = complete_upload_url(&base_url, upload_id, file_key);
-    let body = complete_upload_body(results)?;
-    fetch_json::<serde_json::Value>(&url, "POST", Some(&body))
-        .await
-        .map(|_| ())
+    async fn fetch_upload_urls_batch(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_numbers: &[u32],
+    ) -> Result<HashMap<u32, String>, String> {
+        let url = get_config().get_upload_urls_api.clone();
+        let body = upload_urls_batch_body(key, upload_id, part_numbers)?;
+        let resp: UploadUrlsBatchResponse = fetch_json(&url, "POST", Some(&body)).await?;
+        Ok(resp.into_part_map())
+    }
+
+    async fn complete_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        results: Vec<ChunkUploadResult>,
+    ) -> Result<(), String> {
+        let base_url = get_config().complete_api.clone();
+        let url = complete_upload_url(&base_url, upload_id, key);
+        let body = complete_upload_body(results)?;
+        fetch_json::<serde_json::Value>(&url, "POST", Some(&body))
+            .await
+            .map(|_| ())
+    }
 }
 
 async fn fetch_request(request: &Request) -> Result<JsValue, JsValue> {

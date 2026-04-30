@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
 
 use jni::objects::{JClass, JString};
@@ -8,11 +7,14 @@ use jni::sys::{jint, jstring};
 use jni::JNIEnv;
 
 use crate::android::progress as androidProgress;
-use crate::android::{build_client, dup_fd, enqueue, PAUSE_FLAG};
-use crate::core::api;
-use crate::core::hash::sha256_fd;
-use crate::core::session::{self, UploadState};
-use crate::core::upload::{self, StartDecision};
+use crate::android::{PAUSE_FLAG, QUEUE_SIGNAL};
+use crate::native::NativeSessionStore;
+use crate::core::runtime;
+use crate::core::session::{self, register_store, format_template, GlobalUploaderState, UploadState};
+
+fn ensure_store() {
+    register_store(NativeSessionStore);
+}
 
 #[no_mangle]
 pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetConfig(
@@ -22,6 +24,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetConfig(
     get_upload_urls_api: JString,
     complete_api: JString,
 ) {
+    ensure_store();
     let s: String = env
         .get_string(&start_upload_api)
         .map(|s| s.into())
@@ -43,6 +46,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetStorage
     _class: JClass,
     path: JString,
 ) {
+    ensure_store();
     let p: String = env.get_string(&path).map(|s| s.into()).unwrap_or_default();
     session::set_storage_path(&p);
 }
@@ -78,8 +82,6 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeUploadFile
     transfer_id: JString,
     user_params_json: JString,
 ) -> jstring {
-    crate::android::init_logging();
-
     let tid: String = env
         .get_string(&transfer_id)
         .map(|s| s.into())
@@ -91,81 +93,16 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeUploadFile
     let user_params: HashMap<String, String> =
         serde_json::from_str(&params_str).unwrap_or_default();
 
-    let raw_fd = fd as RawFd;
-    let file_hash = match sha256_fd(raw_fd, &tid) {
-        Ok(h) => h,
+    match super::start_and_enqueue(fd as RawFd, &tid, user_params) {
+        Ok(file_key) => env
+            .new_string(&file_key)
+            .map(|s| s.into_raw())
+            .unwrap_or(empty_jstring(&mut env)),
         Err(e) => {
-            log::error!("sha256_fd failed: {}", e);
-            return empty_jstring(&mut env);
+            log::error!("nativeUploadFile failed: {}", e);
+            empty_jstring(&mut env)
         }
-    };
-
-    let file_key = match upload::start_decision(&file_hash) {
-        StartDecision::Completed { file_key } => {
-            return env
-                .new_string(&file_key)
-                .map(|s| s.into_raw())
-                .unwrap_or(empty_jstring(&mut env));
-        }
-        StartDecision::Resume { file_key } => {
-            let dup = match dup_fd(raw_fd) {
-                Ok(f) => f,
-                Err(_) => return empty_jstring(&mut env),
-            };
-            enqueue(file_key.clone(), dup);
-            return env
-                .new_string(&file_key)
-                .map(|s| s.into_raw())
-                .unwrap_or(empty_jstring(&mut env));
-        }
-        StartDecision::StartNew => {
-            let dup_for_size = match dup_fd(raw_fd) {
-                Ok(f) => f,
-                Err(_) => return empty_jstring(&mut env),
-            };
-            let file_size = unsafe {
-                let f = File::from_raw_fd(dup_for_size);
-                f.metadata().map(|m| m.len()).unwrap_or(0)
-            };
-
-            let client = build_client();
-            let start_resp = match api::start_upload_android(
-                &client,
-                "file",
-                &file_hash,
-                file_size,
-                &user_params,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("startUploadApi failed: {}", e);
-                    return empty_jstring(&mut env);
-                }
-            };
-
-            let file_key = upload::register_started_upload(
-                file_hash,
-                &tid,
-                String::new(),
-                "file".to_string(),
-                file_size,
-                user_params,
-                start_resp,
-            );
-            session::persist_session();
-            file_key
-        }
-    };
-
-    let dup = match dup_fd(raw_fd) {
-        Ok(f) => f,
-        Err(_) => return empty_jstring(&mut env),
-    };
-    enqueue(file_key.clone(), dup);
-
-    env.new_string(&file_key)
-        .map(|s| s.into_raw())
-        .unwrap_or(empty_jstring(&mut env))
+    }
 }
 
 #[no_mangle]
@@ -173,7 +110,8 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetFormatt
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let s = session::session().format_title();
+    let template = session::session().title_template.clone();
+    let s = format_with_live_aggregate(template);
     env.new_string(&s)
         .map(|s| s.into_raw())
         .unwrap_or(empty_jstring(&mut env))
@@ -184,10 +122,30 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetFormatt
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let s = session::session().format_subtitle();
+    let template = session::session().subtitle_template.clone();
+    let s = format_with_live_aggregate(template);
     env.new_string(&s)
         .map(|s| s.into_raw())
         .unwrap_or(empty_jstring(&mut env))
+}
+
+fn format_with_live_aggregate(template: String) -> String {
+    if template.is_empty() {
+        return String::new();
+    }
+    let (session_agg, transfer_agg, current_tid) = {
+        let sess = session::session();
+        let s = sess.get_aggregate_progress(None);
+        let t = sess.get_aggregate_progress(sess.current_transfer_id.as_deref());
+        let ctid = sess.current_transfer_id.clone().unwrap_or_default();
+        (s, t, ctid)
+    };
+    let (live_agg, _) = androidProgress::progress_manager().get_live_aggregate(
+        session_agg,
+        transfer_agg,
+        &current_tid,
+    );
+    format_template(&template, &live_agg)
 }
 
 fn empty_jstring(env: &mut JNIEnv) -> jstring {
@@ -206,8 +164,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelFile
         .get_string(&file_key)
         .map(|s| s.into())
         .unwrap_or_default();
-    session::session().cancel_file(&k);
-    session::persist_session();
+    session::cancel_file(&k);
 }
 
 #[no_mangle]
@@ -220,8 +177,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelTran
         .get_string(&transfer_id)
         .map(|s| s.into())
         .unwrap_or_default();
-    session::session().cancel_transfer(&t);
-    session::persist_session();
+    session::cancel_transfer(&t);
 }
 
 #[no_mangle]
@@ -238,8 +194,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativePauseAll(
     _class: JClass,
 ) {
     PAUSE_FLAG.store(true, Ordering::Relaxed);
-    session::session().pause_all();
-    session::persist_session();
+    runtime::pause_all(androidProgress::progress_manager());
 }
 
 #[no_mangle]
@@ -247,8 +202,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeResumeAll(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    PAUSE_FLAG.store(false, Ordering::Relaxed);
-    let file_keys: Vec<String> = {
+    let resumed_keys: Vec<String> = {
         let sess = session::session();
         sess.files
             .values()
@@ -256,10 +210,12 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeResumeAll(
             .map(|e| e.file_key.clone())
             .collect()
     };
-    for key in &file_keys {
-        session::session().mark_file_state(key, UploadState::NotStarted);
+    PAUSE_FLAG.store(false, Ordering::Relaxed);
+    session::resume_all();
+    for key in &resumed_keys {
+        androidProgress::progress_manager().remove(key);
     }
-    session::persist_session();
+    QUEUE_SIGNAL.notify_one();
 }
 
 #[no_mangle]
@@ -348,11 +304,23 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetLiveAgg
         transfer_agg,
         &current_tid,
     );
-    let result = if tid.is_some() {
+    let mut result = if tid.is_some() {
         live_transfer
     } else {
         live_session
     };
+
+    // After all files complete, upload_orchestrator calls clear_session() which resets
+    // global_state to NOT_STARTED before the next poll runs. The ProgressManager is not
+    // cleared, so its entries still carry status=Completed. Use that to surface COMPLETED
+    // to the polling service so it can terminate instead of looping forever.
+    if result.state == GlobalUploaderState::NotStarted {
+        let live = androidProgress::progress_manager().get_live_progress(tid.as_deref(), None);
+        if !live.is_empty() && live.iter().all(|p| p.state == UploadState::Completed) {
+            result.state = GlobalUploaderState::Completed;
+        }
+    }
+
     let s = serde_json::to_string(&result.to_json()).unwrap_or_else(|_| "{}".to_string());
     env.new_string(&s)
         .map(|s| s.into_raw())

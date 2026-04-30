@@ -2,20 +2,21 @@ use std::collections::HashMap;
 
 use wasm_bindgen::prelude::*;
 
-use crate::core::session::{self, UploadState};
-use crate::core::upload::{self, StartDecision};
-use crate::wasm::api;
+use crate::core::session::{self, register_store, UploadState};
+use crate::wasm::api::WasmApiClient;
 use crate::wasm::progress as wasmProgress;
-use crate::wasm::{enqueue_file, FILE_QUEUE, PAUSE_REQUESTED, QUEUE_RUNNING};
+use crate::wasm::store::WasmSessionStore;
+use crate::wasm::{FILE_QUEUE, PAUSE_REQUESTED, QUEUE_RUNNING};
 
 #[wasm_bindgen(start)]
 pub fn wasm_start() {
     console_error_panic_hook::set_once();
+    register_store(WasmSessionStore);
 }
 
 #[wasm_bindgen]
 pub async fn wasm_load_session() {
-    if let Some(s) = session::idb_load().await {
+    if let Some(s) = crate::wasm::store::load().await {
         *session::session() = s;
     }
 }
@@ -35,42 +36,13 @@ pub fn wasm_set_config(
 }
 
 #[wasm_bindgen]
-pub async fn wasm_start_file(
-    file: web_sys::File,
-    transfer_id: String,
-    user_params_js: JsValue,
-) -> Result<JsValue, JsValue> {
-    let user_params = parse_user_params(user_params_js);
-    start_file_internal(&file, &transfer_id, &user_params)
-        .await
-        .map(|key| JsValue::from_str(&key))
-        .map_err(|e| JsValue::from_str(&format!("Start failed: {}", e)))
-}
-
-#[wasm_bindgen]
-pub fn wasm_run_file(file_key: String, file: web_sys::File) {
-    {
-        let sess = session::session();
-        if let Some(entry) = sess.files.get(&file_key) {
-            if entry.state == UploadState::Completed {
-                return;
-            }
-        } else {
-            return;
-        }
-    }
-
-    enqueue_file(file_key, file);
-}
-
-#[wasm_bindgen]
 pub async fn upload_file(
     file: web_sys::File,
     transfer_id: String,
     user_params_js: JsValue,
 ) -> Result<JsValue, JsValue> {
     let user_params = parse_user_params(user_params_js);
-    upload_file_internal(file, transfer_id, user_params)
+    super::start_and_enqueue(file, transfer_id, user_params)
         .await
         .map(|key| JsValue::from_str(&key))
         .map_err(|e| JsValue::from_str(&format!("Upload failed: {}", e)))
@@ -79,7 +51,7 @@ pub async fn upload_file(
 #[wasm_bindgen]
 pub fn wasm_cancel_file(file_key: String) {
     FILE_QUEUE.with(|q| q.borrow_mut().retain(|e| e.file_key != file_key));
-    session::session().cancel_file(&file_key);
+    session::cancel_file(&file_key);
 }
 
 #[wasm_bindgen]
@@ -93,7 +65,7 @@ pub fn wasm_cancel_transfer(transfer_id: String) {
                 .map_or(true, |f| f.transfer_id != transfer_id)
         });
     });
-    session::session().cancel_transfer(&transfer_id);
+    session::cancel_transfer(&transfer_id);
 }
 
 #[wasm_bindgen]
@@ -107,17 +79,14 @@ pub fn wasm_cancel_all() {
 
 #[wasm_bindgen]
 pub fn wasm_pause_all() {
-    FILE_QUEUE.with(|q| q.borrow_mut().clear());
     PAUSE_REQUESTED.with(|p| *p.borrow_mut() = true);
-    session::session().pause_all();
+    crate::core::runtime::pause_all(wasmProgress::progress_manager());
+}
 
-    for file_key in &wasmProgress::progress_manager().tracked_file_keys() {
-        crate::core::runtime::set_status(
-            wasmProgress::progress_manager(),
-            file_key,
-            UploadState::Paused,
-        );
-    }
+#[wasm_bindgen]
+pub fn wasm_resume_all() {
+    session::resume_all();
+    crate::wasm::resume_queue();
 }
 
 #[wasm_bindgen]
@@ -153,51 +122,4 @@ fn parse_user_params(user_params_js: JsValue) -> HashMap<String, String> {
             .unwrap_or_else(|| "{}".to_string());
         serde_json::from_str(&json_str).unwrap_or_default()
     }
-}
-
-async fn start_file_internal(
-    file: &web_sys::File,
-    transfer_id: &str,
-    user_params: &HashMap<String, String>,
-) -> Result<String, String> {
-    let file_hash = crate::core::hash::sha256_web_file(file, transfer_id).await?;
-
-    match upload::start_decision(&file_hash) {
-        StartDecision::Completed { file_key } | StartDecision::Resume { file_key } => Ok(file_key),
-        StartDecision::StartNew => {
-            let file_size = file.size() as u64;
-            let file_name = file.name();
-            let start_resp =
-                api::start_upload(&file_name, &file_hash, file_size, user_params).await?;
-            Ok(upload::register_started_upload(
-                file_hash,
-                transfer_id,
-                String::new(),
-                file_name,
-                file_size,
-                user_params.clone(),
-                start_resp,
-            ))
-        }
-    }
-}
-
-async fn upload_file_internal(
-    file: web_sys::File,
-    transfer_id: String,
-    user_params: HashMap<String, String>,
-) -> Result<String, String> {
-    let file_key = start_file_internal(&file, &transfer_id, &user_params).await?;
-
-    {
-        let sess = session::session();
-        if let Some(entry) = sess.files.get(&file_key) {
-            if entry.state == UploadState::Completed {
-                return Ok(file_key.clone());
-            }
-        }
-    }
-
-    enqueue_file(file_key.clone(), file);
-    Ok(file_key)
 }

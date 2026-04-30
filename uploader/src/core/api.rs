@@ -1,8 +1,7 @@
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[cfg(any(feature = "ios", feature = "android"))]
-use crate::core::config::get_config;
 use crate::core::ChunkUploadResult;
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -106,148 +105,27 @@ impl ChunkUploadResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// iOS / blocking HTTP helpers (compiled only for the `ios` feature)
-// ---------------------------------------------------------------------------
+#[async_trait(?Send)]
+pub trait ApiClient {
+    async fn start_upload(
+        &self,
+        file_name: &str,
+        file_hash: &str,
+        file_size: u64,
+        user_params: &HashMap<String, String>,
+    ) -> Result<StartUploadResponse, String>;
 
-#[cfg(feature = "ios")]
-pub fn start_upload(
-    client: &nyquest::BlockingClient,
-    file_name: &str,
-    file_hash: &str,
-    file_size: u64,
-    user_params: &HashMap<String, String>,
-) -> Result<StartUploadResponse, Box<dyn std::error::Error>> {
-    let url = get_config().start_upload_api.clone();
-    let body_json = start_upload_body(file_name, file_hash, file_size, user_params)?;
+    async fn fetch_upload_urls_batch(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_numbers: &[u32],
+    ) -> Result<HashMap<u32, String>, String>;
 
-    let body = nyquest::Body::bytes(body_json.into_bytes(), "application/json");
-    let request = nyquest::Request::post(url).with_body(body);
-    let response = client
-        .request(request)
-        .map_err(|e| format!("start_upload request failed: {:?}", e))?;
-    let text = response
-        .text()
-        .map_err(|e| format!("start_upload read body failed: {:?}", e))?;
-    serde_json::from_str(&text)
-        .map_err(|e| format!("start_upload parse failed: {:?} body={}", e, text).into())
-}
-
-#[cfg(feature = "ios")]
-pub fn fetch_upload_urls_batch(
-    client: &nyquest::BlockingClient,
-    key: &str,
-    upload_id: &str,
-    part_numbers: &[u32],
-) -> Result<HashMap<u32, String>, Box<dyn std::error::Error>> {
-    let url = get_config().get_upload_urls_api.clone();
-    let body_json = upload_urls_batch_body(key, upload_id, part_numbers)?;
-
-    let body = nyquest::Body::bytes(body_json.into_bytes(), "application/json");
-    let request = nyquest::Request::post(url).with_body(body);
-    let response = client
-        .request(request)
-        .map_err(|e| format!("fetch_upload_urls_batch request failed: {:?}", e))?;
-    let text = response
-        .text()
-        .map_err(|e| format!("fetch_upload_urls_batch read body failed: {:?}", e))?;
-    let parsed: UploadUrlsBatchResponse = serde_json::from_str(&text).map_err(|e| {
-        format!(
-            "fetch_upload_urls_batch parse failed: {:?} body={}",
-            e, text
-        )
-    })?;
-    Ok(parsed.into_part_map())
-}
-
-#[cfg(feature = "ios")]
-pub fn complete_upload(
-    client: &nyquest::BlockingClient,
-    key: &str,
-    upload_id: &str,
-    results: Vec<ChunkUploadResult>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = get_config().complete_api.clone();
-    let body_json = complete_upload_body(results)?;
-    let body = nyquest::Body::bytes(body_json.into_bytes(), "application/json");
-    let request = nyquest::Request::post(complete_upload_url(&url, upload_id, key)).with_body(body);
-    client
-        .request(request)
-        .map_err(|e| format!("complete_upload request failed: {:?}", e))?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Android / reqwest blocking helpers
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "android")]
-pub fn start_upload_android(
-    client: &reqwest::blocking::Client,
-    file_name: &str,
-    file_hash: &str,
-    file_size: u64,
-    user_params: &HashMap<String, String>,
-) -> Result<StartUploadResponse, Box<dyn std::error::Error>> {
-    let url = get_config().start_upload_api.clone();
-    let response = client
-        .post(&url)
-        .body(start_upload_body(
-            file_name,
-            file_hash,
-            file_size,
-            user_params,
-        )?)
-        .header("Content-Type", "application/json")
-        .send()
-        .map_err(|e| format!("start_upload request failed: {:?}", e))?;
-    let text = response
-        .text()
-        .map_err(|e| format!("start_upload read body failed: {:?}", e))?;
-    serde_json::from_str(&text)
-        .map_err(|e| format!("start_upload parse failed: {:?} body={}", e, text).into())
-}
-
-#[cfg(feature = "android")]
-pub fn fetch_upload_urls_batch_android(
-    client: &reqwest::blocking::Client,
-    key: &str,
-    upload_id: &str,
-    part_numbers: &[u32],
-) -> Result<HashMap<u32, String>, Box<dyn std::error::Error>> {
-    let url = get_config().get_upload_urls_api.clone();
-    let response = client
-        .post(&url)
-        .body(upload_urls_batch_body(key, upload_id, part_numbers)?)
-        .header("Content-Type", "application/json")
-        .send()
-        .map_err(|e| format!("fetch_upload_urls_batch request failed: {:?}", e))?;
-    let text = response
-        .text()
-        .map_err(|e| format!("fetch_upload_urls_batch read body failed: {:?}", e))?;
-    let parsed: UploadUrlsBatchResponse = serde_json::from_str(&text).map_err(|e| {
-        format!(
-            "fetch_upload_urls_batch parse failed: {:?} body={}",
-            e, text
-        )
-    })?;
-    Ok(parsed.into_part_map())
-}
-
-#[cfg(feature = "android")]
-pub fn complete_upload_android(
-    client: &reqwest::blocking::Client,
-    key: &str,
-    upload_id: &str,
-    results: Vec<ChunkUploadResult>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = get_config().complete_api.clone();
-    let body_json = complete_upload_body(results)?;
-    client
-        .post(complete_upload_url(&url, upload_id, key))
-        .header("Content-Type", "application/json")
-        .body(body_json)
-        .send()
-        .map_err(|e| format!("complete_upload request failed: {:?}", e))?;
-    Ok(())
+    async fn complete_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        results: Vec<ChunkUploadResult>,
+    ) -> Result<(), String>;
 }

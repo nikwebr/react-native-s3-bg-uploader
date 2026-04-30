@@ -1,5 +1,4 @@
 use std::io::{Read, Seek, SeekFrom};
-
 /// Informationen für einen einzelnen Chunk-Upload
 #[derive(Debug, Clone)]
 pub struct ChunkInfo {
@@ -7,6 +6,16 @@ pub struct ChunkInfo {
     pub start_pos: u64,
     pub chunk_size: u64,
     pub url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkUploadResult {
+    pub part_number: u32,
+    pub etag: String,
+}
+
+pub fn clean_etag(etag: &str) -> String {
+    etag.trim_matches('"').to_string()
 }
 
 impl ChunkInfo {

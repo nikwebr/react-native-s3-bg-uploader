@@ -1,16 +1,19 @@
 pub mod api;
 mod bindings;
+pub mod hash;
 pub mod progress;
+pub mod store;
 mod upload;
+pub mod upload_engine;
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use wasm_bindgen_futures::spawn_local;
 
-use crate::core::runtime;
-use crate::core::session::{self, GlobalUploaderState, UploadState};
-use crate::wasm::progress as wasmProgress;
+use crate::core::upload::StartResult;
+use crate::core::upload_orchestrator::UploadOutcome;
+use crate::wasm::api::WasmApiClient;
 
 struct FileQueueEntry {
     file_key: String,
@@ -23,6 +26,29 @@ thread_local! {
     pub(crate) static PAUSE_REQUESTED: RefCell<bool> = RefCell::new(false);
 }
 
+pub(super) async fn start_and_enqueue(
+    file: web_sys::File,
+    transfer_id: String,
+    user_params: HashMap<String, String>,
+) -> Result<String, String> {
+    let file_hash = hash::sha256_web_file(&file, &transfer_id).await?;
+    let result = crate::core::upload::start_and_register(
+        file_hash,
+        &transfer_id,
+        String::new(),
+        file.name(),
+        file.size() as u64,
+        user_params,
+        &WasmApiClient,
+    )
+    .await?;
+    let file_key = result.file_key().to_string();
+    if result.should_upload() {
+        enqueue_file(file_key.clone(), file);
+    }
+    Ok(file_key)
+}
+
 pub(crate) fn enqueue_file(file_key: String, file: web_sys::File) {
     FILE_QUEUE.with(|q| q.borrow_mut().push_back(FileQueueEntry { file_key, file }));
     maybe_start_next();
@@ -32,11 +58,9 @@ pub(crate) fn is_pause_requested() -> bool {
     PAUSE_REQUESTED.with(|p| *p.borrow())
 }
 
-#[derive(Debug)]
-pub(crate) enum UploadOutcome {
-    Completed,
-    Paused,
-    Failed(String),
+pub(crate) fn resume_queue() {
+    PAUSE_REQUESTED.with(|p| *p.borrow_mut() = false);
+    maybe_start_next();
 }
 
 fn maybe_start_next() {
@@ -50,46 +74,14 @@ fn maybe_start_next() {
     if let Some(entry) = next {
         QUEUE_RUNNING.with(|r| *r.borrow_mut() = true);
         spawn_local(async move {
-            session::session().mark_file_state(&entry.file_key, UploadState::Running);
-            let outcome = upload::run_upload(&entry.file_key, entry.file).await;
-            match outcome {
-                UploadOutcome::Completed => {
-                    session::session().mark_file_state(&entry.file_key, UploadState::Completed);
-                    runtime::set_status(
-                        wasmProgress::progress_manager(),
-                        &entry.file_key,
-                        UploadState::Completed,
-                    );
-                    let all_done =
-                        session::session().global_state == GlobalUploaderState::Completed;
-                    if all_done {
-                        session::clear_session();
-                        wasmProgress::progress_manager().clear();
-                    } else {
-                        session::persist_session();
-                    }
-                }
-                UploadOutcome::Paused => {
-                    session::session().mark_file_state(&entry.file_key, UploadState::Paused);
-                    session::persist_session();
-                    PAUSE_REQUESTED.with(|p| *p.borrow_mut() = false);
-                }
-                UploadOutcome::Failed(e) => {
-                    web_sys::console::error_1(
-                        &format!("Upload failed for {}: {}", entry.file_key, e).into(),
-                    );
-                    session::session().mark_file_state(&entry.file_key, UploadState::Failed);
-                    session::persist_session();
-                    runtime::set_status(
-                        wasmProgress::progress_manager(),
-                        &entry.file_key,
-                        UploadState::Failed,
-                    );
-                }
+            let outcome = upload::run_upload(&entry.file_key, entry.file.clone()).await;
+            if matches!(outcome, UploadOutcome::Paused) {
+                FILE_QUEUE.with(|q| q.borrow_mut().push_front(entry));
             }
-
             QUEUE_RUNNING.with(|r| *r.borrow_mut() = false);
-            maybe_start_next();
+            if !is_pause_requested() {
+                maybe_start_next();
+            }
         });
     }
 }

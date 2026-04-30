@@ -34,8 +34,8 @@ where
         match op(attempt) {
             Ok(value) => return Ok(value),
             Err(err) => {
-                // Don't retry pause interrupts — propagate immediately.
-                if err.contains("paused") || err.contains("Interrupted") {
+                // Don't retry pause/stale interrupts — propagate immediately.
+                if err.contains("paused") || err.contains("Interrupted") || err.contains("stale run") {
                     return Err(err);
                 }
                 last_error = Some(err);

@@ -69,16 +69,18 @@ const NOTIFY_EVERY_BYTES: u64 = 256 * 1024; // 256 KB
 pub struct ProgressReader {
     inner: Cursor<Vec<u8>>,
     file_key: String,
+    run_version: u64,
     part_number: u32,
     bytes_read: u64,
     last_notified: u64,
 }
 
 impl ProgressReader {
-    pub fn new(data: Vec<u8>, file_key: String, part_number: u32) -> Self {
+    pub fn new(data: Vec<u8>, file_key: String, run_version: u64, part_number: u32) -> Self {
         Self {
             inner: Cursor::new(data),
             file_key,
+            run_version,
             part_number,
             bytes_read: 0,
             last_notified: 0,
@@ -89,10 +91,10 @@ impl ProgressReader {
 impl Read for ProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if crate::ios::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "paused",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "paused"));
+        }
+        if !crate::core::session::is_current_run(&self.file_key, self.run_version) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stale run"));
         }
         let n = self.inner.read(buf)?;
         if n > 0 {
