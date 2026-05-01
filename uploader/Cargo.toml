@@ -75,3 +75,9 @@ features = [
     "XmlHttpRequestUpload",
     "ProgressEvent"
 ]
+
+[patch.crates-io]
+# Adds task.cancel() on stream-body error so the NSURLSession task is torn down
+# immediately on pause instead of waiting for the async ErrorOccurred run-loop event.
+# See vendor/nyquest-backend-nsurlsession/PATCHES.md for details.
+nyquest-backend-nsurlsession = { path = "vendor/nyquest-backend-nsurlsession" }

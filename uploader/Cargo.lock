@@ -732,8 +732,6 @@ dependencies = [
 [[package]]
 name = "nyquest-backend-nsurlsession"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6c578b7cf5efeb08c5d3d78094ef2cf1798f3c74a23c8bfb69213e0652eaa48"
 dependencies = [
  "arc-swap",
  "block2",

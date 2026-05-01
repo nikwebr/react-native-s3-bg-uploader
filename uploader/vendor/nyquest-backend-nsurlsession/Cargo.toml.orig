@@ -1,0 +1,66 @@
+[package]
+name = "nyquest-backend-nsurlsession"
+description = "NSURLSession backend for nyquest"
+version = "0.3.1"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+exclude.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-apple-darwin", "x86_64-apple-darwin", "aarch64-apple-ios"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+async = ["nyquest-interface/async", "dep:futures-util"]
+blocking = ["nyquest-interface/blocking"]
+multipart = ["nyquest-interface/multipart"]
+
+[dependencies]
+nyquest-interface = { version = "0.3.0", path = "../../nyquest-interface", default-features = false }
+cfg-if.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+block2 = { version = "0.6", default-features = false }
+objc2 = { version = "0.6", default-features = false }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "alloc",
+    "block2",
+    "NSError",
+    "NSObject",
+    "NSCharacterSet",
+    "NSArray",
+    "NSString",
+    "NSData",
+    "NSDate",
+    "NSURL",
+    "NSURLError",
+    "NSURLAuthenticationChallenge",
+    "NSURLCredential",
+    "NSURLProtectionSpace",
+    "NSDictionary",
+    "NSURLRequest",
+    "NSURLResponse",
+    "NSURLSession",
+    "NSStream",
+    "NSObjCRuntime",
+    "NSRunLoop",
+    "NSOperation",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "CFString",
+] }
+objc2-security = { version = "0.3", default-features = false, features = [
+    "objc2",
+    "SecTrust",
+] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "io",
+] }
+arc-swap.workspace = true
