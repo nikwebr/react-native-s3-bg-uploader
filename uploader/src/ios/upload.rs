@@ -142,18 +142,7 @@ impl UploadBackend for IosUploadBackend {
         upload_id: &str,
         results: Vec<crate::core::ChunkUploadResult>,
     ) -> Result<(), String> {
-        if !session::is_current_run(&self.file_key, self.run_version) {
-            return Err("stale run".to_string());
-        }
-        let client = nyquest::ClientBuilder::default()
-            .request_timeout(std::time::Duration::from_secs(60))
-            .build_blocking()
-            .map_err(|e| format!("Failed to create client for complete_upload: {:?}", e))?;
-        NativeApiClient {
-            network: IosNetwork { client },
-        }
-        .complete_upload(&self.file_key, upload_id, results)
-        .await
+        self.api.complete_upload(&self.file_key, upload_id, results).await
     }
 }
 
