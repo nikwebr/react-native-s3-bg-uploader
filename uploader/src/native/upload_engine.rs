@@ -57,7 +57,6 @@ pub fn run_blocking_upload(
     file_size: u64,
     parts_to_upload: Vec<u32>,
 ) -> Result<Vec<ChunkUploadResult>, String> {
-    let started_at = std::time::Instant::now();
     let completed_parts = Arc::new(Mutex::new(Vec::<ChunkUploadResult>::new()));
     let url_pool: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let parts_arc = Arc::new(parts_to_upload);
@@ -223,33 +222,12 @@ pub fn run_blocking_upload(
             || (abort.load(std::sync::atomic::Ordering::Relaxed)
                 && !error_abort.load(std::sync::atomic::Ordering::Relaxed));
     if should_return_early_for_pause {
-        eprintln!(
-            "[S3BgUploader] run_blocking_upload early-exit for {} after {}ms (paused={}, current_run={}, abort={}, error_abort={})",
-            file_key,
-            started_at.elapsed().as_millis(),
-            adapter.is_paused(),
-            adapter.is_current_run(),
-            abort.load(std::sync::atomic::Ordering::Relaxed),
-            error_abort.load(std::sync::atomic::Ordering::Relaxed),
-        );
         return Err("Upload paused".to_string());
     }
 
-    let join_started_at = std::time::Instant::now();
-    eprintln!(
-        "[S3BgUploader] run_blocking_upload joining workers for {} after {}ms",
-        file_key,
-        started_at.elapsed().as_millis()
-    );
     for handle in handles {
         handle.join().ok();
     }
-    eprintln!(
-        "[S3BgUploader] run_blocking_upload joined workers for {} in {}ms (total {}ms)",
-        file_key,
-        join_started_at.elapsed().as_millis(),
-        started_at.elapsed().as_millis()
-    );
 
     if adapter.is_paused()
         || !adapter.is_current_run()

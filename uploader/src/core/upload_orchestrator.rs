@@ -91,7 +91,6 @@ pub async fn run_upload<B: UploadBackend>(backend: &B) -> UploadOutcome {
 
 async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
     let file_key = backend.file_key().to_string();
-    let started_at = std::time::Instant::now();
 
     let total_bytes = match backend.total_bytes() {
         Ok(b) => b,
@@ -154,19 +153,8 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
     if !backend.is_current_run() {
         return UploadOutcome::Paused;
     }
-    eprintln!(
-        "[S3BgUploader] complete_upload starting for {} after {}ms with {} parts",
-        file_key,
-        started_at.elapsed().as_millis(),
-        all_results.len()
-    );
     match backend.complete_upload(&prepared.upload_id, all_results).await {
         Ok(_) => {
-            eprintln!(
-                "[S3BgUploader] complete_upload finished for {} after {}ms",
-                file_key,
-                started_at.elapsed().as_millis()
-            );
             UploadOutcome::Completed
         }
         Err(e) if e.contains("stale run") => UploadOutcome::Paused,
