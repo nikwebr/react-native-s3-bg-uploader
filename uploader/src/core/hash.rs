@@ -1,10 +1,10 @@
-use sha2::{Digest, Sha256};
+use xxhash_rust::xxh3::Xxh3;
 use std::io::Read;
 
 const BUF_SIZE: usize = 64 * 1024 * 1024;
 
 pub fn hash_reader<R: Read>(reader: &mut R, transfer_id: &str) -> Result<String, String> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Xxh3::new();
     hasher.update(transfer_id.as_bytes());
     let mut buf = vec![0u8; BUF_SIZE];
     loop {
@@ -16,5 +16,5 @@ pub fn hash_reader<R: Read>(reader: &mut R, transfer_id: &str) -> Result<String,
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(format!("{:016x}", hasher.digest()))
 }

@@ -29,7 +29,7 @@ pub(super) fn start_and_enqueue(
     user_params: HashMap<String, String>,
 ) -> Result<String, String> {
     init_logging();
-    let file_hash = hash::sha256_fd(raw_fd, transfer_id)?;
+    let file_hash = hash::hash_fd(raw_fd, transfer_id)?;
     let dup_for_size = unsafe { libc::dup(raw_fd) };
     let file_size = if dup_for_size != -1 {
         unsafe { File::from_raw_fd(dup_for_size).metadata().map(|m| m.len()).unwrap_or(0) }

@@ -36,7 +36,7 @@ pub(super) fn start_and_enqueue(
     user_params: HashMap<String, String>,
 ) -> Result<String, String> {
     init_nyquest();
-    let file_hash = hash::sha256_file(file_path, transfer_id)?;
+    let file_hash = hash::hash_file(file_path, transfer_id)?;
     let file_name = std::path::Path::new(file_path)
         .file_name()
         .and_then(|n| n.to_str())

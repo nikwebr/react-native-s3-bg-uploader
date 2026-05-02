@@ -3,7 +3,7 @@ use std::os::unix::io::{FromRawFd, RawFd};
 
 use crate::core::hash::hash_reader;
 
-pub(super) fn sha256_fd(raw_fd: RawFd, transfer_id: &str) -> Result<String, String> {
+pub(super) fn hash_fd(raw_fd: RawFd, transfer_id: &str) -> Result<String, String> {
     let new_fd = unsafe { libc::dup(raw_fd) };
     if new_fd == -1 {
         return Err("dup() failed for hashing fd".to_string());

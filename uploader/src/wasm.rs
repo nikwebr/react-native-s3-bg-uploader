@@ -31,7 +31,7 @@ pub(super) async fn start_and_enqueue(
     transfer_id: String,
     user_params: HashMap<String, String>,
 ) -> Result<String, String> {
-    let file_hash = hash::sha256_web_file(&file, &transfer_id).await?;
+    let file_hash = hash::hash_web_file(&file, &transfer_id).await?;
     let result = crate::core::upload::start_and_register(
         file_hash,
         &transfer_id,

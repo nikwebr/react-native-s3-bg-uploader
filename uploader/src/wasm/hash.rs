@@ -1,12 +1,12 @@
 use js_sys::{ArrayBuffer, Uint8Array};
-use sha2::{Digest, Sha256};
+use xxhash_rust::xxh3::Xxh3;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 const CHUNK_SIZE: f64 = 8.0 * 1024.0 * 1024.0; // 8 MB per slice
 
-pub async fn sha256_web_file(file: &web_sys::File, transfer_id: &str) -> Result<String, String> {
-    let mut hasher = Sha256::new();
+pub async fn hash_web_file(file: &web_sys::File, transfer_id: &str) -> Result<String, String> {
+    let mut hasher = Xxh3::new();
     hasher.update(transfer_id.as_bytes());
 
     let file_size = file.size();
@@ -32,6 +32,5 @@ pub async fn sha256_web_file(file: &web_sys::File, transfer_id: &str) -> Result<
         offset = end;
     }
 
-    let hash = hasher.finalize();
-    Ok(hash.iter().map(|b| format!("{:02x}", b)).collect())
+    Ok(format!("{:016x}", hasher.digest()))
 }
