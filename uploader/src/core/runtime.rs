@@ -103,3 +103,21 @@ pub fn complete_chunk<N: ProgressNotifier>(
     let (_, session_agg, transfer_agg) = aggregate_snapshot_for_file(file_key);
     manager.complete_chunk(file_key, part_number, chunk_size, session_agg, transfer_agg);
 }
+
+/// Register a newly queued (NotStarted) file in the ProgressManager so push-callback
+/// platforms receive an initial event and `get_live_progress` returns the file.
+pub fn notify_file_registered<N: ProgressNotifier>(manager: &ProgressManager<N>, file_key: &str) {
+    let (transfer_id, session_agg, transfer_agg) = aggregate_snapshot_for_file(file_key);
+    let total_bytes = session::session()
+        .files
+        .get(file_key)
+        .map(|e| e.total_bytes)
+        .unwrap_or(0);
+    manager.register_not_started(
+        file_key.to_string(),
+        transfer_id,
+        total_bytes,
+        session_agg,
+        transfer_agg,
+    );
+}

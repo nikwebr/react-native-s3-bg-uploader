@@ -72,9 +72,12 @@ pub extern "C" fn upload_file(
     };
 
     match super::start_and_enqueue(&path, &tid, user_params) {
-        Ok(file_key) => CString::new(file_key)
-            .map(|s| s.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
+        Ok(file_key) => {
+            runtime::notify_file_registered(iosProgress::progress_manager(), &file_key);
+            CString::new(file_key)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut())
+        }
         Err(e) => {
             eprintln!("upload_file failed: {}", e);
             std::ptr::null_mut()

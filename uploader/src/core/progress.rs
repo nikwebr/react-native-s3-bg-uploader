@@ -241,6 +241,46 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         self.progress.lock().unwrap().remove(file_key);
     }
 
+    /// Register a newly queued file in the progress map with NotStarted status and
+    /// fire a notification. Called right after the file is added to the session so
+    /// push-callback platforms (Android) know about queued files without polling.
+    /// If the worker thread already advanced the entry to Running, we skip the insert
+    /// to avoid overwriting active progress tracking.
+    pub fn register_not_started(
+        &self,
+        file_key: String,
+        transfer_id: String,
+        total_bytes: u64,
+        session_agg: AggregateProgress,
+        transfer_agg: AggregateProgress,
+    ) {
+        let mut lock = self.progress.lock().unwrap();
+        if let Some(existing) = lock.get(&file_key) {
+            // Worker already started — notify with the live state, don't overwrite.
+            let fp = existing.to_file_progress();
+            drop(lock);
+            self.notifier.notify(&fp, &session_agg, &transfer_agg);
+            return;
+        }
+        let mut p = UploadProgress::new(file_key.clone(), transfer_id, total_bytes, 0);
+        p.status = UploadState::NotStarted;
+        let fp = p.to_file_progress();
+        lock.insert(file_key, p);
+        drop(lock);
+        self.notifier.notify(&fp, &session_agg, &transfer_agg);
+    }
+
+    /// Fire a one-shot notification without inserting into the progress map.
+    /// Used to deliver the initial state of a newly registered (NotStarted) file.
+    pub fn notify_external(
+        &self,
+        fp: &crate::core::session::FileProgress,
+        session_agg: &AggregateProgress,
+        transfer_agg: &AggregateProgress,
+    ) {
+        self.notifier.notify(fp, session_agg, transfer_agg);
+    }
+
     /// Return live FileProgress snapshots (including in-flight bytes) for all tracked files.
     /// Optionally filtered by transfer_id or file_key.
     pub fn get_live_progress(

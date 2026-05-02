@@ -396,9 +396,10 @@ impl Session {
             self.global_state = GlobalUploaderState::Running;
         } else if states.iter().any(|s| *s == UploadState::Failed) {
             self.global_state = GlobalUploaderState::Failed;
-        } else if states
-            .iter()
-            .all(|s| matches!(s, UploadState::Paused | UploadState::Completed))
+        } else if states.iter().any(|s| *s == UploadState::Paused)
+            && states
+                .iter()
+                .all(|s| matches!(s, UploadState::Paused | UploadState::Completed | UploadState::NotStarted))
         {
             self.global_state = GlobalUploaderState::Paused;
         } else {
@@ -446,7 +447,7 @@ impl Session {
 
     pub fn pause_all(&mut self) {
         for entry in self.files.values_mut() {
-            if matches!(entry.state, UploadState::Running | UploadState::NotStarted) {
+            if entry.state == UploadState::Running {
                 entry.state = UploadState::Paused;
             }
         }

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-use jni::objects::{JClass, JString};
+use jni::objects::{GlobalRef, JClass, JString, JValue};
 use jni::sys::{jint, jstring};
-use jni::JNIEnv;
+use jni::{JavaVM, JNIEnv};
 
 use crate::android::progress as androidProgress;
 use crate::android::{PAUSE_FLAG, QUEUE_SIGNAL};
@@ -12,8 +13,88 @@ use crate::native::NativeSessionStore;
 use crate::core::runtime;
 use crate::core::session::{self, register_store, format_template, GlobalUploaderState, UploadState};
 
+static JVM: std::sync::OnceLock<Arc<JavaVM>> = std::sync::OnceLock::new();
+// Cached from the JNI-thread that has the app class loader. Background threads
+// attached via attach_current_thread_as_daemon use the bootstrap class loader
+// and cannot find app classes by name.
+static CLASS_HYBRID: std::sync::OnceLock<GlobalRef> = std::sync::OnceLock::new();
+
 fn ensure_store() {
     register_store(NativeSessionStore);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeInitProgressCallback(
+    env: JNIEnv,
+    class: JClass,
+) {
+    let vm = match env.get_java_vm() {
+        Ok(v) => Arc::new(v),
+        Err(_) => return,
+    };
+    let _ = JVM.set(vm);
+    let vm = match JVM.get() {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    if CLASS_HYBRID.get().is_none() {
+        if let Ok(global) = env.new_global_ref(class) {
+            let _ = CLASS_HYBRID.set(global);
+        }
+    }
+    androidProgress::set_progress_callback(Some(Box::new(move |
+        file_key, transfer_id,
+        total_bytes, uploaded_bytes, completed_parts, total_parts, percentage, state,
+        transfer_pct, transfer_total_size, transfer_uploaded_size,
+        transfer_total_files, transfer_completed_files, transfer_state,
+        session_pct, session_total_size, session_uploaded_size,
+        session_total_transfers, session_completed_transfers,
+        session_total_files, session_completed_files, session_state,
+    | {
+        let json = serde_json::json!({
+            "file": {
+                "fileKey": file_key,
+                "transferId": transfer_id,
+                "totalBytes": total_bytes,
+                "uploadedBytes": uploaded_bytes,
+                "completedParts": completed_parts,
+                "totalParts": total_parts,
+                "percentage": percentage,
+                "state": state,
+            },
+            "sessionAgg": {
+                "percentage": session_pct,
+                "totalSize": session_total_size,
+                "uploadedSize": session_uploaded_size,
+                "totalTransfers": session_total_transfers,
+                "completedTransfers": session_completed_transfers,
+                "totalFiles": session_total_files,
+                "completedFiles": session_completed_files,
+                "state": session_state,
+            },
+            "transferAgg": {
+                "percentage": transfer_pct,
+                "totalSize": transfer_total_size,
+                "uploadedSize": transfer_uploaded_size,
+                "totalFiles": transfer_total_files,
+                "completedFiles": transfer_completed_files,
+                "state": transfer_state,
+            },
+        }).to_string();
+        let Ok(mut env) = vm.attach_current_thread_as_daemon() else { return };
+        let Ok(json_jstr) = env.new_string(&json) else { return };
+        let Some(class_ref) = CLASS_HYBRID.get() else { return };
+        // Safety: class_ref is a GlobalRef to HybridS3BgUploader.class, stored
+        // when called from the JNI thread that has the correct app class loader.
+        let class_jclass: JClass<'_> = unsafe { JClass::from_raw(class_ref.as_raw()) };
+        let _ = env.call_static_method(
+            class_jclass,
+            "onNativeProgress",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&*json_jstr)],
+        );
+        let _ = env.exception_clear();
+    })));
 }
 
 #[no_mangle]
@@ -94,10 +175,12 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeUploadFile
         serde_json::from_str(&params_str).unwrap_or_default();
 
     match super::start_and_enqueue(fd as RawFd, &tid, user_params) {
-        Ok(file_key) => env
-            .new_string(&file_key)
-            .map(|s| s.into_raw())
-            .unwrap_or(empty_jstring(&mut env)),
+        Ok(file_key) => {
+            runtime::notify_file_registered(androidProgress::progress_manager(), &file_key);
+            env.new_string(&file_key)
+                .map(|s| s.into_raw())
+                .unwrap_or(empty_jstring(&mut env))
+        }
         Err(e) => {
             log::error!("nativeUploadFile failed: {}", e);
             empty_jstring(&mut env)

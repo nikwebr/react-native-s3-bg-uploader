@@ -32,7 +32,8 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
     override fun setProgressCallback(
         callback: Variant_NullType__fileProgress__UploadProgress__sessionAggregate__AggregateProgress__transferAggregate__AggregateProgress_____Unit?,
     ): Unit {
-        UploadForegroundService.progressCallback = callback?.asSecondOrNull()
+        progressCallback = callback?.asSecondOrNull()
+        nativeInitProgressCallback()
     }
 
     // -------------------------------------------------------------------------
@@ -146,6 +147,38 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             System.loadLibrary("uploader")
         }
 
+        @Volatile var progressCallback: ((UploadProgress, AggregateProgress, AggregateProgress) -> Unit)? = null
+
+        private val mainHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
+
+        /** Called from Rust on a background thread for every progress event. */
+        @JvmStatic
+        fun onNativeProgress(json: String) {
+            val cb = progressCallback ?: return
+            try {
+                val o = org.json.JSONObject(json)
+                val fp = parseUploadProgressFromObject(o.getJSONObject("file"))
+                val sessionAgg = parseAggregateProgress(o.getJSONObject("sessionAgg").toString())
+                val transferAgg = parseAggregateProgress(o.getJSONObject("transferAgg").toString())
+                mainHandler.post { cb(fp, sessionAgg, transferAgg) }
+            } catch (e: Exception) {
+                android.util.Log.e("S3Uploader", "onNativeProgress parse error: $e")
+            }
+        }
+
+        private fun parseUploadProgressFromObject(o: org.json.JSONObject): UploadProgress {
+            return UploadProgress(
+                fileKey        = o.getString("fileKey"),
+                transferId     = o.getString("transferId"),
+                totalBytes     = o.getLong("totalBytes").toDouble(),
+                uploadedBytes  = o.getLong("uploadedBytes").toDouble(),
+                completedParts = o.getInt("completedParts").toDouble(),
+                totalParts     = o.getInt("totalParts").toDouble(),
+                percentage     = o.getDouble("percentage"),
+                state          = parseUploadState(o.getString("state")),
+            )
+        }
+
         @JvmStatic external fun nativeSetConfig(
             startUploadApi: String,
             getUploadUrlsApi: String,
@@ -191,6 +224,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
 
         @JvmStatic external fun nativeGetFormattedTitle(): String
         @JvmStatic external fun nativeGetFormattedSubtitle(): String
+        @JvmStatic external fun nativeInitProgressCallback()
     }
 }
 

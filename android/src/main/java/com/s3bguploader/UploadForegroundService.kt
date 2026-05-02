@@ -11,13 +11,13 @@ import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
-import com.margelo.nitro.s3bguploader.AggregateProgress
 import com.margelo.nitro.s3bguploader.GlobalUploaderState
-import com.margelo.nitro.s3bguploader.UploadProgress
 
 class UploadForegroundService : Service() {
 
-    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val pollerLock = Any()
+    @Volatile private var pollerThread: Thread? = null
+    @Volatile private var latestStartId: Int = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -27,46 +27,43 @@ class UploadForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val transferId = intent?.getStringExtra(EXTRA_TRANSFER_ID) ?: run {
+        if (intent?.getStringExtra(EXTRA_TRANSFER_ID) == null) {
             stopSelf(startId)
             return START_NOT_STICKY
         }
 
         startForeground(NOTIFICATION_ID, buildNotification("S3 Upload", "Starting upload…", 0, indeterminate = true))
+        latestStartId = startId
 
-        // Poll aggregate progress to keep notification up-to-date.
-        // The notification template strings were already set via setTaskTitle/Subtitle
-        // and are applied inside Rust — we simply refresh periodically.
-        val pollerThread = Thread {
-            while (!Thread.interrupted()) {
-                try {
-                    Thread.sleep(POLL_INTERVAL_MS)
-                    val transferAggJson = HybridS3BgUploader.nativeGetLiveAggregateProgressJson(transferId)
-                    val agg = parseAggregateProgressForNotification(transferAggJson)
-                    val isTerminal = agg.state == GlobalUploaderState.COMPLETED
-                            || agg.state == GlobalUploaderState.FAILED
-                    updateNotification(agg.percentage.toInt(), isTerminal)
-
-                    // Deliver per-file progress to the JS callback if registered
-                    val cb = progressCallback
-                    if (cb != null) {
-                        val sessionAggJson = HybridS3BgUploader.nativeGetLiveAggregateProgressJson(null)
-                        val filesJson = HybridS3BgUploader.nativeGetLiveProgressJson(transferId, null)
-                        val sessionAgg = parseAggregateProgress(sessionAggJson)
-                        val transferAgg = parseAggregateProgress(transferAggJson)
-                        val files = parseUploadProgressArray(filesJson)
-                        files.forEach { fp -> mainHandler.post { cb(fp, sessionAgg, transferAgg) } }
-                    }
-
-                    if (isTerminal) break
-                } catch (_: InterruptedException) {
-                    break
-                }
+        synchronized(pollerLock) {
+            val existing = pollerThread
+            if (existing != null && existing.isAlive) {
+                // A poller is already running and tracks session-level progress — no second thread needed.
+                return START_NOT_STICKY
             }
-            stopSelf(startId)
+
+            val thread = Thread {
+                while (!Thread.interrupted()) {
+                    try {
+                        Thread.sleep(POLL_INTERVAL_MS)
+                        // Poll session-level aggregate so all concurrent transfers are covered.
+                        val aggJson = HybridS3BgUploader.nativeGetLiveAggregateProgressJson(null)
+                        val agg = parseAggregateProgressForNotification(aggJson)
+                        val isTerminal = agg.state == GlobalUploaderState.COMPLETED
+                                || agg.state == GlobalUploaderState.FAILED
+                        updateNotification(agg.percentage.toInt(), isTerminal)
+                        if (isTerminal) break
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+                // Use latestStartId so the service only stops when no newer start has come in.
+                stopSelf(latestStartId)
+            }
+            thread.isDaemon = true
+            thread.start()
+            pollerThread = thread
         }
-        pollerThread.isDaemon = true
-        pollerThread.start()
 
         return START_NOT_STICKY
     }
@@ -120,9 +117,6 @@ class UploadForegroundService : Service() {
         const val NOTIFICATION_ID = 1001
         const val EXTRA_TRANSFER_ID = "transfer_id"
         private const val POLL_INTERVAL_MS = 500L
-
-        /** Set by HybridS3BgUploader before starting the service. */
-        @Volatile var progressCallback: ((UploadProgress, AggregateProgress, AggregateProgress) -> Unit)? = null
 
         fun openAsPfdStatic(context: Context, uri: String): ParcelFileDescriptor? {
             return try {
