@@ -1,279 +1,209 @@
-pub mod progress;
 pub mod api;
+mod bindings;
+pub mod hash;
+pub mod progress;
+pub mod store;
+mod upload;
+pub mod upload_engine;
 
-use wasm_bindgen::prelude::*;
-use wasm_bindgen_file_reader::WebSysFile;
-use wasm_bindgen_futures::JsFuture;
-use futures::stream::{FuturesUnordered, StreamExt};
-use js_sys::{Promise, Uint8Array, Function};
-use std::sync::{Arc, Mutex};
-use crate::core::{
-    ChunkUploadResult,
-    MAX_CONCURRENT_UPLOADS, MAX_RETRIES,
-    clean_etag
-};
-use crate::core::chunk::{self, ChunkInfo};
-use crate::core::retry::{self, RetryPolicy};
-use crate::core::progress::UploadStatus;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 
-#[wasm_bindgen]
-pub fn add(one: f64, two: f64) -> f64 {
-    one + two
+use wasm_bindgen_futures::spawn_local;
+
+use crate::core::runtime;
+use crate::core::session::{self, UploadState};
+use crate::core::upload_orchestrator::UploadOutcome;
+use crate::wasm::api::WasmApiClient;
+use crate::wasm::progress as wasmProgress;
+
+struct FileQueueEntry {
+    file_key: String,
+    file: web_sys::File,
 }
 
-#[wasm_bindgen]
-pub async fn upload_file(file: web_sys::File) -> Result<JsValue, JsValue> {
-    upload_file_internal(file)
-        .await
-        .map(|_| JsValue::from_str("Upload successful"))
-        .map_err(|e| JsValue::from_str(&format!("Upload failed: {}", e)))
+thread_local! {
+    pub(crate) static FILE_QUEUE: RefCell<VecDeque<FileQueueEntry>> = RefCell::new(VecDeque::new());
+    pub(crate) static QUEUE_RUNNING: RefCell<bool> = RefCell::new(false);
+    pub(crate) static PAUSE_REQUESTED: RefCell<bool> = RefCell::new(false);
+    /// Stores the web_sys::File for each pending (hashed but not yet initialized) upload.
+    /// Keyed by file_hash. Cleared when start_api succeeds or on cancel_all.
+    pub(crate) static PENDING_WASM_FILES: RefCell<HashMap<String, web_sys::File>> = RefCell::new(HashMap::new());
 }
 
-async fn upload_file_internal(file: web_sys::File) -> Result<(), String> {
-    let file_size = file.size() as u64;
+/// Phase 1 only: hash file, pre-register in session, fire NOT_STARTED callback.
+/// Returns the file hash immediately. Phase 2 (start_api → INITIALIZED → enqueue)
+/// is deferred to `process_pending_files()`, called from `resume()` in JS.
+/// This mirrors the native split so that `uploadFile` always resolves before any
+/// INITIALIZED callback fires, preventing a race where the progress matcher can't
+/// find the queue item by fileHash yet.
+///
+/// If the hash already maps to a resumable session entry (e.g. after a page reload),
+/// we skip pre-registration and the NOT_STARTED callback entirely — the existing entry
+/// stays in the UI and will be resumed via `process_pending_files`.
+pub(super) async fn start_and_enqueue(
+    file: web_sys::File,
+    transfer_id: String,
+    user_params: HashMap<String, String>,
+) -> Result<String, String> {
+    let file_hash = hash::hash_web_file(&file, &transfer_id)?;
 
-    // Upload URLs abrufen
-    let upload_info = api::fetch_upload_urls(file_size).await?;
-
-    // Progress initialisieren
-    progress::progress_manager().init(file_size, upload_info.chunk_count());
-
-    // Chunk-Infos generieren
-    let chunk_infos = chunk::generate_chunk_infos(file_size, &upload_info)?;
-
-    // Shared state
-    let file_arc = Arc::new(file);
-    let chunk_infos_arc = Arc::new(chunk_infos);
-
-    // Chunks parallel hochladen mit Sliding Window
-    let completed_parts = upload_chunks_parallel_async(file_arc, chunk_infos_arc)
-        .await
-        .map_err(|e| {
-            progress::progress_manager().set_status(UploadStatus::Failed);
-            e
-        })?;
-
-    // Upload abschließen
-    api::complete_upload_async(&upload_info, completed_parts)
-        .await
-        .map_err(|e| {
-            progress::progress_manager().set_status(UploadStatus::Failed);
-            e
-        })?;
-
-    progress::progress_manager().set_status(UploadStatus::Finished);
-    Ok(())
-}
-
-async fn upload_chunks_parallel_async(
-    file: Arc<web_sys::File>,
-    chunk_infos: Arc<Vec<ChunkInfo>>,
-) -> Result<Vec<ChunkUploadResult>, String> {
-    let completed_parts = Arc::new(Mutex::new(Vec::new()));
-
-    // Sliding Window: Starte bis zu MAX_CONCURRENT_UPLOADS gleichzeitig,
-    // und starte einen neuen sobald einer fertig ist
-    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-    let mut next_chunk_idx: usize = 0;
-
-    // Initiale Befüllung der Queue
-    while next_chunk_idx < chunk_infos.len() && in_flight.len() < MAX_CONCURRENT_UPLOADS {
-        let future = upload_chunk_task(
-            file.clone(),
-            chunk_infos.clone(),
-            next_chunk_idx,
-            completed_parts.clone(),
-        );
-
-        in_flight.push(future);
-        next_chunk_idx += 1;
+    // If this hash already exists in session (resumable or completed) don't create a
+    // duplicate UI entry — just re-associate the File object.
+    let existing_state = session::session()
+        .find_by_hash(&file_hash)
+        .map(|e| (e.state.clone(), e.is_resumable()));
+    match existing_state {
+        Some((UploadState::Completed, _)) => {
+            return Ok(file_hash);
+        }
+        Some((_, true)) => {
+            session::session().files_needing_provision.remove(&file_hash);
+            PENDING_WASM_FILES.with(|m| m.borrow_mut().insert(file_hash.clone(), file));
+            return Ok(file_hash);
+        }
+        Some(_) => {
+            return Err(format!("DUPLICATE_FILE: file with hash {} is already active in this session", file_hash));
+        }
+        None => {}
     }
 
-    // Verarbeite fertige Uploads und starte neue
-    while let Some(result) = in_flight.next().await {
-        // Fehler prüfen
-        if let Err(e) = result {
-            return Err(format!("Chunk upload failed: {}", e));
-        }
-
-        // Neuen Chunk starten, falls noch welche übrig sind
-        if next_chunk_idx < chunk_infos.len() {
-            let future = upload_chunk_task(
-                file.clone(),
-                chunk_infos.clone(),
-                next_chunk_idx,
-                completed_parts.clone(),
-            );
-
-            in_flight.push(future);
-            next_chunk_idx += 1;
-        }
+    if session::session().pending_files.contains_key(&file_hash) {
+        return Err(format!("DUPLICATE_FILE: file with hash {} is already pending in this session", file_hash));
     }
 
-    let parts = completed_parts.lock().unwrap().clone();
-    Ok(parts)
+    session::session().pre_register_file(
+        file_hash.clone(),
+        transfer_id.clone(),
+        String::new(),
+        file.name(),
+        file.size() as u64,
+        user_params,
+    );
+
+    PENDING_WASM_FILES.with(|m| m.borrow_mut().insert(file_hash.clone(), file));
+    Ok(file_hash)
 }
 
-async fn upload_chunk_task(
-    file: Arc<web_sys::File>,
-    chunk_infos: Arc<Vec<ChunkInfo>>,
-    chunk_idx: usize,
-    completed_parts: Arc<Mutex<Vec<ChunkUploadResult>>>,
-) -> Result<(), String> {
-    let chunk_info = &chunk_infos[chunk_idx];
+/// Phase 2: for every entry in `session.pending_files` that has a stored File object,
+/// call start_api, fire INITIALIZED callback, and enqueue for upload.
+/// Also handles re-provided resumable files (already in session.files, stored in
+/// PENDING_WASM_FILES by start_and_enqueue without going through pending_files).
+/// Called from `wasm_resume_all` (JS `resume()`) so JS always stores fileHash first.
+pub(crate) fn process_pending_files() {
+    let pending: Vec<(String, String, String, u64, HashMap<String, String>)> = {
+        let sess = session::session();
+        sess.pending_files
+            .values()
+            .map(|p| (
+                p.file_hash.clone(),
+                p.transfer_id.clone(),
+                p.file_name.clone(),
+                p.file_size,
+                p.user_params.clone(),
+            ))
+            .collect()
+    };
 
-    // Chunk aus Datei lesen
-    let chunk = read_chunk_from_web_file(&file, chunk_info)?;
-
-    // Upload mit Retry und Progress-Tracking
-    let etag = upload_chunk_with_retry_and_progress(&chunk_info.url, &chunk, chunk_info.part_number).await?;
-
-    // Completed part speichern
-    {
-        let mut parts = completed_parts.lock().unwrap();
-        parts.push(ChunkUploadResult {
-            part_number: chunk_info.part_number,
-            etag
+    for (file_hash, transfer_id, file_name, file_size, user_params) in pending {
+        let file_opt = PENDING_WASM_FILES.with(|m| m.borrow().get(&file_hash).cloned());
+        let Some(file) = file_opt else { continue };
+        spawn_local(async move {
+            let result = crate::core::upload::start_and_register(
+                file_hash.clone(),
+                &transfer_id,
+                String::new(),
+                file_name,
+                file_size,
+                user_params,
+                &WasmApiClient,
+            )
+            .await;
+            match result {
+                Ok(result) => {
+                    let file_key = result.file_key().to_string();
+                    // Check if cancel_all fired while we awaited the start_api network call.
+                    // cancel_all clears pending_files; if our hash is gone, the session was reset.
+                    let still_active = session::session().pending_files.contains_key(&file_hash);
+                    session::session().pending_files.remove(&file_hash);
+                    PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
+                    if !still_active {
+                        // Undo the session.files insertion made by start_and_register.
+                        session::session().cancel_file(&file_key);
+                        return;
+                    }
+                    runtime::notify_file_registered(wasmProgress::progress_manager(), &file_key);
+                    if result.should_upload() {
+                        enqueue_file(file_key, file);
+                    }
+                }
+                Err(e) => {
+                    web_sys::console::error_1(
+                        &format!("start_and_register failed for {}: {}", file_hash, e).into(),
+                    );
+                }
+            }
         });
     }
 
-    // Chunk als abgeschlossen markieren
-    progress::progress_manager().complete_chunk(chunk_info.part_number, chunk_info.chunk_size);
-
-    Ok(())
-}
-
-async fn upload_chunk_with_retry_and_progress(
-    url: &str,
-    data: &[u8],
-    part_number: u32,
-) -> Result<String, String> {
-    let policy = RetryPolicy::new(MAX_RETRIES);
-
-    retry::run_with_retry_string_async(
-        &policy,
-        |_attempt| async {
-            progress::progress_manager().update_in_flight(part_number, 0);
-            upload_chunk_with_progress(url, data, part_number).await
-        },
-        |attempt, err, delay_ms| {
-            let err = err.to_string();
-            async move {
-                log_retry_attempt(attempt, part_number, &err, delay_ms);
-                sleep(delay_ms).await;
-            }
-        },
-    )
-        .await
-}
-
-// uses XMLHttpRequest for progress tracking of inflight parts
-async fn upload_chunk_with_progress(
-    url: &str,
-    data: &[u8],
-    part_number: u32,
-) -> Result<String, String> {
-    use wasm_bindgen::closure::Closure;
-    use web_sys::XmlHttpRequest;
-
-    let xhr = XmlHttpRequest::new()
-        .map_err(|e| format!("Failed to create XMLHttpRequest: {:?}", e))?;
-
-    xhr.open("PUT", url)
-        .map_err(|e| format!("Failed to open request: {:?}", e))?;
-
-    // Promise für async/await
-    let promise = Promise::new(&mut |resolve, reject| {
-        let resolve_clone = resolve.clone();
-        let reject_clone = reject.clone();
-        let xhr_clone = xhr.clone();
-
-        // Progress Event Handler
-        let pn = part_number;
-        let onprogress = Closure::wrap(Box::new(move |event: web_sys::ProgressEvent| {
-            if event.length_computable() {
-                let loaded = event.loaded() as u64;
-                progress::progress_manager().update_in_flight(pn, loaded);
-            }
-        }) as Box<dyn FnMut(_)>);
-
-        // Load Event Handler (Erfolg)
-        let onload = Closure::wrap(Box::new(move || {
-            let status = xhr_clone.status().unwrap_or(0);
-            if status >= 200 && status < 300 {
-                let etag = xhr_clone
-                    .get_response_header("etag")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                resolve_clone.call1(&JsValue::NULL, &JsValue::from_str(&etag)).ok();
-            } else {
-                reject_clone.call1(&JsValue::NULL, &JsValue::from_str(&format!("HTTP error: {}", status))).ok();
-            }
-        }) as Box<dyn FnMut()>);
-
-        // Error Event Handler
-        let onerror = Closure::wrap(Box::new(move || {
-            reject.call1(&JsValue::NULL, &JsValue::from_str("Network error")).ok();
-        }) as Box<dyn FnMut()>);
-
-        // Event Listener setzen
-        if let Ok(upload) = xhr.upload() {
-            upload.set_onprogress(Some(onprogress.as_ref().unchecked_ref()));
-        }
-        xhr.set_onload(Some(onload.as_ref().unchecked_ref()));
-        xhr.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-
-        // Closures am Leben halten
-        onprogress.forget();
-        onload.forget();
-        onerror.forget();
+    // Handle re-provided resumable files: stored in PENDING_WASM_FILES by start_and_enqueue
+    // but skipped pre_register_file (so they're NOT in pending_files).
+    let pending_file_hashes: std::collections::HashSet<String> = session::session()
+        .pending_files
+        .keys()
+        .cloned()
+        .collect();
+    let resumable: Vec<(String, web_sys::File)> = PENDING_WASM_FILES.with(|m| {
+        m.borrow()
+            .iter()
+            .filter(|(hash, _)| !pending_file_hashes.contains(*hash))
+            .map(|(hash, file)| (hash.clone(), file.clone()))
+            .collect()
     });
-
-    // Daten senden
-    let uint8_array = Uint8Array::new_with_length(data.len() as u32);
-    uint8_array.copy_from(data);
-
-    xhr.send_with_opt_buffer_source(Some(&uint8_array))
-        .map_err(|e| format!("Failed to send request: {:?}", e))?;
-
-    // Auf Completion warten
-    let result = JsFuture::from(promise)
-        .await
-        .map_err(|e| format!("Upload failed: {:?}", e))?;
-
-    let etag = result.as_string().unwrap_or_default();
-    Ok(clean_etag(&etag))
+    for (file_hash, file) in resumable {
+        let file_key = match session::session().find_by_hash(&file_hash) {
+            Some(e) if e.is_resumable() => e.file_key.clone(),
+            _ => continue,
+        };
+        PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
+        runtime::notify_file_registered(wasmProgress::progress_manager(), &file_key);
+        enqueue_file(file_key, file);
+    }
 }
 
-fn read_chunk_from_web_file(
-    file: &web_sys::File,
-    chunk_info: &ChunkInfo
-) -> Result<Vec<u8>, String> {
-    let mut wf = WebSysFile::new(file.clone());
-    chunk_info.read(&mut wf)
-        .map_err(|e| format!("Read failed: {}", e))
+pub(crate) fn enqueue_file(file_key: String, file: web_sys::File) {
+    FILE_QUEUE.with(|q| q.borrow_mut().push_back(FileQueueEntry { file_key, file }));
+    maybe_start_next();
 }
 
-fn log_retry_attempt(attempt: usize, part_number: u32, err: &str, delay_ms: u32) {
-    web_sys::console::log_1(&format!(
-        "Upload attempt {} failed for part {}: {}, retrying in {}ms",
-        attempt, part_number, err, delay_ms
-    ).into());
+pub(crate) fn is_pause_requested() -> bool {
+    PAUSE_REQUESTED.with(|p| *p.borrow())
 }
 
-async fn sleep(ms: u32) {
-    let promise = Promise::new(&mut |resolve, _| {
-        // Versuche zuerst WorkerGlobalScope (für Web Worker)
-        if let Ok(worker) = js_sys::global().dyn_into::<web_sys::WorkerGlobalScope>() {
-            worker
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms as i32)
-                .ok();
-        } else if let Some(window) = web_sys::window() {
-            window
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms as i32)
-                .ok();
-        }
-    });
-    JsFuture::from(promise).await.ok();
+pub(crate) fn resume_queue() {
+    PAUSE_REQUESTED.with(|p| *p.borrow_mut() = false);
+    maybe_start_next();
+}
+
+fn maybe_start_next() {
+    if is_pause_requested() {
+        return;
+    }
+    if QUEUE_RUNNING.with(|r| *r.borrow()) {
+        return;
+    }
+    let next = FILE_QUEUE.with(|q| q.borrow_mut().pop_front());
+    if let Some(entry) = next {
+        QUEUE_RUNNING.with(|r| *r.borrow_mut() = true);
+        spawn_local(async move {
+            let outcome = upload::run_upload(&entry.file_key, entry.file.clone()).await;
+            if matches!(outcome, UploadOutcome::Paused) {
+                FILE_QUEUE.with(|q| q.borrow_mut().push_front(entry));
+            }
+            QUEUE_RUNNING.with(|r| *r.borrow_mut() = false);
+            if !is_pause_requested() {
+                maybe_start_next();
+            }
+        });
+    }
 }

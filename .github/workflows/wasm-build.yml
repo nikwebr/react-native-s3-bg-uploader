@@ -44,7 +44,7 @@ jobs:
             ${{ runner.os }}-cargo-wasm-
 
       - name: Install wasm-bindgen-cli
-        run: cargo install wasm-bindgen-cli --version 0.2.110 --locked
+        run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
 
       - name: Build WASM library
         run: ./scripts/build.sh wasm
