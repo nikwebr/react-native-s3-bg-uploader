@@ -27,6 +27,12 @@ class UploadForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            pollerThread?.interrupt()
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         if (intent?.getStringExtra(EXTRA_TRANSFER_ID) == null) {
             stopSelf(startId)
             return START_NOT_STICKY
@@ -43,14 +49,20 @@ class UploadForegroundService : Service() {
             }
 
             val thread = Thread {
+                var seenRunning = false
                 while (!Thread.interrupted()) {
                     try {
                         Thread.sleep(POLL_INTERVAL_MS)
                         // Poll session-level aggregate so all concurrent transfers are covered.
                         val aggJson = HybridS3BgUploader.nativeGetLiveAggregateProgressJson(null)
                         val agg = parseAggregateProgressForNotification(aggJson)
+                        if (!seenRunning && (agg.state == GlobalUploaderState.RUNNING || agg.state == GlobalUploaderState.RUNNING_IN_BG)) {
+                            seenRunning = true
+                        }
                         val isTerminal = agg.state == GlobalUploaderState.COMPLETED
                                 || agg.state == GlobalUploaderState.FAILED
+                                || agg.state == GlobalUploaderState.PAUSED
+                                || (seenRunning && agg.state == GlobalUploaderState.NOT_STARTED)
                         updateNotification(agg.percentage.toInt(), isTerminal)
                         if (isTerminal) break
                     } catch (_: InterruptedException) {
@@ -116,6 +128,7 @@ class UploadForegroundService : Service() {
         const val CHANNEL_ID = "s3_upload_channel"
         const val NOTIFICATION_ID = 1001
         const val EXTRA_TRANSFER_ID = "transfer_id"
+        const val ACTION_STOP = "com.s3bguploader.ACTION_STOP"
         private const val POLL_INTERVAL_MS = 500L
 
         fun openAsPfdStatic(context: Context, uri: String): ParcelFileDescriptor? {

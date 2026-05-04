@@ -20,7 +20,9 @@ private let taskId = "\(Bundle.main.bundleIdentifier!).background"
 private func rustProgressBridge(_ eventPtr: UnsafePointer<ProgressEvent>?) {
     guard let e = eventPtr?.pointee else { return }
 
-    let fileKey    = e.file_key.map    { String(cString: $0) } ?? ""
+    let fileKey    = e.file_key.map    { String(cString: $0) }
+    let fileName   = e.file_name.map   { String(cString: $0) } ?? ""
+    let fileHash   = e.file_hash.map   { String(cString: $0) } ?? ""
     let transferId = e.transfer_id.map { String(cString: $0) } ?? ""
     let fState     = e.state.map       { String(cString: $0) } ?? "NOT_STARTED"
     let tState     = e.transfer_state.map { String(cString: $0) } ?? "NOT_STARTED"
@@ -28,6 +30,8 @@ private func rustProgressBridge(_ eventPtr: UnsafePointer<ProgressEvent>?) {
 
     let fileProgress = UploadProgress(
         fileKey:        fileKey,
+        fileName:       fileName,
+        fileHash:       fileHash,
         transferId:     transferId,
         totalBytes:     Double(e.total_bytes),
         uploadedBytes:  Double(e.uploaded_bytes),
@@ -102,6 +106,15 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     @available(iOS 26.0, *)
     private static var bgTaskHandlerRegistered = false
 
+    // Serial queue: max 1 concurrent hash
+    private static let hashQueue = DispatchQueue(label: "com.s3bguploader.hash", qos: .userInitiated)
+    // Concurrent queue with semaphore: max 2 concurrent start_api calls
+    private static let initApiQueue = DispatchQueue(label: "com.s3bguploader.initApi", qos: .userInitiated, attributes: .concurrent)
+    private static let initApiSemaphore = DispatchSemaphore(value: 2)
+    // Files waiting for resume() to trigger start_api
+    private static var pendingHashes: [(hash: String, transferId: String)] = []
+    private static let pendingHashesLock = NSLock()
+
     // Storage path set once on first use
     private static var storagePath: String = {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -163,38 +176,67 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     // Upload
     // -------------------------------------------------------------------------
 
-    func uploadFile(filePath: String, transferId: String, userParams: [String: String]?) throws -> String {
-        let paramsJson: String
-        if let params = userParams, !params.isEmpty {
-            let data = try JSONSerialization.data(withJSONObject: params)
-            paramsJson = String(data: data, encoding: .utf8) ?? "{}"
-        } else {
-            paramsJson = "{}"
-        }
+    func uploadFile(filePath: String, transferId: String, userParams: [String: String]?) throws -> Promise<String> {
+        return Promise.parallel(HybridS3BgUploader.hashQueue) { [self] in
+            let paramsJson: String
+            if let params = userParams, !params.isEmpty {
+                let data = try JSONSerialization.data(withJSONObject: params)
+                paramsJson = String(data: data, encoding: .utf8) ?? "{}"
+            } else {
+                paramsJson = "{}"
+            }
 
-        let fileKey: String = filePath.withCString { pathPtr in
-            transferId.withCString { tidPtr in
-                paramsJson.withCString { paramsPtr in
-                    if let ptr = upload_file(pathPtr, tidPtr, paramsPtr) {
-                        let key = String(cString: ptr)
-                        free_string(ptr)
-                        return key
+            let rawResult: String = filePath.withCString { pathPtr in
+                transferId.withCString { tidPtr in
+                    paramsJson.withCString { paramsPtr in
+                        if let ptr = hash_and_pre_register(pathPtr, tidPtr, paramsPtr) {
+                            let h = String(cString: ptr); free_string(ptr); return h
+                        }
+                        return ""
                     }
-                    return ""
+                }
+            }
+
+            guard !rawResult.isEmpty else {
+                throw NSError(domain: "S3BgUploader", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "hash_and_pre_register failed"])
+            }
+            guard !rawResult.hasPrefix("ERROR:") else {
+                let message = String(rawResult.dropFirst("ERROR:".count))
+                throw NSError(domain: "S3BgUploader", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: message])
+            }
+            let fileHash = rawResult
+
+            // If already running, trigger start_api eagerly; otherwise defer until resume().
+            let globalState: String
+            if let ptr = get_global_state() {
+                globalState = String(cString: ptr); free_string(ptr)
+            } else {
+                globalState = "NOT_STARTED"
+            }
+            if globalState == "RUNNING" || globalState == "RUNNING_IN_BG" {
+                self.triggerInitApi(hash: fileHash, transferId: transferId)
+            } else {
+                HybridS3BgUploader.pendingHashesLock.lock()
+                HybridS3BgUploader.pendingHashes.append((hash: fileHash, transferId: transferId))
+                HybridS3BgUploader.pendingHashesLock.unlock()
+            }
+
+            return fileHash
+        }
+    }
+
+    private func triggerInitApi(hash: String, transferId: String) {
+        HybridS3BgUploader.initApiQueue.async {
+            HybridS3BgUploader.initApiSemaphore.wait()
+            defer { HybridS3BgUploader.initApiSemaphore.signal() }
+            hash.withCString { hashPtr in
+                transferId.withCString { tidPtr in
+                    if let ptr = initialize_file(hashPtr, tidPtr) { free_string(ptr) }
                 }
             }
         }
-
-        guard !fileKey.isEmpty else {
-            throw NSError(domain: "S3BgUploader", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "uploadFile returned empty fileKey"])
-        }
-
-        if #available(iOS 26.0, *) {
-            scheduleBgTaskIfNeeded()
-        }
-
-        return fileKey
     }
 
     @available(iOS 26.0, *)
@@ -234,8 +276,8 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     // Cancel / pause / resume
     // -------------------------------------------------------------------------
 
-    func cancelFile(fileKey: String) throws {
-        fileKey.withCString { cancel_file($0) }
+    func cancelFile(fileHash: String) throws {
+        fileHash.withCString { cancel_file($0) }
     }
 
     func cancelTransfer(transferId: String) throws {
@@ -243,6 +285,9 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     }
 
     func cancel() throws {
+        HybridS3BgUploader.pendingHashesLock.lock()
+        HybridS3BgUploader.pendingHashes.removeAll()
+        HybridS3BgUploader.pendingHashesLock.unlock()
         cancel_all()
         if #available(iOS 26.0, *) {
             DispatchQueue.main.async {
@@ -262,13 +307,26 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
         }
     }
 
-    func resume() throws {
-        resume_all()
+    func resume() throws -> Promise<Void> {
+        if let errPtr = resume_all() {
+            let errMsg = String(cString: errPtr); free_string(errPtr)
+            throw NSError(domain: "S3BgUploader", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: errMsg])
+        }
+        // Process deferred NOT_STARTED files
+        HybridS3BgUploader.pendingHashesLock.lock()
+        let pending = HybridS3BgUploader.pendingHashes
+        HybridS3BgUploader.pendingHashes.removeAll()
+        HybridS3BgUploader.pendingHashesLock.unlock()
+        for p in pending {
+            triggerInitApi(hash: p.hash, transferId: p.transferId)
+        }
         if #available(iOS 26.0, *) {
             DispatchQueue.main.async {
                 self.scheduleBgTaskIfNeeded()
             }
         }
+        return Promise.resolved()
     }
 
     // -------------------------------------------------------------------------
@@ -342,23 +400,27 @@ private func decodeJSON<T: Decodable>(_ type: T.Type, from string: String) -> T?
 // ---------------------------------------------------------------------------
 
 private struct UploadProgressJSON: Decodable {
-    let file_key: String
-    let transfer_id: String
-    let total_bytes: UInt64
-    let uploaded_bytes: UInt64
-    let completed_parts: UInt32
-    let total_parts: UInt32
+    let fileKey: String?
+    let fileName: String
+    let fileHash: String
+    let transferId: String
+    let totalBytes: UInt64
+    let uploadedBytes: UInt64
+    let completedParts: UInt32
+    let totalParts: UInt32
     let percentage: Double
     let state: String
 
     var asUploadProgress: UploadProgress {
         UploadProgress(
-            fileKey:        file_key,
-            transferId:     transfer_id,
-            totalBytes:     Double(total_bytes),
-            uploadedBytes:  Double(uploaded_bytes),
-            completedParts: Double(completed_parts),
-            totalParts:     Double(total_parts),
+            fileKey:        fileKey,
+            fileName:       fileName,
+            fileHash:       fileHash,
+            transferId:     transferId,
+            totalBytes:     Double(totalBytes),
+            uploadedBytes:  Double(uploadedBytes),
+            completedParts: Double(completedParts),
+            totalParts:     Double(totalParts),
             percentage:     percentage,
             state:          UploadState(fromString: state) ?? .notStarted
         )
@@ -367,23 +429,23 @@ private struct UploadProgressJSON: Decodable {
 
 private struct AggregateProgressJSON: Decodable {
     let percentage: Double
-    let total_size: UInt64
-    let uploaded_size: UInt64
-    let total_transfers: UInt32?
-    let completed_transfers: UInt32?
-    let total_files: UInt32
-    let completed_files: UInt32
+    let totalSize: UInt64
+    let uploadedSize: UInt64
+    let totalTransfers: UInt32?
+    let completedTransfers: UInt32?
+    let totalFiles: UInt32
+    let completedFiles: UInt32
     let state: String
 
     var asAggregateProgress: AggregateProgress {
         AggregateProgress(
             percentage:         percentage,
-            totalSize:          Double(total_size),
-            uploadedSize:       Double(uploaded_size),
-            totalTransfers:     total_transfers.map(Double.init),
-            completedTransfers: completed_transfers.map(Double.init),
-            totalFiles:         Double(total_files),
-            completedFiles:     Double(completed_files),
+            totalSize:          Double(totalSize),
+            uploadedSize:       Double(uploadedSize),
+            totalTransfers:     totalTransfers.map(Double.init),
+            completedTransfers: completedTransfers.map(Double.init),
+            totalFiles:         Double(totalFiles),
+            completedFiles:     Double(completedFiles),
             state:              GlobalUploaderState(fromString: state) ?? .notStarted
         )
     }

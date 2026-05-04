@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::core::session::{AggregateProgress, FileProgress, UploadState};
@@ -11,6 +11,8 @@ use crate::core::session::{AggregateProgress, FileProgress, UploadState};
 pub struct UploadProgress {
     /// S3 key — the public identifier returned by uploadFile().
     pub file_key: String,
+    pub file_name: String,
+    pub file_hash: String,
     pub transfer_id: String,
     pub total_bytes: u64,
     pub total_parts: u32,
@@ -20,12 +22,17 @@ pub struct UploadProgress {
     pub in_flight_progress: HashMap<u32, u64>,
     pub completed_parts: u32,
     pub status: UploadState,
+    /// Guards against double-counting when stale workers from a previous run
+    /// call complete_chunk after a pause+resume starts a new run.
+    completed_part_set: HashSet<u32>,
 }
 
 impl UploadProgress {
-    pub fn new(file_key: String, transfer_id: String, total_bytes: u64, total_parts: u32) -> Self {
+    pub fn new(file_key: String, file_name: String, file_hash: String, transfer_id: String, total_bytes: u64, total_parts: u32) -> Self {
         Self {
             file_key,
+            file_name,
+            file_hash,
             transfer_id,
             total_bytes,
             total_parts,
@@ -33,6 +40,7 @@ impl UploadProgress {
             in_flight_progress: HashMap::new(),
             completed_parts: 0,
             status: UploadState::Running,
+            completed_part_set: HashSet::new(),
         }
     }
 
@@ -56,6 +64,11 @@ impl UploadProgress {
     }
 
     pub fn complete_chunk(&mut self, part_number: u32, chunk_size: u64) {
+        if !self.completed_part_set.insert(part_number) {
+            // Already counted by a concurrent worker from the same or a previous run.
+            self.in_flight_progress.remove(&part_number);
+            return;
+        }
         self.in_flight_progress.remove(&part_number);
         self.completed_bytes += chunk_size;
         self.completed_parts += 1;
@@ -63,7 +76,9 @@ impl UploadProgress {
 
     pub fn to_file_progress(&self) -> FileProgress {
         FileProgress {
-            file_key: self.file_key.clone(),
+            file_key: Some(self.file_key.clone()),
+            file_name: self.file_name.clone(),
+            file_hash: self.file_hash.clone(),
             transfer_id: self.transfer_id.clone(),
             total_bytes: self.total_bytes,
             uploaded_bytes: self.uploaded_bytes(),
@@ -151,6 +166,8 @@ impl<N: ProgressNotifier> ProgressManager<N> {
     pub fn init(
         &self,
         file_key: String,
+        file_name: String,
+        file_hash: String,
         transfer_id: String,
         total_bytes: u64,
         total_parts: u32,
@@ -159,7 +176,7 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         session_agg: AggregateProgress,
         transfer_agg: AggregateProgress,
     ) {
-        let mut p = UploadProgress::new(file_key.clone(), transfer_id, total_bytes, total_parts);
+        let mut p = UploadProgress::new(file_key.clone(), file_name, file_hash, transfer_id, total_bytes, total_parts);
         p.completed_bytes = already_completed_bytes;
         p.completed_parts = already_completed_parts;
         let fp = p.to_file_progress();
@@ -185,10 +202,12 @@ impl<N: ProgressNotifier> ProgressManager<N> {
     ) {
         let mut lock = self.progress.lock().unwrap();
         if let Some(p) = lock.get_mut(file_key) {
-            p.update_in_flight(part_number, bytes_uploaded);
             if p.status != UploadState::Running {
+                // Don't re-populate in_flight after pause; stale bytes would inflate
+                // progress reported by polls and aggregate calculations.
                 return;
             }
+            p.update_in_flight(part_number, bytes_uploaded);
             let fp = p.to_file_progress();
             let tid = p.transfer_id.clone();
             let (s, t) = Self::build_aggregates(&lock, session_agg, transfer_agg, &tid);
@@ -241,16 +260,21 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         self.progress.lock().unwrap().remove(file_key);
     }
 
-    /// Register a newly queued file in the progress map with NotStarted status and
-    /// fire a notification. Called right after the file is added to the session so
-    /// push-callback platforms (Android) know about queued files without polling.
-    /// If the worker thread already advanced the entry to Running, we skip the insert
-    /// to avoid overwriting active progress tracking.
+    /// Register a file's initial state in the progress map and fire a notification.
+    /// Called right after `initialize_and_enqueue` / `process_pending_files` so clients
+    /// see the correct state (INITIALIZED for new/resumed files, COMPLETED for already-done
+    /// files) before the upload worker starts — or instead of it for completed files.
+    /// If the worker thread has already advanced the entry, we notify with the live state.
     pub fn register_not_started(
         &self,
         file_key: String,
+        file_name: String,
+        file_hash: String,
         transfer_id: String,
         total_bytes: u64,
+        committed_bytes: u64,
+        committed_parts: u32,
+        state: UploadState,
         session_agg: AggregateProgress,
         transfer_agg: AggregateProgress,
     ) {
@@ -262,8 +286,10 @@ impl<N: ProgressNotifier> ProgressManager<N> {
             self.notifier.notify(&fp, &session_agg, &transfer_agg);
             return;
         }
-        let mut p = UploadProgress::new(file_key.clone(), transfer_id, total_bytes, 0);
-        p.status = UploadState::NotStarted;
+        let mut p = UploadProgress::new(file_key.clone(), file_name, file_hash, transfer_id, total_bytes, 0);
+        p.status = state;
+        p.completed_bytes = committed_bytes;
+        p.completed_parts = committed_parts;
         let fp = p.to_file_progress();
         lock.insert(file_key, p);
         drop(lock);

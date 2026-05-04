@@ -12,7 +12,7 @@ android = ["jni", "reqwest", "reqwest/blocking", "reqwest/rustls-tls-webpki-root
 wasm = ["wasm-bindgen", "wasm-bindgen-file-reader", "web-sys", "wasm-bindgen-futures", "js-sys", "futures", "console_error_panic_hook", "rexie"]
 
 [dependencies]
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+murmur3 = "0.5"
 indexmap = { version = "2", features = ["serde"] }
 async-trait = "0.1"
 pollster = "0.4"

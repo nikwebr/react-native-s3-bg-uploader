@@ -26,6 +26,8 @@ use std::os::raw::c_char;
 pub struct ProgressEvent {
     // per-file
     pub file_key: *const c_char,
+    pub file_name: *const c_char,
+    pub file_hash: *const c_char,
     pub transfer_id: *const c_char,
     pub total_bytes: u64,
     pub uploaded_bytes: u64,

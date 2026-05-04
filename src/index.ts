@@ -6,6 +6,7 @@ import type {
   S3BgUploaderAPI,
   UploadProgress,
 } from './specs/s3-bg-uploader.types'
+import { S3BgUploaderResumeError, S3BgUploaderDuplicateFileError } from './specs/s3-bg-uploader.types'
 
 const Native = NitroModules.createHybridObject<S3BgUploaderSpec>('S3BgUploader')
 
@@ -26,17 +27,23 @@ export const S3BgUploader: S3BgUploaderAPI = {
     Native.setTaskSubtitle(subtitle)
   },
 
-  uploadFile(file: string | File, transferId: string, userParams?: Record<string, string>): string {
+  async uploadFile(file: string | File, transferId: string, userParams?: Record<string, string>): Promise<string> {
     if (typeof file !== 'string') {
       throw new TypeError(
         'S3BgUploader: On native platforms, uploadFile requires a string file path.',
       )
     }
-    return Native.uploadFile(file, transferId, userParams)
+    try {
+      return await Native.uploadFile(file, transferId, userParams)
+    } catch (e: unknown) {
+      const msg = (e as Error)?.message ?? String(e)
+      if (msg.includes('DUPLICATE_FILE')) throw new S3BgUploaderDuplicateFileError(msg)
+      throw e
+    }
   },
 
-  cancelFile(fileKey: string) {
-    Native.cancelFile(fileKey)
+  cancelFile(fileHash: string) {
+    Native.cancelFile(fileHash)
   },
 
   cancelTransfer(transferId: string) {
@@ -51,8 +58,12 @@ export const S3BgUploader: S3BgUploaderAPI = {
     Native.pause()
   },
 
-  resume() {
-    Native.resume()
+  async resume(): Promise<void> {
+    try {
+      await Native.resume()
+    } catch (e: unknown) {
+      throw new S3BgUploaderResumeError((e as Error)?.message ?? String(e))
+    }
   },
 
   getProgress(transferId?: string, fileKey?: string): UploadProgress[] {

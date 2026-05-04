@@ -10,7 +10,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, Once};
 use std::thread;
 
-use crate::native::{BlockingNetwork, NativeApiClient};
+use crate::core::{session, upload as core_upload};
+use crate::core::session::{PendingFileEntry, UploadState};
+use crate::core::upload::StartResult;
 
 struct DescriptorForFileKey {
     file_key: String,
@@ -22,30 +24,87 @@ static QUEUE: Mutex<std::collections::VecDeque<DescriptorForFileKey>> =
 pub(crate) static QUEUE_SIGNAL: Condvar = Condvar::new();
 static WORKER_STARTED: Once = Once::new();
 pub(crate) static PAUSE_FLAG: AtomicBool = AtomicBool::new(false);
+/// Holds raw fds for files that failed so they can be re-enqueued on resume.
+pub(crate) static FAILED_FDS: std::sync::LazyLock<Mutex<HashMap<String, RawFd>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub(super) fn start_and_enqueue(
+use crate::native::{BlockingNetwork, NativeApiClient};
+
+/// Phase 1: hash fd and pre-register (before start_api). Returns file hash.
+pub(super) fn hash_and_pre_register(
     raw_fd: RawFd,
+    file_name: String,
     transfer_id: &str,
     user_params: HashMap<String, String>,
 ) -> Result<String, String> {
     init_logging();
     let file_hash = hash::hash_fd(raw_fd, transfer_id)?;
+    {
+        let sess = session::session();
+        if let Some(entry) = sess.find_by_hash(&file_hash) {
+            if entry.state == UploadState::Completed {
+                return Ok(file_hash);
+            }
+            if !entry.is_resumable() {
+                return Err(format!("DUPLICATE_FILE: file with hash {} is already active in this session", file_hash));
+            }
+        } else if sess.pending_files.contains_key(&file_hash) {
+            return Err(format!("DUPLICATE_FILE: file with hash {} is already pending in this session", file_hash));
+        }
+    }
     let dup_for_size = unsafe { libc::dup(raw_fd) };
     let file_size = if dup_for_size != -1 {
         unsafe { File::from_raw_fd(dup_for_size).metadata().map(|m| m.len()).unwrap_or(0) }
     } else {
         0
     };
-    let api = NativeApiClient { network: AndroidNetwork { client: build_client() } };
-    let result = pollster::block_on(crate::core::upload::start_and_register(
-        file_hash,
-        transfer_id,
+    session::session().pre_register_file(
+        file_hash.clone(),
+        transfer_id.to_string(),
         String::new(),
-        "file".to_string(),
+        file_name,
         file_size,
         user_params,
+    );
+    Ok(file_hash)
+}
+
+/// Phase 2: call start_api and enqueue. `raw_fd` is a fresh fd opened by Kotlin for this phase.
+pub(super) fn initialize_and_enqueue(
+    raw_fd: RawFd,
+    file_hash: &str,
+    transfer_id: &str,
+) -> Result<String, String> {
+    let pending: PendingFileEntry = session::session()
+        .pending_files
+        .get(file_hash)
+        .cloned()
+        .ok_or_else(|| format!("no pending entry for hash {}", file_hash))?;
+
+    let dup_for_size = unsafe { libc::dup(raw_fd) };
+    let file_size = if dup_for_size != -1 {
+        unsafe { File::from_raw_fd(dup_for_size).metadata().map(|m| m.len()).unwrap_or(0) }
+    } else {
+        pending.file_size
+    };
+
+    let api = NativeApiClient { network: AndroidNetwork { client: build_client() } };
+    let result = pollster::block_on(core_upload::start_and_register(
+        file_hash.to_string(),
+        transfer_id,
+        String::new(),
+        pending.file_name.clone(),
+        file_size,
+        pending.user_params.clone(),
         &api,
     ))?;
+    // Check if cancel_all fired while we were blocked on the network call.
+    let still_active = session::session().pending_files.contains_key(file_hash);
+    session::session().pending_files.remove(file_hash);
+    if !still_active {
+        session::session().cancel_file(result.file_key());
+        return Err("cancelled".to_string());
+    }
     if result.should_upload() {
         let dup = dup_fd(raw_fd).map_err(|e| e.to_string())?;
         enqueue(result.file_key().to_string(), dup);
@@ -55,10 +114,19 @@ pub(super) fn start_and_enqueue(
 
 pub(crate) fn enqueue(file_key: String, raw_fd: RawFd) {
     start_worker_thread();
-    QUEUE
-        .lock()
-        .unwrap()
-        .push_back(DescriptorForFileKey { file_key, raw_fd });
+    let has_progress = session::session()
+        .files
+        .get(&file_key)
+        .map(|e| e.uploaded_bytes > 0)
+        .unwrap_or(false);
+    let mut q = QUEUE.lock().unwrap();
+    let entry = DescriptorForFileKey { file_key, raw_fd };
+    // Files that already have progress go to the front so they resume before fresh files.
+    if has_progress {
+        q.push_front(entry);
+    } else {
+        q.push_back(entry);
+    }
     QUEUE_SIGNAL.notify_one();
 }
 

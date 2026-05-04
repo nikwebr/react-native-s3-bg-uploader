@@ -9,16 +9,13 @@ use crate::core::session::{AggregateProgress, FileProgress};
 // Callback and static storage
 // ---------------------------------------------------------------------------
 
-/// JNI callback: fn(file_key, transfer_id, total_bytes, uploaded_bytes, completed_parts,
-///   total_parts, percentage, state,
-///   transfer_pct, transfer_total_size, transfer_uploaded_size, transfer_total_files,
-///   transfer_completed_files, transfer_state,
-///   session_pct, session_total_size, session_uploaded_size, session_total_transfers,
-///   session_completed_transfers, session_total_files, session_completed_files, session_state)
+/// JNI callback: fn(file_key, file_name, file_hash, transfer_id, total_bytes, ...)
 pub type AndroidProgressCallback = Box<
     dyn Fn(
-            &str,
-            &str,
+            &str, // file_key
+            &str, // file_name
+            &str, // file_hash
+            &str, // transfer_id
             u64,
             u64,
             u32,
@@ -58,7 +55,9 @@ impl ProgressNotifier for AndroidProgressNotifier {
         let cb = PROGRESS_CALLBACK.lock().unwrap();
         if let Some(ref callback) = *cb {
             callback(
-                &fp.file_key,
+                fp.file_key.as_deref().unwrap_or(""),
+                &fp.file_name,
+                &fp.file_hash,
                 &fp.transfer_id,
                 fp.total_bytes,
                 fp.uploaded_bytes,
@@ -102,16 +101,18 @@ const NOTIFY_EVERY_BYTES: u64 = 256 * 1024;
 pub struct ProgressReader {
     inner: Cursor<Vec<u8>>,
     file_key: String,
+    run_version: u64,
     part_number: u32,
     bytes_read: u64,
     last_notified: u64,
 }
 
 impl ProgressReader {
-    pub fn new(data: Vec<u8>, file_key: String, part_number: u32) -> Self {
+    pub fn new(data: Vec<u8>, file_key: String, run_version: u64, part_number: u32) -> Self {
         Self {
             inner: Cursor::new(data),
             file_key,
+            run_version,
             part_number,
             bytes_read: 0,
             last_notified: 0,
@@ -123,6 +124,9 @@ impl Read for ProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "paused"));
+        }
+        if !crate::core::session::is_current_run(&self.file_key, self.run_version) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stale run"));
         }
         let n = self.inner.read(buf)?;
         if n > 0 {

@@ -29,7 +29,11 @@ pub(super) fn run_upload(file_key: &str) {
             Some(e)
                 if matches!(
                     e.state,
-                    UploadState::NotStarted | UploadState::Paused | UploadState::Failed
+                    UploadState::NotStarted
+                        | UploadState::Initialized
+                        | UploadState::Running  // app was killed mid-upload; resume from where it left off
+                        | UploadState::Paused
+                        | UploadState::Failed
                 ) =>
             {
                 (e.file_path.clone(), e.run_version)
@@ -60,7 +64,8 @@ pub(super) fn run_upload(file_key: &str) {
 
     match pollster::block_on(upload_orchestrator::run_upload(&backend)) {
         UploadOutcome::Completed => {
-            if let Some(next_key) = session::session().next_pending_file() {
+            let next_key = session::session().next_pending_file();
+            if let Some(next_key) = next_key {
                 enqueue_key(next_key);
             }
         }

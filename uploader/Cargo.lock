@@ -663,6 +663,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "murmur3"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9252111cf132ba0929b6f8e030cac2a24b507f3a4d6db6fb2896f27b354c714b"
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1384,6 +1390,7 @@ dependencies = [
  "js-sys",
  "libc",
  "log",
+ "murmur3",
  "nyquest",
  "nyquest-backend-nsurlsession",
  "pollster",
@@ -1396,7 +1403,6 @@ dependencies = [
  "wasm-bindgen-file-reader",
  "wasm-bindgen-futures",
  "web-sys",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -1793,12 +1799,6 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
-
-[[package]]
-name = "xxhash-rust"
-version = "0.8.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yoke"

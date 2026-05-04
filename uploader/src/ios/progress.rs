@@ -21,7 +21,9 @@ impl ProgressNotifier for IosProgressNotifier {
     ) {
         let cb = PROGRESS_CALLBACK.lock().unwrap();
         if let Some(callback) = *cb {
-            let file_key = CString::new(fp.file_key.as_str()).unwrap_or_default();
+            let file_key = CString::new(fp.file_key.as_deref().unwrap_or("")).unwrap_or_default();
+            let file_name = CString::new(fp.file_name.as_str()).unwrap_or_default();
+            let file_hash = CString::new(fp.file_hash.as_str()).unwrap_or_default();
             let transfer_id = CString::new(fp.transfer_id.as_str()).unwrap_or_default();
             let state = CString::new(fp.state.as_str()).unwrap_or_default();
             let t_state = CString::new(transfer_agg.state.as_str()).unwrap_or_default();
@@ -29,6 +31,8 @@ impl ProgressNotifier for IosProgressNotifier {
 
             let event = ProgressEvent {
                 file_key: file_key.as_ptr(),
+                file_name: file_name.as_ptr(),
+                file_hash: file_hash.as_ptr(),
                 transfer_id: transfer_id.as_ptr(),
                 total_bytes: fp.total_bytes,
                 uploaded_bytes: fp.uploaded_bytes,

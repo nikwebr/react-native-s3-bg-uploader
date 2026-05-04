@@ -2,16 +2,37 @@ package com.s3bguploader
 
 import android.content.Intent
 import android.os.Build
+import com.margelo.nitro.core.Promise
 import com.margelo.nitro.s3bguploader.AggregateProgress
 import com.margelo.nitro.s3bguploader.GlobalUploaderState
 import com.margelo.nitro.s3bguploader.HybridS3BgUploaderSpec
 import com.margelo.nitro.s3bguploader.UploadProgress
 import com.margelo.nitro.s3bguploader.UploadState
 import com.margelo.nitro.s3bguploader.Variant_NullType__fileProgress__UploadProgress__sessionAggregate__AggregateProgress__transferAggregate__AggregateProgress_____Unit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Executors
 
 class HybridS3BgUploader : HybridS3BgUploaderSpec() {
+
+    // Serial queue: max 1 concurrent hash
+    private val hashDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+    private val hashScope = CoroutineScope(hashDispatcher + SupervisorJob())
+
+    // Concurrent queue with semaphore: max 2 concurrent start_api calls
+    private val initApiSemaphore = Semaphore(2)
+    private val initApiScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Files waiting for resume() to trigger start_api
+    private data class PendingFile(val hash: String, val transferId: String, val filePath: String)
+    private val pendingFiles = mutableListOf<PendingFile>()
 
     // -------------------------------------------------------------------------
     // Config
@@ -58,53 +79,112 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         filePath: String,
         transferId: String,
         userParams: Map<String, String>?,
-    ): String {
-        val context = appContext() ?: run {
-            android.util.Log.e("S3Uploader", "No application context available")
-            throw IllegalStateException("No application context")
+    ): Promise<String> {
+        return Promise.async(hashScope) {
+            val context = appContext() ?: throw IllegalStateException("No application context")
+            StoragePathInit.ensureInit(context)
+
+            val paramsJson = if (!userParams.isNullOrEmpty()) {
+                JSONObject(userParams as Map<*, *>).toString()
+            } else {
+                "{}"
+            }
+
+            val pfd = UploadForegroundService.openAsPfdStatic(context, filePath)
+                ?: throw IllegalArgumentException("Cannot open file: $filePath")
+            val fd = pfd.detachFd()
+            val fileName = resolveFileName(context, filePath)
+
+            val rawResult = nativeHashAndPreRegister(fd, fileName, transferId, paramsJson)
+            if (rawResult.isEmpty()) throw RuntimeException("hash_and_pre_register failed for $filePath")
+            if (rawResult.startsWith("ERROR:")) throw RuntimeException(rawResult.removePrefix("ERROR:"))
+            val fileHash = rawResult
+
+            // If already running, trigger start_api eagerly; otherwise defer until resume().
+            val globalState = nativeGetGlobalState()
+            if (globalState == "RUNNING" || globalState == "RUNNING_IN_BG") {
+                launchInitApi(fileHash, transferId, filePath)
+            } else {
+                synchronized(pendingFiles) {
+                    pendingFiles.add(PendingFile(fileHash, transferId, filePath))
+                }
+            }
+
+            fileHash
         }
+    }
 
-        // Set storage path on first call
-        StoragePathInit.ensureInit(context)
-
-        val paramsJson = if (!userParams.isNullOrEmpty()) {
-            JSONObject(userParams as Map<*, *>).toString()
-        } else {
-            "{}"
+    private fun launchInitApi(hash: String, transferId: String, filePath: String) {
+        initApiScope.launch {
+            initApiSemaphore.withPermit {
+                val context = appContext() ?: return@withPermit
+                val pfd = UploadForegroundService.openAsPfdStatic(context, filePath)
+                    ?: return@withPermit
+                val fd = pfd.detachFd()
+                nativeInitializeFile(fd, hash, transferId)
+            }
         }
+    }
 
-        val pfd = UploadForegroundService.openAsPfdStatic(context, filePath) ?: run {
-            throw IllegalArgumentException("Cannot open file: $filePath")
+    private fun resolveFileName(context: android.content.Context, uriString: String): String {
+        val uri = android.net.Uri.parse(uriString)
+        if (uri.scheme == "content") {
+            context.contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null, null, null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) {
+                        val name = cursor.getString(idx)
+                        if (!name.isNullOrEmpty()) return name
+                    }
+                }
+            }
         }
-        val fd = pfd.detachFd()
-
-        val fileKey = nativeUploadFile(fd, transferId, paramsJson)
-
-        val intent = Intent(context, UploadForegroundService::class.java).apply {
-            putExtra(UploadForegroundService.EXTRA_TRANSFER_ID, transferId)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
-        }
-
-        return fileKey
+        return uri.lastPathSegment?.substringAfterLast('/') ?: "file"
     }
 
     // -------------------------------------------------------------------------
     // Cancel / pause / resume
     // -------------------------------------------------------------------------
 
-    override fun cancelFile(fileKey: String): Unit = nativeCancelFile(fileKey)
+    override fun cancelFile(fileHash: String): Unit = nativeCancelFile(fileHash)
 
     override fun cancelTransfer(transferId: String): Unit = nativeCancelTransfer(transferId)
 
-    override fun cancel(): Unit = nativeCancelAll()
+    override fun cancel(): Unit {
+        synchronized(pendingFiles) { pendingFiles.clear() }
+        nativeCancelAll()
+        stopForegroundService()
+    }
 
-    override fun pause(): Unit = nativePauseAll()
+    override fun pause(): Unit {
+        nativePauseAll()
+        stopForegroundService()
+    }
 
-    override fun resume(): Unit = nativeResumeAll()
+    override fun resume(): Promise<Unit> {
+        return Promise.async {
+            val err = nativeResumeAll()
+            if (err != null) throw Exception(err)
+            val toProcess = synchronized(pendingFiles) { pendingFiles.toList().also { pendingFiles.clear() } }
+            for (p in toProcess) {
+                launchInitApi(p.hash, p.transferId, p.filePath)
+            }
+            appContext()?.let { ctx ->
+                val intent = Intent(ctx, UploadForegroundService::class.java).apply {
+                    putExtra(UploadForegroundService.EXTRA_TRANSFER_ID, "session")
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    ctx.startForegroundService(intent)
+                } else {
+                    ctx.startService(intent)
+                }
+            }
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Progress queries
@@ -123,9 +203,13 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         return parseAggregateProgress(json)
     }
 
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
+    private fun stopForegroundService() {
+        appContext()?.let { ctx ->
+            ctx.startService(Intent(ctx, UploadForegroundService::class.java).apply {
+                action = UploadForegroundService.ACTION_STOP
+            })
+        }
+    }
 
     private fun appContext(): android.content.Context? {
         S3BgUploaderPackage.appContext?.let { return it }
@@ -168,7 +252,9 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
 
         private fun parseUploadProgressFromObject(o: org.json.JSONObject): UploadProgress {
             return UploadProgress(
-                fileKey        = o.getString("fileKey"),
+                fileKey        = if (o.has("fileKey")) o.getString("fileKey") else null,
+                fileName       = o.optString("fileName", ""),
+                fileHash       = o.optString("fileHash", ""),
                 transferId     = o.getString("transferId"),
                 totalBytes     = o.getLong("totalBytes").toDouble(),
                 uploadedBytes  = o.getLong("uploadedBytes").toDouble(),
@@ -191,18 +277,28 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
 
         @JvmStatic external fun nativeSetTaskSubtitle(subtitle: String)
 
-        /** Enqueues a file upload. Returns the S3 fileKey. Takes ownership of fd. */
-        @JvmStatic external fun nativeUploadFile(
+        /** Phase 1: hash fd and pre-register. Returns file hash. Takes ownership of fd. */
+        @JvmStatic external fun nativeHashAndPreRegister(
             fd: Int,
+            fileName: String,
             transferId: String,
             userParamsJson: String,
         ): String
 
-        @JvmStatic external fun nativeCancelFile(fileKey: String)
+        /** Phase 2: call start_api and enqueue the file. Returns file key. Takes ownership of fd. */
+        @JvmStatic external fun nativeInitializeFile(
+            fd: Int,
+            fileHash: String,
+            transferId: String,
+        ): String
+
+        @JvmStatic external fun nativeGetGlobalState(): String
+
+        @JvmStatic external fun nativeCancelFile(fileHash: String)
         @JvmStatic external fun nativeCancelTransfer(transferId: String)
         @JvmStatic external fun nativeCancelAll()
         @JvmStatic external fun nativePauseAll()
-        @JvmStatic external fun nativeResumeAll()
+        @JvmStatic external fun nativeResumeAll(): String?
 
         /** Returns JSON array string of UploadProgress objects. Nullable filters. */
         @JvmStatic external fun nativeGetProgressJson(
@@ -238,7 +334,9 @@ internal fun parseUploadProgressArray(json: String): Array<UploadProgress> {
         Array(arr.length()) { i ->
             val o = arr.getJSONObject(i)
             UploadProgress(
-                fileKey        = o.getString("fileKey"),
+                fileKey        = if (o.has("fileKey")) o.getString("fileKey") else null,
+                fileName       = o.optString("fileName", ""),
+                fileHash       = o.optString("fileHash", ""),
                 transferId     = o.getString("transferId"),
                 totalBytes     = o.getLong("totalBytes").toDouble(),
                 uploadedBytes  = o.getLong("uploadedBytes").toDouble(),
@@ -279,11 +377,13 @@ internal fun parseAggregateProgress(json: String): AggregateProgress {
 }
 
 private fun parseUploadState(s: String): UploadState = when (s) {
-    "RUNNING"    -> UploadState.RUNNING
-    "PAUSED"     -> UploadState.PAUSED
-    "COMPLETED"  -> UploadState.COMPLETED
-    "FAILED"     -> UploadState.FAILED
-    else         -> UploadState.NOT_STARTED
+    "INITIALIZED" -> UploadState.INITIALIZED
+    "RUNNING"     -> UploadState.RUNNING
+    "PAUSED"      -> UploadState.PAUSED
+    "COMPLETED"   -> UploadState.COMPLETED
+    "FAILED"      -> UploadState.FAILED
+    "CANCELLED"   -> UploadState.CANCELLED
+    else          -> UploadState.NOT_STARTED
 }
 
 private fun parseGlobalUploaderState(s: String): GlobalUploaderState = when (s) {

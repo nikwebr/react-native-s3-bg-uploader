@@ -1,6 +1,6 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -10,20 +10,24 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UploadState {
     NotStarted,
+    Initialized,
     Running,
     Paused,
     Completed,
     Failed,
+    Cancelled,
 }
 
 impl UploadState {
     pub fn as_str(&self) -> &'static str {
         match self {
             UploadState::NotStarted => "NOT_STARTED",
+            UploadState::Initialized => "INITIALIZED",
             UploadState::Running => "RUNNING",
             UploadState::Paused => "PAUSED",
             UploadState::Completed => "COMPLETED",
             UploadState::Failed => "FAILED",
+            UploadState::Cancelled => "CANCELLED",
         }
     }
 }
@@ -97,7 +101,7 @@ impl FileEntry {
             transfer_id,
             file_path,
             file_name,
-            state: UploadState::NotStarted,
+            state: UploadState::Initialized,
             total_bytes,
             uploaded_bytes: 0,
             completed_parts: 0,
@@ -124,6 +128,7 @@ impl FileEntry {
         matches!(
             self.state,
             UploadState::NotStarted
+                | UploadState::Initialized
                 | UploadState::Failed
                 | UploadState::Paused
                 | UploadState::Running
@@ -181,7 +186,9 @@ impl AggregateProgress {
 
 #[derive(Debug, Clone)]
 pub struct FileProgress {
-    pub file_key: String,
+    pub file_key: Option<String>,
+    pub file_name: String,
+    pub file_hash: String,
     pub transfer_id: String,
     pub total_bytes: u64,
     pub uploaded_bytes: u64,
@@ -193,8 +200,9 @@ pub struct FileProgress {
 
 impl FileProgress {
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "fileKey": self.file_key,
+        let mut v = serde_json::json!({
+            "fileName": self.file_name,
+            "fileHash": self.file_hash,
             "transferId": self.transfer_id,
             "totalBytes": self.total_bytes,
             "uploadedBytes": self.uploaded_bytes,
@@ -202,8 +210,28 @@ impl FileProgress {
             "totalParts": self.total_parts,
             "percentage": self.percentage,
             "state": self.state.as_str(),
-        })
+        });
+        if let Some(ref key) = self.file_key {
+            v["fileKey"] = serde_json::Value::String(key.clone());
+        }
+        v
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pending pre-registration (before start_api is called)
+// ---------------------------------------------------------------------------
+
+/// Transient entry created after hashing but before start_api.
+/// Not persisted — lost on app restart (acceptable since server state is absent).
+#[derive(Debug, Clone)]
+pub struct PendingFileEntry {
+    pub file_hash: String,
+    pub transfer_id: String,
+    pub file_path: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub user_params: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +250,14 @@ pub struct Session {
     pub current_transfer_id: Option<String>,
     pub title_template: String,
     pub subtitle_template: String,
+    /// Hashed but not yet start_api'd files — keyed by file_hash. Not persisted.
+    #[serde(skip)]
+    pub pending_files: HashMap<String, PendingFileEntry>,
+    /// Hashes of session files that need a fresh local file reference before resume() is valid.
+    /// Populated after loading a persisted session; cleared entry-by-entry as files are re-provided.
+    /// Not persisted.
+    #[serde(skip)]
+    pub files_needing_provision: HashSet<String>,
 }
 
 impl Session {
@@ -234,7 +270,35 @@ impl Session {
             current_transfer_id: None,
             title_template: String::new(),
             subtitle_template: String::new(),
+            pending_files: HashMap::new(),
+            files_needing_provision: HashSet::new(),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Provision tracking (not persisted)
+    // ------------------------------------------------------------------
+
+    /// Populate `files_needing_provision` from the loaded session.
+    /// Call once immediately after loading a persisted session.
+    pub fn recompute_needs_provision(&mut self) {
+        self.files_needing_provision = self
+            .files
+            .values()
+            .filter(|e| e.state != UploadState::Completed)
+            .map(|e| e.file_hash.clone())
+            .collect();
+        // Files that were RUNNING when the process was killed are effectively paused.
+        for entry in self.files.values_mut() {
+            if entry.state == UploadState::Running {
+                entry.state = UploadState::Paused;
+            }
+        }
+        self.recompute_global_state();
+    }
+
+    pub fn has_missing_files(&self) -> bool {
+        !self.files_needing_provision.is_empty()
     }
 
     // ------------------------------------------------------------------
@@ -292,6 +356,70 @@ impl Session {
         }
     }
 
+    /// Phase 1 of the new upload flow: store hash + metadata; start_api not yet called.
+    pub fn pre_register_file(
+        &mut self,
+        file_hash: String,
+        transfer_id: String,
+        file_path: String,
+        file_name: String,
+        file_size: u64,
+        user_params: HashMap<String, String>,
+    ) {
+        self.pending_files.insert(
+            file_hash.clone(),
+            PendingFileEntry {
+                file_hash: file_hash.clone(),
+                transfer_id,
+                file_path,
+                file_name,
+                file_size,
+                user_params,
+            },
+        );
+        // File is being re-provided — no longer missing.
+        self.files_needing_provision.remove(&file_hash);
+    }
+
+    /// Phase 2: start_api succeeded — move from pending_files into session.files.
+    /// Returns false if no pending entry for the given hash exists.
+    pub fn initialize_file(
+        &mut self,
+        file_hash: &str,
+        file_key: String,
+        upload_id: String,
+        part_size: u64,
+        total_parts: u32,
+    ) -> bool {
+        let pending = match self.pending_files.remove(file_hash) {
+            Some(p) => p,
+            None => return false,
+        };
+        let mut entry = FileEntry::new(
+            file_key.clone(),
+            file_hash.to_string(),
+            pending.transfer_id.clone(),
+            pending.file_path,
+            pending.file_name,
+            pending.file_size,
+            pending.user_params,
+        );
+        entry.upload_id = Some(upload_id);
+        entry.part_size = Some(part_size);
+        entry.total_parts = total_parts;
+        self.hash_to_key.insert(file_hash.to_string(), file_key.clone());
+        self.files.insert(file_key.clone(), entry);
+        let transfer = self
+            .transfers
+            .entry(pending.transfer_id)
+            .or_insert_with_key(|id| TransferEntry {
+                transfer_id: id.clone(),
+                file_keys: Vec::new(),
+            });
+        transfer.file_keys.push(file_key);
+        true
+    }
+
     // ------------------------------------------------------------------
     // Queue management
     // ------------------------------------------------------------------
@@ -320,7 +448,10 @@ impl Session {
             if let Some(entry) = self.files.get(key) {
                 if matches!(
                     entry.state,
-                    UploadState::NotStarted | UploadState::Failed | UploadState::Paused
+                    UploadState::NotStarted
+                        | UploadState::Initialized
+                        | UploadState::Failed
+                        | UploadState::Paused
                 ) {
                     return Some(key.clone());
                 }
@@ -385,21 +516,39 @@ impl Session {
     }
 
     pub fn recompute_global_state(&mut self) {
-        if self.files.is_empty() {
+        let has_pending = !self.pending_files.is_empty();
+        if self.files.is_empty() && !has_pending {
             self.global_state = GlobalUploaderState::NotStarted;
             return;
         }
-        let states: Vec<_> = self.files.values().map(|f| f.state.clone()).collect();
-        if states.iter().all(|s| *s == UploadState::Completed) {
+        // Files that need re-provision cannot actually run — treat them as Paused.
+        let states: Vec<_> = self
+            .files
+            .values()
+            .map(|f| {
+                if self.files_needing_provision.contains(&f.file_hash) {
+                    UploadState::Paused
+                } else {
+                    f.state.clone()
+                }
+            })
+            .collect();
+        if !has_pending && states.iter().all(|s| *s == UploadState::Completed) {
             self.global_state = GlobalUploaderState::Completed;
         } else if states.iter().any(|s| *s == UploadState::Running) {
             self.global_state = GlobalUploaderState::Running;
         } else if states.iter().any(|s| *s == UploadState::Failed) {
             self.global_state = GlobalUploaderState::Failed;
         } else if states.iter().any(|s| *s == UploadState::Paused)
-            && states
-                .iter()
-                .all(|s| matches!(s, UploadState::Paused | UploadState::Completed | UploadState::NotStarted))
+            && states.iter().all(|s| {
+                matches!(
+                    s,
+                    UploadState::Paused
+                        | UploadState::Completed
+                        | UploadState::NotStarted
+                        | UploadState::Initialized
+                )
+            })
         {
             self.global_state = GlobalUploaderState::Paused;
         } else {
@@ -414,6 +563,7 @@ impl Session {
     pub fn cancel_file(&mut self, file_key: &str) {
         if let Some(entry) = self.files.remove(file_key) {
             self.hash_to_key.remove(&entry.file_hash);
+            self.files_needing_provision.remove(&entry.file_hash);
         }
         for transfer in self.transfers.values_mut() {
             transfer.file_keys.retain(|k| k != file_key);
@@ -421,12 +571,27 @@ impl Session {
         self.recompute_global_state();
     }
 
+    pub fn cancel_file_by_hash(&mut self, file_hash: &str) {
+        self.pending_files.remove(file_hash);
+        self.files_needing_provision.remove(file_hash);
+        if let Some(file_key) = self.hash_to_key.remove(file_hash) {
+            self.files.remove(&file_key);
+            for transfer in self.transfers.values_mut() {
+                transfer.file_keys.retain(|k| k != &file_key);
+            }
+        }
+        self.recompute_global_state();
+    }
+
     pub fn cancel_transfer(&mut self, transfer_id: &str) {
+        self.pending_files
+            .retain(|_, p| p.transfer_id != transfer_id);
         if let Some(transfer) = self.transfers.get(transfer_id) {
             let keys: Vec<String> = transfer.file_keys.clone();
             for key in keys {
                 if let Some(entry) = self.files.remove(&key) {
                     self.hash_to_key.remove(&entry.file_hash);
+                    self.files_needing_provision.remove(&entry.file_hash);
                 }
             }
         }
@@ -441,6 +606,8 @@ impl Session {
         self.files.clear();
         self.hash_to_key.clear();
         self.transfers.clear();
+        self.pending_files.clear();
+        self.files_needing_provision.clear();
         self.current_transfer_id = None;
         self.global_state = GlobalUploaderState::NotStarted;
     }
@@ -463,14 +630,17 @@ impl Session {
         transfer_id: Option<&str>,
         file_key: Option<&str>,
     ) -> Vec<FileProgress> {
-        self.files
+        let mut result: Vec<FileProgress> = self
+            .files
             .values()
             .filter(|e| {
                 transfer_id.map_or(true, |t| e.transfer_id == t)
                     && file_key.map_or(true, |k| e.file_key == k)
             })
             .map(|e| FileProgress {
-                file_key: e.file_key.clone(),
+                file_key: Some(e.file_key.clone()),
+                file_name: e.file_name.clone(),
+                file_hash: e.file_hash.clone(),
                 transfer_id: e.transfer_id.clone(),
                 total_bytes: e.total_bytes,
                 uploaded_bytes: e.uploaded_bytes,
@@ -479,7 +649,30 @@ impl Session {
                 percentage: e.percentage(),
                 state: e.state.clone(),
             })
-            .collect()
+            .collect();
+
+        // Include pending (pre-registered, start_api not yet called) entries.
+        // Only included when not filtering by file_key (pending files have none).
+        if file_key.is_none() {
+            for p in self.pending_files.values() {
+                if transfer_id.map_or(true, |t| p.transfer_id == t) {
+                    result.push(FileProgress {
+                        file_key: None,
+                        file_name: p.file_name.clone(),
+                        file_hash: p.file_hash.clone(),
+                        transfer_id: p.transfer_id.clone(),
+                        total_bytes: p.file_size,
+                        uploaded_bytes: 0,
+                        completed_parts: 0,
+                        total_parts: 0,
+                        percentage: 0.0,
+                        state: UploadState::NotStarted,
+                    });
+                }
+            }
+        }
+
+        result
     }
 
     pub fn get_aggregate_progress(&self, transfer_id: Option<&str>) -> AggregateProgress {
@@ -489,9 +682,16 @@ impl Session {
             .filter(|e| transfer_id.map_or(true, |t| e.transfer_id == t))
             .collect();
 
-        let total_size: u64 = entries.iter().map(|e| e.total_bytes).sum();
+        let pending_entries: Vec<&PendingFileEntry> = self
+            .pending_files
+            .values()
+            .filter(|p| transfer_id.map_or(true, |t| p.transfer_id == t))
+            .collect();
+
+        let total_size: u64 = entries.iter().map(|e| e.total_bytes).sum::<u64>()
+            + pending_entries.iter().map(|p| p.file_size).sum::<u64>();
         let raw_uploaded_size: u64 = entries.iter().map(|e| e.uploaded_bytes).sum();
-        let total_files = entries.len() as u32;
+        let total_files = entries.len() as u32 + pending_entries.len() as u32;
         let completed_files = entries
             .iter()
             .filter(|e| e.state == UploadState::Completed)
@@ -507,7 +707,10 @@ impl Session {
                         self.files
                             .get(k)
                             .map_or(false, |e| e.state == UploadState::Completed)
-                    })
+                    }) && !self
+                        .pending_files
+                        .values()
+                        .any(|p| p.transfer_id == t.transfer_id)
                 })
                 .count() as u32;
             (Some(total), Some(completed))
@@ -515,24 +718,29 @@ impl Session {
             (None, None)
         };
 
-        let state = if entries.is_empty() {
+        let has_pending = !pending_entries.is_empty();
+        let state = if entries.is_empty() && !has_pending {
             GlobalUploaderState::NotStarted
-        } else if entries.iter().all(|e| e.state == UploadState::Completed) {
+        } else if !has_pending && entries.iter().all(|e| e.state == UploadState::Completed) {
             GlobalUploaderState::Completed
-        } else if entries.iter().any(|e| e.state == UploadState::Running) {
+        } else if entries
+            .iter()
+            .filter(|e| !self.files_needing_provision.contains(&e.file_hash))
+            .any(|e| e.state == UploadState::Running)
+        {
             GlobalUploaderState::Running
         } else if entries.iter().any(|e| e.state == UploadState::Failed) {
             GlobalUploaderState::Failed
         } else if entries
             .iter()
-            .all(|e| matches!(e.state, UploadState::Paused | UploadState::Completed))
+            .all(|e| matches!(e.state, UploadState::Paused | UploadState::Completed | UploadState::NotStarted | UploadState::Initialized))
+            && entries.iter().any(|e| e.state == UploadState::Paused)
         {
             GlobalUploaderState::Paused
         } else {
             self.global_state.clone()
         };
 
-        // When all files are done, ensure percentage and uploaded_size reflect 100%.
         let (percentage, uploaded_size) = if state == GlobalUploaderState::Completed {
             (100.0, total_size)
         } else {
@@ -643,9 +851,10 @@ pub fn register_store(store: impl SessionStore + 'static) {
 pub fn session() -> MutexGuard<'static, Session> {
     SESSION
         .get_or_init(|| {
-            let initial = STORE.get()
+            let mut initial = STORE.get()
                 .and_then(|s| s.load())
                 .unwrap_or_else(Session::new);
+            initial.recompute_needs_provision();
             Mutex::new(initial)
         })
         .lock()
@@ -662,6 +871,11 @@ pub fn persist_session() {
 
 pub fn cancel_file(key: &str) {
     session().cancel_file(key);
+    persist_session();
+}
+
+pub fn cancel_file_by_hash(hash: &str) {
+    session().cancel_file_by_hash(hash);
     persist_session();
 }
 

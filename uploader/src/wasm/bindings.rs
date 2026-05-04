@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use wasm_bindgen::prelude::*;
 
-use crate::core::session::{self, register_store, UploadState};
-use crate::wasm::api::WasmApiClient;
+use crate::core::runtime;
+use crate::core::session::{self, register_store};
 use crate::wasm::progress as wasmProgress;
 use crate::wasm::store::WasmSessionStore;
-use crate::wasm::{FILE_QUEUE, PAUSE_REQUESTED, QUEUE_RUNNING};
+use crate::wasm::{FILE_QUEUE, PAUSE_REQUESTED, PENDING_WASM_FILES, QUEUE_RUNNING};
 
 #[wasm_bindgen(start)]
 pub fn wasm_start() {
@@ -16,7 +16,8 @@ pub fn wasm_start() {
 
 #[wasm_bindgen]
 pub async fn wasm_load_session() {
-    if let Some(s) = crate::wasm::store::load().await {
+    if let Some(mut s) = crate::wasm::store::load().await {
+        s.recompute_needs_provision();
         *session::session() = s;
     }
 }
@@ -42,16 +43,57 @@ pub async fn upload_file(
     user_params_js: JsValue,
 ) -> Result<JsValue, JsValue> {
     let user_params = parse_user_params(user_params_js);
-    super::start_and_enqueue(file, transfer_id, user_params)
+    let hash = super::start_and_enqueue(file, transfer_id, user_params)
         .await
-        .map(|key| JsValue::from_str(&key))
-        .map_err(|e| JsValue::from_str(&format!("Upload failed: {}", e)))
+        .map_err(|e| JsValue::from_str(&format!("Upload failed: {}", e)))?;
+
+    // If the queue is already running, process the newly pending file immediately
+    // so it is enqueued without waiting for an explicit resume() call.
+    let is_running = QUEUE_RUNNING.with(|r| *r.borrow())
+        && !PAUSE_REQUESTED.with(|p| *p.borrow());
+    if is_running {
+        crate::wasm::process_pending_files();
+    }
+
+    Ok(JsValue::from_str(&hash))
 }
 
 #[wasm_bindgen]
-pub fn wasm_cancel_file(file_key: String) {
-    FILE_QUEUE.with(|q| q.borrow_mut().retain(|e| e.file_key != file_key));
-    session::cancel_file(&file_key);
+pub fn wasm_cancel_file(file_hash: String) {
+    let (file_key, file_name, transfer_id, total_bytes, uploaded_bytes) = {
+        let sess = session::session();
+        if let Some(p) = sess.pending_files.get(&file_hash) {
+            (String::new(), p.file_name.clone(), p.transfer_id.clone(), 0u64, 0u64)
+        } else if let Some(key) = sess.hash_to_key.get(&file_hash) {
+            let key = key.clone();
+            if let Some(e) = sess.files.get(&key) {
+                (key, e.file_name.clone(), e.transfer_id.clone(), e.total_bytes, e.uploaded_bytes)
+            } else {
+                (key, String::new(), String::new(), 0, 0)
+            }
+        } else {
+            (String::new(), String::new(), String::new(), 0, 0)
+        }
+    };
+
+    if !file_key.is_empty() {
+        FILE_QUEUE.with(|q| q.borrow_mut().retain(|e| e.file_key != file_key));
+        wasmProgress::progress_manager().remove(&file_key);
+    }
+    PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
+    session::cancel_file_by_hash(&file_hash);
+
+    if !transfer_id.is_empty() {
+        runtime::notify_cancelled_file(
+            wasmProgress::progress_manager(),
+            &file_key,
+            &file_name,
+            &file_hash,
+            &transfer_id,
+            total_bytes,
+            uploaded_bytes,
+        );
+    }
 }
 
 #[wasm_bindgen]
@@ -71,6 +113,7 @@ pub fn wasm_cancel_transfer(transfer_id: String) {
 #[wasm_bindgen]
 pub fn wasm_cancel_all() {
     FILE_QUEUE.with(|q| q.borrow_mut().clear());
+    PENDING_WASM_FILES.with(|m| m.borrow_mut().clear());
     PAUSE_REQUESTED.with(|p| *p.borrow_mut() = false);
     QUEUE_RUNNING.with(|r| *r.borrow_mut() = false);
     session::clear_session();
@@ -84,9 +127,12 @@ pub fn wasm_pause_all() {
 }
 
 #[wasm_bindgen]
-pub fn wasm_resume_all() {
-    session::resume_all();
+pub fn wasm_resume_all() -> Result<(), JsValue> {
+    runtime::resume_all(wasmProgress::progress_manager())
+        .map_err(|e| JsValue::from_str(&e))?;
+    crate::wasm::process_pending_files();
     crate::wasm::resume_queue();
+    Ok(())
 }
 
 #[wasm_bindgen]

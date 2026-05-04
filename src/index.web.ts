@@ -5,6 +5,7 @@ import type {
   UploadProgress,
   WebS3BgUploaderAPI,
 } from './specs/s3-bg-uploader.types'
+import { S3BgUploaderResumeError, S3BgUploaderDuplicateFileError } from './specs/s3-bg-uploader.types'
 import { UPLOADER_JS_CODE, UPLOADER_WASM_BASE64 } from './web/wasm-assets'
 
 // ---------------------------------------------------------------------------
@@ -80,7 +81,7 @@ onmessage = async function (e) {
     }
 
     case 'cancelFile': {
-      wasm.wasm_cancel_file(payload.fileKey);
+      wasm.wasm_cancel_file(payload.fileHash);
       postMessage({ type: 'ack', requestId });
       break;
     }
@@ -104,8 +105,12 @@ onmessage = async function (e) {
     }
 
     case 'resume': {
-      wasm.wasm_resume_all();
-      postMessage({ type: 'ack', requestId });
+      try {
+        wasm.wasm_resume_all();
+        postMessage({ type: 'ack', requestId });
+      } catch (err) {
+        postMessage({ type: 'result', requestId, ok: false, error: String(err) });
+      }
       break;
     }
 
@@ -225,11 +230,17 @@ export const S3BgUploader: WebS3BgUploaderAPI = {
     if (typeof file === 'string') {
       throw new TypeError('S3BgUploader: On web platform, uploadFile requires a File value, not a string path.')
     }
-    return sendRequest('uploadFile', { file, transferId, userParams: userParams ?? null }) as Promise<string>
+    try {
+      return await sendRequest('uploadFile', { file, transferId, userParams: userParams ?? null }) as Promise<string>
+    } catch (e: unknown) {
+      const msg = (e as Error)?.message ?? String(e)
+      if (msg.includes('DUPLICATE_FILE')) throw new S3BgUploaderDuplicateFileError(msg)
+      throw e
+    }
   },
 
-  cancelFile(fileKey: string): void {
-    sendRequest('cancelFile', { fileKey })
+  cancelFile(fileHash: string): void {
+    sendRequest('cancelFile', { fileHash })
   },
 
   cancelTransfer(transferId: string): void {
@@ -244,8 +255,12 @@ export const S3BgUploader: WebS3BgUploaderAPI = {
     sendRequest('pause')
   },
 
-  resume(): void {
-    sendRequest('resume')
+  async resume(): Promise<void> {
+    try {
+      await sendRequest('resume')
+    } catch (e: unknown) {
+      throw new S3BgUploaderResumeError((e as Error)?.message ?? String(e))
+    }
   },
 
   async getProgress(transferId?: string, fileKey?: string): Promise<UploadProgress[]> {

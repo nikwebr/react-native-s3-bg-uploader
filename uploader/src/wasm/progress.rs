@@ -58,7 +58,11 @@ pub fn progress_manager() -> &'static ProgressManager<WasmProgressNotifier> {
 
 pub fn file_progress_to_js(fp: &FileProgress) -> JsValue {
     let obj = js_sys::Object::new();
-    js_sys::Reflect::set(&obj, &"fileKey".into(), &JsValue::from_str(&fp.file_key)).ok();
+    if let Some(ref key) = fp.file_key {
+        js_sys::Reflect::set(&obj, &"fileKey".into(), &JsValue::from_str(key)).ok();
+    }
+    js_sys::Reflect::set(&obj, &"fileName".into(), &JsValue::from_str(&fp.file_name)).ok();
+    js_sys::Reflect::set(&obj, &"fileHash".into(), &JsValue::from_str(&fp.file_hash)).ok();
     js_sys::Reflect::set(
         &obj,
         &"transferId".into(),

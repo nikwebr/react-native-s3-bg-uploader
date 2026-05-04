@@ -22,14 +22,18 @@ use crate::core::{clean_etag, MAX_RETRIES};
 
 pub(super) fn run_upload(file_key: &str, raw_fd: RawFd) {
     use crate::core::session;
-    if !session::session().files.contains_key(file_key) {
-        unsafe { libc::close(raw_fd) };
-        return;
-    }
+    let run_version = match session::session().files.get(file_key) {
+        Some(e) => e.run_version,
+        None => {
+            unsafe { libc::close(raw_fd) };
+            return;
+        }
+    };
 
     let backend = AndroidUploadBackend {
         file_key: file_key.to_string(),
         raw_fd,
+        run_version,
         api: NativeApiClient {
             network: AndroidNetwork {
                 client: build_client(),
@@ -39,27 +43,38 @@ pub(super) fn run_upload(file_key: &str, raw_fd: RawFd) {
 
     let outcome = pollster::block_on(upload_orchestrator::run_upload(&backend));
 
-    if matches!(outcome, UploadOutcome::Paused) {
-        let should_reenqueue = session::session()
-            .files
-            .get(file_key)
-            .map(|e| matches!(e.state, UploadState::Paused | UploadState::NotStarted))
-            .unwrap_or(false);
-        if should_reenqueue {
-            // Re-enqueue at the front so this partially-uploaded file resumes before
-            // not-yet-started files that are still waiting in the queue.
-            enqueue_front(file_key.to_string(), raw_fd);
-        } else {
+    match outcome {
+        UploadOutcome::Paused => {
+            let should_reenqueue = session::session()
+                .files
+                .get(file_key)
+                .map(|e| matches!(e.state, UploadState::Paused | UploadState::NotStarted | UploadState::Initialized))
+                .unwrap_or(false);
+            if should_reenqueue {
+                // Re-enqueue at the front so this partially-uploaded file resumes before
+                // not-yet-started files that are still waiting in the queue.
+                enqueue_front(file_key.to_string(), raw_fd);
+            } else {
+                unsafe { libc::close(raw_fd) };
+            }
+        }
+        UploadOutcome::Failed(_) => {
+            // Keep the fd alive so nativeResumeAll can re-enqueue this file for retry.
+            crate::android::FAILED_FDS
+                .lock()
+                .unwrap()
+                .insert(file_key.to_string(), raw_fd);
+        }
+        UploadOutcome::Completed => {
             unsafe { libc::close(raw_fd) };
         }
-    } else {
-        unsafe { libc::close(raw_fd) };
     }
 }
 
 struct AndroidUploadBackend {
     file_key: String,
     raw_fd: RawFd,
+    run_version: u64,
     api: NativeApiClient<AndroidNetwork>,
 }
 
@@ -79,6 +94,10 @@ impl UploadBackend for AndroidUploadBackend {
         PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn is_current_run(&self) -> bool {
+        session::is_current_run(&self.file_key, self.run_version)
+    }
+
     fn total_bytes(&self) -> Result<u64, String> {
         let file = unsafe { File::from_raw_fd(dup_fd(self.raw_fd).map_err(|e| e.to_string())?) };
         Ok(file.metadata().map_err(|e| e.to_string())?.len())
@@ -93,6 +112,7 @@ impl UploadBackend for AndroidUploadBackend {
             raw_fd: self.raw_fd,
             file_key: self.file_key.clone(),
             upload_id: prepared.upload_id.clone(),
+            run_version: self.run_version,
             network: self.api.network.clone(),
         });
         upload_engine::run_blocking_upload(
@@ -123,12 +143,17 @@ struct AndroidAdapter {
     raw_fd: RawFd,
     file_key: String,
     upload_id: String,
+    run_version: u64,
     network: AndroidNetwork,
 }
 
 impl BlockingPlatformAdapter for AndroidAdapter {
     fn is_paused(&self) -> bool {
         PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn is_current_run(&self) -> bool {
+        session::is_current_run(&self.file_key, self.run_version)
     }
 
     fn fetch_urls(&self, parts: &[u32]) -> Result<std::collections::HashMap<u32, String>, String> {
@@ -142,6 +167,7 @@ impl BlockingPlatformAdapter for AndroidAdapter {
         Ok(Box::new(AndroidWorker {
             client: build_client(),
             raw_fd: self.raw_fd,
+            run_version: self.run_version,
         }))
     }
 
@@ -161,6 +187,7 @@ impl BlockingPlatformAdapter for AndroidAdapter {
 struct AndroidWorker {
     client: reqwest::blocking::Client,
     raw_fd: RawFd,
+    run_version: u64,
 }
 
 impl BlockingWorker for AndroidWorker {
@@ -198,7 +225,7 @@ impl BlockingWorker for AndroidWorker {
         part_number: u32,
         file_key: &str,
     ) -> Result<String, String> {
-        upload_chunk_with_retry(&self.client, url, data, part_number, file_key)
+        upload_chunk_with_retry(&self.client, url, data, part_number, file_key, self.run_version)
             .map_err(|e| e.to_string())
     }
 }
@@ -209,6 +236,7 @@ fn upload_chunk_with_retry(
     data: &[u8],
     part_number: u32,
     file_key: &str,
+    run_version: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let chunk_size = data.len() as u64;
     let policy = crate::core::retry::RetryPolicy::new(MAX_RETRIES);
@@ -220,6 +248,9 @@ fn upload_chunk_with_retry(
             if crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err("paused".to_string());
             }
+            if !session::is_current_run(&file_key, run_version) {
+                return Err("stale run".to_string());
+            }
 
             runtime::update_in_flight(
                 androidProgress::progress_manager(),
@@ -228,7 +259,7 @@ fn upload_chunk_with_retry(
                 0,
             );
 
-            let progress_reader = ProgressReader::new(data.to_vec(), file_key.clone(), part_number);
+            let progress_reader = ProgressReader::new(data.to_vec(), file_key.clone(), run_version, part_number);
             let response = match client
                 .put(url)
                 .header("Content-Length", chunk_size.to_string())
@@ -240,6 +271,9 @@ fn upload_chunk_with_retry(
                     if crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err("paused".to_string());
                     }
+                    if !session::is_current_run(&file_key, run_version) {
+                        return Err("stale run".to_string());
+                    }
                     return Err(format!("{:?}", e));
                 }
             };
@@ -250,6 +284,13 @@ fn upload_chunk_with_retry(
                 .and_then(|v| v.to_str().ok())
                 .map(clean_etag)
                 .ok_or_else(|| "No ETag in response".to_string())?;
+
+            // Check staleness after a successful response — a pause+resume may have
+            // started a new run while this request was in-flight. Without this check
+            // the old worker would double-count the part in the ProgressManager.
+            if !session::is_current_run(&file_key, run_version) {
+                return Err("stale run".to_string());
+            }
 
             runtime::complete_chunk(
                 androidProgress::progress_manager(),
