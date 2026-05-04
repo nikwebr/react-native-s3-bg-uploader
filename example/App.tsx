@@ -145,7 +145,7 @@ export default function App(): React.JSX.Element {
   const runUpload = useCallback(
     async (id: string, fileOrPath: File | string, transferId: string) => {
       try {
-        const fileHash = await (S3BgUploader as any).uploadFile(fileOrPath, transferId);
+        const fileHash = await S3BgUploader.uploadFile(fileOrPath, transferId);
         setQueue((prev) => {
           // Remove any other entry with the same hash (same file re-provided after restart).
           // Must use f.id === id guard so we keep the current placeholder even if the

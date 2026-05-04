@@ -118,7 +118,7 @@ interface BaseUploaderAPI {
 
 export interface S3BgUploaderAPI extends BaseUploaderAPI {
   /**
-   * Enqueue a file for upload.
+   * Enqueue a file for upload. Can be called in any `GlobalUploaderState`.
    * 
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
    * @param userParams these params are added to the `startUpload()` backend call
@@ -147,7 +147,7 @@ export interface S3BgUploaderAPI extends BaseUploaderAPI {
 
 export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
   /**
-   * Enqueue a file for upload.
+   * Enqueue a file for upload. Can be called in any `GlobalUploaderState`.
    * 
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
    * @param userParams these params are added to the `startUpload()` backend call
@@ -176,7 +176,7 @@ export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
 
 export interface WebS3BgUploaderAPI extends BaseUploaderAPI {
   /**
-   * Enqueue a file for upload.
+   * Enqueue a file for upload. Can be called in any `GlobalUploaderState`.
    * 
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
    * @param userParams these params are added to the `startUpload()` backend call
