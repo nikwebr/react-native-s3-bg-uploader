@@ -45,11 +45,11 @@
   "workspaces": [
     "example"
   ],
-  "repository": "https://github.com/niklasweber/react-native-s3-bg-uploader.git",
+  "repository": "https://github.com/nikwebr/react-native-s3-bg-uploader.git",
   "author": "Niklas Weber",
   "license": "MIT",
-  "bugs": "https://github.com/niklasweber/react-native-s3-bg-uploader/issues",
-  "homepage": "https://github.com/niklasweber/react-native-s3-bg-uploader#readme",
+  "bugs": "https://github.com/nikwebr/react-native-s3-bg-uploader/issues",
+  "homepage": "https://github.com/nikwebr/react-native-s3-bg-uploader#readme",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
