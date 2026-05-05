@@ -45,7 +45,10 @@
   "workspaces": [
     "example"
   ],
-  "repository": "https://github.com/nikwebr/react-native-s3-bg-uploader.git",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nikwebr/react-native-s3-bg-uploader.git"
+  },
   "author": "Niklas Weber",
   "license": "MIT",
   "bugs": "https://github.com/nikwebr/react-native-s3-bg-uploader/issues",
