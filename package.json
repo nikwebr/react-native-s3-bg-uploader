@@ -16,7 +16,7 @@
     "build:ios": "cd uploader && ./scripts/build.sh ios && cd .. && npm run native-codegen",
     "build:wasm": "cd uploader && ./scripts/build.sh wasm",
     "build:ts": "npm run typecheck && bob build",
-    "build": "npm run build:ts && npm run build:ios && npm run build:wasm",
+    "build": "npm run build:ts && npm run build:ios && npm run build:android && npm run build:wasm",
     "example:ios": "npm run build:ios && cd example/ios && npm run pod && npm run ios",
     "example:android": "npm run build:android && cd example && npm run android",
     "example:web": "npm run build:wasm && cd example && npm run web"
@@ -37,11 +37,7 @@
     "android/gradle.properties",
     "android/CMakeLists.txt",
     "android/src",
-    "ios/**/*.h",
-    "ios/**/*.m",
-    "ios/**/*.mm",
-    "ios/**/*.cpp",
-    "ios/**/*.swift",
+    "ios/**",
     "app.plugin.js",
     "*.podspec",
     "README.md"

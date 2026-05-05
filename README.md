@@ -39,9 +39,12 @@ npm run build:wasm
 
 ### Additional requirements
 - [rustup](https://rust-lang.org/tools/install/)
+- **iOS**: Xcode with Command Line Tools (`xcode-select --install`)
+- **Android**: Android SDK with NDK — set `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT`, install [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) (`cargo install cargo-ndk`)
 
-### Example
+### Running the Example App
 ```bash
+npm install
 npm run example:ios
 npm run example:android
 npm run example:web

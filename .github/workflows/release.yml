@@ -13,7 +13,7 @@ concurrency:
 jobs:
   release:
     name: Release
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     permissions:
       contents: write
       issues: write
@@ -39,6 +39,17 @@ jobs:
 
       - name: Install npm dependencies (bun)
         run: bun install
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
 
       - name: Build lib
         run: bun run build
