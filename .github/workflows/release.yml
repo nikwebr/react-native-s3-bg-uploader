@@ -4,7 +4,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  issues: write
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,10 +22,18 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
+      - name: Generate bot app token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_SEMANTIC_RELEASE_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_SEMANTIC_RELEASE_PRIVATE_KEY }}
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          token: ${{ steps.generate_token.outputs.token }}
           fetch-depth: 0
+          persist-credentials: false
       - name: Setup Bun.js
         uses: oven-sh/setup-bun@v2
         with:
@@ -36,6 +46,13 @@ jobs:
           key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb') }}
           restore-keys: |
             ${{ runner.os }}-bun-
+
+      - name: Get bot user ID
+        id: bot-user-id
+        run: |
+          echo "user-id=$(gh api "/users/${{ steps.generate_token.outputs.app-slug }}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
 
       - name: Install npm dependencies (bun)
         run: bun install
@@ -54,13 +71,13 @@ jobs:
       - name: Build lib
         run: bun run build
 
-      - name: Release
+      - name: Publish package
+        run: bun release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
-          GIT_AUTHOR_NAME: ${{ github.actor }}
-          GIT_AUTHOR_EMAIL: '${{ github.actor }}@users.noreply.github.com'
+          GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
+          GIT_AUTHOR_EMAIL: "${{ steps.bot-user-id.outputs.user-id }}+${{ steps.generate_token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          GIT_COMMITTER_EMAIL: "${{ steps.bot-user-id.outputs.user-id }}+${{ steps.generate_token.outputs.app-slug }}[bot]@users.noreply.github.com"
           GIT_COMMITTER_NAME: ${{ github.actor }}
-          GIT_COMMITTER_EMAIL: '${{ github.actor }}@users.noreply.github.com'
-        run: bun release
+          GIT_AUTHOR_NAME: ${{ github.actor }}
