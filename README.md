@@ -1,10 +1,11 @@
 # react-native-s3-bg-uploader
 
-react-native-s3-bg-uploader is a react native package built with Nitro
-
 [![Version](https://img.shields.io/npm/v/react-native-s3-bg-uploader.svg)](https://www.npmjs.com/package/react-native-s3-bg-uploader)
 [![Downloads](https://img.shields.io/npm/dm/react-native-s3-bg-uploader.svg)](https://www.npmjs.com/package/react-native-s3-bg-uploader)
 [![License](https://img.shields.io/npm/l/react-native-s3-bg-uploader.svg)](https://github.com/nikwebr/react-native-s3-bg-uploader/LICENSE)
+
+Seamless file uploads that continue even when your app goes to background. Pausable, resumable, and built for the S3 API. 
+react-native-s3-bg-uploader is a react native package built with Nitro and Rust. It is compiled to native modules on iOS and Android, and to WebAssembly for the web.
 
 ## Requirements
 
