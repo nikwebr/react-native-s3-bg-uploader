@@ -1,3 +1,9 @@
+## [1.1.1](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.1.0...v1.1.1) (2026-05-06)
+
+### 🐛 Bug Fixes
+
+* minor improvements: Readme, package.json & example app setup ([ecc7d6e](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/ecc7d6e096c7a5a0e8d4c58e9249e34f9bbcc4bd))
+
 ## [1.1.0](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.0.0...v1.1.0) (2026-05-06)
 
 ### ✨ Features
