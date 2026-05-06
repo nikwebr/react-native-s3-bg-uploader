@@ -4,6 +4,16 @@
 
 * **pencil:** initial release ([9f5c21e](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/9f5c21e787b0a018f1263371e1ddbdeb4c322b3c))
 
+### 🛠️ Other changes
+
+* **release:** 1.1.0 [skip ci] ([1f447e3](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/1f447e3c6452c491112917bd39592e45a8391f6e))
+
+## [1.1.0](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.0.0...v1.1.0) (2026-05-06)
+
+### ✨ Features
+
+* **pencil:** initial release ([9f5c21e](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/9f5c21e787b0a018f1263371e1ddbdeb4c322b3c))
+
 ## 1.0.0 (2026-05-05)
 
 ### ✨ Features
