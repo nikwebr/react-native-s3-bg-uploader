@@ -28,7 +28,7 @@ jobs:
     steps:
       - name: Generate bot app token
         id: generate_token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASE_BOT_SEMANTIC_RELEASE_ID }}
           private-key: ${{ secrets.RELEASE_BOT_SEMANTIC_RELEASE_PRIVATE_KEY }}
