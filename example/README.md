@@ -12,6 +12,23 @@ npm run example:android
 npm run example:web
 ```
 
+If you instead want to run the example application with a prebuild version of the library, do the following:
+Inside example, run
+```sh
+npm install react-native-s3-bg-uploader
+npm start
+
+npm run android
+
+npm run web
+
+bundle install
+cd ios
+pod install
+cd ..
+npm run ios
+```
+
 # Troubleshooting
 
 If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
