@@ -54,11 +54,6 @@ jobs:
         run: bun install
       - name: Generate iOS native bindings
         run: bun run build:ios
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.2'
-          bundler-cache: true
-          working-directory: example/ios
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
@@ -66,7 +61,7 @@ jobs:
           build-mode: manual
       - name: Install CocoaPods
         working-directory: example/ios
-        run: bundle exec pod install
+        run: pod install
       - name: Build
         working-directory: example/ios
         run: |
