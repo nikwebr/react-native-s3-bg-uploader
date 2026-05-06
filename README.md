@@ -4,6 +4,8 @@
 [![Downloads](https://img.shields.io/npm/dm/react-native-s3-bg-uploader.svg)](https://www.npmjs.com/package/react-native-s3-bg-uploader)
 [![License](https://img.shields.io/npm/l/react-native-s3-bg-uploader.svg)](https://github.com/nikwebr/react-native-s3-bg-uploader/LICENSE)
 
+<strong>📖 [Read the Documentation](https://uploader.ysendit.com/docs)</strong>
+
 Seamless file uploads that continue even when your app goes to background. Pausable, resumable, and built for the S3 API. 
 react-native-s3-bg-uploader is a react native package built with Nitro and Rust. It is compiled to native modules on iOS and Android, and to WebAssembly for the web.
 
@@ -25,6 +27,36 @@ react-native-s3-bg-uploader is a react native package built with Nitro and Rust.
 ```bash
 npm install react-native-s3-bg-uploader react-native-nitro-modules
 ```
+
+## Usage
+
+```ts
+import { S3BgUploader } from 'react-native-s3-bg-uploader'
+
+// Configure backend endpoints once (e.g. in app startup)
+S3BgUploader.setConfig(
+  'https://api.example.com/upload/startUpload',
+  'https://api.example.com/upload/getUploadUrls',
+  'https://api.example.com/upload/completeUpload',
+)
+
+// Track progress
+S3BgUploader.setProgressCallback((file, session, transfer) => {
+  console.log(`${transfer.percentage}% — ${file.fileName}`)
+})
+
+// Enqueue files and start
+const transferId = 'my-transfer'
+await S3BgUploader.uploadFile('/path/to/file.mp4', transferId, { userId: '42' })
+await S3BgUploader.resume()
+
+// Pause / resume / cancel
+S3BgUploader.pause()
+await S3BgUploader.resume()
+S3BgUploader.cancel()
+```
+
+For the full API reference see the [documentation](https://uploader.ysendit.com/docs).
 
 ## Building
 For native platforms:
