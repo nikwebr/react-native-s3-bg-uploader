@@ -333,10 +333,10 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     // Progress queries
     // -------------------------------------------------------------------------
 
-    func getProgress(transferId: String?, fileKey: String?) throws -> [UploadProgress] {
+    func getProgress(transferId: String?, fileHash: String?) throws -> [UploadProgress] {
         let ptr: UnsafeMutablePointer<CChar>? = withOptionalCString(transferId) { tidPtr in
-            withOptionalCString(fileKey) { fkPtr in
-                get_progress_json(tidPtr, fkPtr)
+            withOptionalCString(fileHash) { fhPtr in
+                get_progress_json(tidPtr, fhPtr)
             }
         }
         guard let ptr = ptr else { return [] }

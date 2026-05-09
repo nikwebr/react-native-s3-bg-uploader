@@ -1,3 +1,15 @@
+## [1.1.2](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.1.1...v1.1.2) (2026-05-09)
+
+### 🐛 Bug Fixes
+
+* getProgress now takes fileHash as a parameter instead of fileKey, translation for example app, adapted readme ([02668ac](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/02668acebe4a33debdba6d7fd80c1f9d9ae18465))
+
+## [1.1.1](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.1.0...v1.1.1) (2026-05-06)
+
+### 🐛 Bug Fixes
+
+* minor improvements: Readme, package.json & example app setup ([ecc7d6e](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/ecc7d6e096c7a5a0e8d4c58e9249e34f9bbcc4bd))
+
 ## [1.1.0](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.0.0...v1.1.0) (2026-05-06)
 
 ### ✨ Features

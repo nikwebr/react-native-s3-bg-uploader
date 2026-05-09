@@ -226,20 +226,20 @@ pub extern "C" fn resume_all() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn get_progress_json(
     transfer_id: *const c_char,
-    file_key: *const c_char,
+    file_hash: *const c_char,
 ) -> *mut c_char {
     let tid = if transfer_id.is_null() {
         None
     } else {
         unsafe { CStr::from_ptr(transfer_id) }.to_str().ok()
     };
-    let fk = if file_key.is_null() {
+    let fh = if file_hash.is_null() {
         None
     } else {
-        unsafe { CStr::from_ptr(file_key) }.to_str().ok()
+        unsafe { CStr::from_ptr(file_hash) }.to_str().ok()
     };
 
-    let progress = session::session().get_progress(tid, fk);
+    let progress = session::session().get_progress(tid, fh);
     let json: Vec<serde_json::Value> = progress.iter().map(|p| p.to_json()).collect();
     let s = serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string());
     CString::new(s)
