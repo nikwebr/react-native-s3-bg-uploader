@@ -7,7 +7,7 @@
 <strong>📖 [Read the Documentation](https://uploader.ysendit.com/docs)</strong>
 
 Seamless file uploads that continue even when your app goes to background. Pausable, resumable, and built for the S3 API. 
-react-native-s3-bg-uploader is a react native package built with Nitro and Rust. It is compiled to native modules on iOS and Android, and to WebAssembly for the web.
+react-native-s3-bg-uploader is a react native package built with Nitro and Rust. It is compiled to native modules on iOS and Android, and to WebAssembly for the web. On iOS it uses a BGContinuedProcessingTask and on Android a foreground service.
 
 ## Requirements
 
