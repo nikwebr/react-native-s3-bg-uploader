@@ -1,44 +1,62 @@
 use std::ffi::CString;
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::os::raw::c_char;
 use std::sync::{Mutex, OnceLock};
-use crate::core::progress::{ProgressManager, ProgressNotifier, UploadProgress};
-use crate::ios::iosProgress;
 
+use crate::core::progress::{ProgressManager, ProgressNotifier};
+use crate::core::runtime;
+use crate::core::session::{AggregateProgress, FileProgress};
+use crate::{ProgressCallback, ProgressEvent};
+
+pub static PROGRESS_CALLBACK: Mutex<Option<ProgressCallback>> = Mutex::new(None);
 static PROGRESS_MANAGER: OnceLock<ProgressManager<IosProgressNotifier>> = OnceLock::new();
-static PROGRESS_CALLBACK: Mutex<Option<ProgressCallback>> = Mutex::new(None);
-
-#[no_mangle]
-pub extern "C" fn get_upload_progress() -> f64 {
-    iosProgress::progress_manager().percentage()
-}
-
-#[no_mangle]
-pub extern "C" fn get_upload_progress_json() -> *const c_char {
-    if let Some(json) = iosProgress::progress_manager().to_json() {
-        if let Ok(json_str) = serde_json::to_string(&json) {
-            if let Ok(c_string) = CString::new(json_str) {
-                return c_string.into_raw();
-            }
-        }
-    }
-
-    std::ptr::null()
-}
-
-#[no_mangle]
-pub extern "C" fn set_progress_callback(callback: Option<extern "C" fn(u64, u64, u32, u32, f64)>) {
-    let mut cb = PROGRESS_CALLBACK.lock().unwrap();
-    *cb = callback;
-}
 
 pub struct IosProgressNotifier;
-pub type ProgressCallback = extern "C" fn(u64, u64, u32, u32, f64);
-
 
 impl ProgressNotifier for IosProgressNotifier {
-    fn notify(&self, progress: &UploadProgress) {
-        notify_progress(progress);
+    fn notify(
+        &self,
+        fp: &FileProgress,
+        session_agg: &AggregateProgress,
+        transfer_agg: &AggregateProgress,
+    ) {
+        let cb = PROGRESS_CALLBACK.lock().unwrap();
+        if let Some(callback) = *cb {
+            let file_key = CString::new(fp.file_key.as_deref().unwrap_or("")).unwrap_or_default();
+            let file_name = CString::new(fp.file_name.as_str()).unwrap_or_default();
+            let file_hash = CString::new(fp.file_hash.as_str()).unwrap_or_default();
+            let transfer_id = CString::new(fp.transfer_id.as_str()).unwrap_or_default();
+            let state = CString::new(fp.state.as_str()).unwrap_or_default();
+            let t_state = CString::new(transfer_agg.state.as_str()).unwrap_or_default();
+            let s_state = CString::new(session_agg.state.as_str()).unwrap_or_default();
+
+            let event = ProgressEvent {
+                file_key: file_key.as_ptr(),
+                file_name: file_name.as_ptr(),
+                file_hash: file_hash.as_ptr(),
+                transfer_id: transfer_id.as_ptr(),
+                total_bytes: fp.total_bytes,
+                uploaded_bytes: fp.uploaded_bytes,
+                completed_parts: fp.completed_parts,
+                total_parts: fp.total_parts,
+                percentage: fp.percentage,
+                state: state.as_ptr(),
+                transfer_percentage: transfer_agg.percentage,
+                transfer_total_size: transfer_agg.total_size,
+                transfer_uploaded_size: transfer_agg.uploaded_size,
+                transfer_total_files: transfer_agg.total_files,
+                transfer_completed_files: transfer_agg.completed_files,
+                transfer_state: t_state.as_ptr(),
+                session_percentage: session_agg.percentage,
+                session_total_size: session_agg.total_size,
+                session_uploaded_size: session_agg.uploaded_size,
+                session_total_transfers: session_agg.total_transfers.unwrap_or(0),
+                session_completed_transfers: session_agg.completed_transfers.unwrap_or(0),
+                session_total_files: session_agg.total_files,
+                session_completed_files: session_agg.completed_files,
+                session_state: s_state.as_ptr(),
+            };
+            callback(&event);
+        }
     }
 }
 
@@ -46,39 +64,54 @@ pub fn progress_manager() -> &'static ProgressManager<IosProgressNotifier> {
     PROGRESS_MANAGER.get_or_init(|| ProgressManager::new(IosProgressNotifier))
 }
 
-pub fn update_progress<F>(update_fn: F)
-where
-    F: FnOnce(&ProgressManager<IosProgressNotifier>),
-{
-    let manager = progress_manager();
-    update_fn(manager);
-}
+// ---------------------------------------------------------------------------
+// ProgressReader — in-flight progress tracking during chunk upload
+// ---------------------------------------------------------------------------
+
+const NOTIFY_EVERY_BYTES: u64 = 256 * 1024; // 256 KB
 
 pub struct ProgressReader {
     inner: Cursor<Vec<u8>>,
+    file_key: String,
+    run_version: u64,
     part_number: u32,
     bytes_read: u64,
-    total_size: u64,
+    last_notified: u64,
 }
 
 impl ProgressReader {
-    pub fn new(data: Vec<u8>, part_number: u32) -> Self {
-        let total_size = data.len() as u64;
+    pub fn new(data: Vec<u8>, file_key: String, run_version: u64, part_number: u32) -> Self {
         Self {
             inner: Cursor::new(data),
+            file_key,
+            run_version,
             part_number,
             bytes_read: 0,
-            total_size,
+            last_notified: 0,
         }
     }
 }
 
 impl Read for ProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if crate::ios::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "paused"));
+        }
+        if !crate::core::session::is_current_run(&self.file_key, self.run_version) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stale run"));
+        }
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.bytes_read += n as u64;
-            update_progress(|m| m.update_in_flight(self.part_number, self.bytes_read));
+            if self.bytes_read - self.last_notified >= NOTIFY_EVERY_BYTES {
+                self.last_notified = self.bytes_read;
+                runtime::update_in_flight(
+                    progress_manager(),
+                    &self.file_key,
+                    self.part_number,
+                    self.bytes_read,
+                );
+            }
         }
         Ok(n)
     }
@@ -87,21 +120,8 @@ impl Read for ProgressReader {
 impl Seek for ProgressReader {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let new_pos = self.inner.seek(pos)?;
-        // Reset bytes_read bei Seek (für Retry-Szenarien)
         self.bytes_read = new_pos;
+        self.last_notified = new_pos;
         Ok(new_pos)
-    }
-}
-
-fn notify_progress(progress: &UploadProgress) {
-    let callback = PROGRESS_CALLBACK.lock().unwrap();
-    if let Some(cb) = *callback {
-        cb(
-            progress.total_bytes,
-            progress.uploaded_bytes(),
-            progress.completed_parts,
-            progress.total_parts,
-            progress.percentage(),
-        );
     }
 }

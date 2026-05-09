@@ -4,38 +4,7 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/ios-build.yml'
-      - 'example/ios/**'
-      - 'example/Gemfile'
-      - 'example/Gemfile.lock'
-      - '**/nitrogen/generated/shared/**'
-      - '**/nitrogen/generated/ios/**'
-      - 'cpp/**'
-      - 'ios/**'
-      - '**/Podfile.lock'
-      - '**/bun.lock'
-      - '**/*.podspec'
-      - '**/react-native.config.js'
-      - '**/nitro.json'
   pull_request:
-    paths:
-      - '.github/workflows/ios-build.yml'
-      - 'example/ios/**'
-      - 'example/Gemfile'
-      - 'example/Gemfile.lock'
-      - '**/nitrogen/generated/shared/**'
-      - '**/nitrogen/generated/ios/**'
-      - 'cpp/**'
-      - 'ios/**'
-      - '**/Podfile.lock'
-      - '**/bun.lock'
-      - '**/*.podspec'
-      - '**/react-native.config.js'
-      - '**/nitro.json'
   workflow_dispatch:
 
 env:
@@ -48,14 +17,14 @@ concurrency:
 jobs:
   build:
     name: Build iOS Example App
-    runs-on: macOS-15
+    runs-on: macOS-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: 16.4
+          xcode-version: 26.2
 
       - name: Install dependencies (bun)
         run: bun install
@@ -80,9 +49,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pods-
 
+      - name: Build
+        run: npm run build:ios
       - name: Install Pods
         working-directory: example/ios
-        run: pod install
+        run: npm run pod
+      
 
       - name: Build App
         working-directory: example/ios
@@ -94,6 +66,6 @@ jobs:
             -scheme S3BgUploaderExample \
             -sdk iphonesimulator \
             -configuration Debug \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -destination 'platform=iOS Simulator,name=iPhone 17' \
             build \
             CODE_SIGNING_ALLOWED=NO | xcpretty

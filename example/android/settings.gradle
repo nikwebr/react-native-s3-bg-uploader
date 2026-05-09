@@ -1,6 +1,10 @@
-pluginManagement { includeBuild("../../node_modules/@react-native/gradle-plugin") }
+pluginManagement {
+    def nodeModulesDir = file("../../node_modules").exists() ? "../../node_modules" : "../node_modules"
+    includeBuild("${nodeModulesDir}/@react-native/gradle-plugin")
+}
 plugins { id("com.facebook.react.settings") }
 extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> ex.autolinkLibrariesFromCommand() }
 rootProject.name = 'S3BgUploaderExample'
 include ':app'
-includeBuild('../../node_modules/@react-native/gradle-plugin')
+def nodeModulesDir = file("../../node_modules").exists() ? "../../node_modules" : "../node_modules"
+includeBuild("${nodeModulesDir}/@react-native/gradle-plugin")

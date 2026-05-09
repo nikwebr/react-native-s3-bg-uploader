@@ -15,6 +15,7 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IOS_RUST_DIR="$SCRIPT_DIR/../../ios/rust"
 TARGET_DIR="$SCRIPT_DIR/../target"
+IOS_MIN_VERSION="15.1" # same as React Native's min_ios_version_supported
 
 ensure_deps() {
     echo -e "${BLUE}🔍 Checking dependencies...${NC}"
@@ -67,12 +68,59 @@ ensure_ios_deps() {
 }
 
 
-if [[ "$1" == "ios" ]] || [[ "$1" == "wasm" ]] || [[ "$1" == "all" ]]; then
+JNILIBS_DIR="$SCRIPT_DIR/../../android/src/main/jniLibs"
+
+ANDROID_ABIS=("arm64-v8a" "armeabi-v7a" "x86_64" "x86")
+
+abi_to_rust_target() {
+    case "$1" in
+        "arm64-v8a")   echo "aarch64-linux-android" ;;
+        "armeabi-v7a") echo "armv7-linux-androideabi" ;;
+        "x86_64")      echo "x86_64-linux-android" ;;
+        "x86")         echo "i686-linux-android" ;;
+    esac
+}
+
+ensure_android_deps() {
+    echo -e "${BLUE}🔍 Checking Android dependencies...${NC}"
+
+    if ! command -v cargo-ndk &> /dev/null; then
+        echo -e "${BLUE}  cargo-ndk not found – installing...${NC}"
+        cargo install cargo-ndk
+    else
+        echo -e "${GREEN}✓ cargo-ndk $(cargo ndk --version 2>/dev/null | head -1)${NC}"
+    fi
+
+    local android_targets=(
+        "aarch64-linux-android"
+        "armv7-linux-androideabi"
+        "x86_64-linux-android"
+        "i686-linux-android"
+    )
+    local installed_targets
+    installed_targets=$(rustup target list --installed)
+    for target in "${android_targets[@]}"; do
+        if echo "$installed_targets" | grep -q "^$target$"; then
+            echo -e "${GREEN}✓ $target${NC}"
+        else
+            echo -e "${BLUE}  Installing $target...${NC}"
+            rustup target add "$target"
+        fi
+    done
+
+    echo ""
+}
+
+if [[ "$1" == "ios" ]] || [[ "$1" == "wasm" ]] || [[ "$1" == "android" ]] || [[ "$1" == "all" ]]; then
     ensure_deps
 fi
 
 if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
     ensure_ios_deps
+fi
+
+if [[ "$1" == "android" ]] || [[ "$1" == "all" ]]; then
+    ensure_android_deps
 fi
 
 # iOS Build (Device + Simulator, universal fat library)
@@ -86,20 +134,6 @@ if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
     echo -e "${BLUE}📱 Building for iOS Simulator x86_64 (x86_64-apple-ios)...${NC}"
     cargo build --features ios --target x86_64-apple-ios --release
 
-    echo -e "${BLUE}🔗 Creating universal simulator fat library (lipo)...${NC}"
-    mkdir -p $TARGET_DIR/universal-ios-sim/release
-    lipo -create \
-        $TARGET_DIR/aarch64-apple-ios-sim/release/libuploader.a \
-        $TARGET_DIR/x86_64-apple-ios/release/libuploader.a \
-        -output $TARGET_DIR/universal-ios-sim/release/libuploader.a
-
-    echo -e "${BLUE}📦 Creating XCFramework...${NC}"
-    rm -rf $TARGET_DIR/libuploader.xcframework
-    xcodebuild -create-xcframework \
-        -library $TARGET_DIR/aarch64-apple-ios/release/libuploader.a \
-        -library $TARGET_DIR/universal-ios-sim/release/libuploader.a \
-        -output $TARGET_DIR/libuploader.xcframework
-
     mkdir -p "$IOS_RUST_DIR"
 
     echo -e "${BLUE}🔤 Generating header with cbindgen...${NC}"
@@ -111,6 +145,79 @@ if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
         echo "  cargo install cbindgen"
     fi
 
+    echo -e "${BLUE}🔧 Fixing dylib install names...${NC}"
+    install_name_tool -id "@rpath/libuploader.framework/libuploader" \
+        $TARGET_DIR/aarch64-apple-ios/release/libuploader.dylib
+    install_name_tool -id "@rpath/libuploader.framework/libuploader" \
+        $TARGET_DIR/aarch64-apple-ios-sim/release/libuploader.dylib
+    install_name_tool -id "@rpath/libuploader.framework/libuploader" \
+        $TARGET_DIR/x86_64-apple-ios/release/libuploader.dylib
+
+    echo -e "${BLUE}🔗 Creating universal simulator fat dylib (lipo)...${NC}"
+    mkdir -p $TARGET_DIR/universal-ios-sim/release
+    lipo -create \
+        $TARGET_DIR/aarch64-apple-ios-sim/release/libuploader.dylib \
+        $TARGET_DIR/x86_64-apple-ios/release/libuploader.dylib \
+        -output $TARGET_DIR/universal-ios-sim/release/libuploader.dylib
+
+    echo -e "${BLUE}🏗️  Creating .framework bundles...${NC}"
+
+    make_framework() {
+        local DYLIB="$1"
+        local OUT_FW="$2"
+        local MIN_OS="$3"
+
+        rm -rf "$OUT_FW"
+        mkdir -p "$OUT_FW"
+        cp "$DYLIB" "$OUT_FW/libuploader"
+        cat > "$OUT_FW/Info.plist" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>libuploader</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.rust.libuploader</string>
+    <key>CFBundleName</key>
+    <string>libuploader</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>MinimumOSVersion</key>
+    <string>$MIN_OS</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>iPhoneOS</string>
+    </array>
+</dict>
+</plist>
+PLISTEOF
+    }
+
+    FW_DIR="$TARGET_DIR/frameworks"
+    rm -rf "$FW_DIR"
+
+    make_framework \
+        "$TARGET_DIR/aarch64-apple-ios/release/libuploader.dylib" \
+        "$FW_DIR/ios-arm64/libuploader.framework" \
+        "$IOS_MIN_VERSION"
+
+    make_framework \
+        "$TARGET_DIR/universal-ios-sim/release/libuploader.dylib" \
+        "$FW_DIR/ios-sim/libuploader.framework" \
+        "$IOS_MIN_VERSION"
+
+    echo -e "${BLUE}📦 Creating XCFramework...${NC}"
+    rm -rf $TARGET_DIR/libuploader.xcframework
+    xcodebuild -create-xcframework \
+        -framework "$FW_DIR/ios-arm64/libuploader.framework" \
+        -framework "$FW_DIR/ios-sim/libuploader.framework" \
+        -output $TARGET_DIR/libuploader.xcframework
+
     echo -e "${BLUE}📋 Copying artifacts to ios/rust/...${NC}"
     rm -rf "$IOS_RUST_DIR/libuploader.xcframework"
     cp -R $TARGET_DIR/libuploader.xcframework "$IOS_RUST_DIR/libuploader.xcframework"
@@ -118,6 +225,29 @@ if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
     echo -e "${GREEN}✓ iOS build successful${NC}"
     echo "  XCFramework: ios/rust/libuploader.xcframework  (device + simulator)"
     echo "  Header     : ios/rust/uploader.h"
+    echo ""
+fi
+
+# Android Build (all ABIs via cargo-ndk)
+if [[ "$1" == "android" ]] || [[ "$1" == "all" ]]; then
+    echo -e "${BLUE}🤖 Building for Android (all ABIs)...${NC}"
+
+    for abi in "${ANDROID_ABIS[@]}"; do
+        rust_target=$(abi_to_rust_target "$abi")
+        echo -e "${BLUE}  Building $abi ($rust_target)...${NC}"
+        cargo ndk -t "$abi" build --features android --release
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}✗ cargo ndk failed for $abi${NC}"
+            exit 1
+        fi
+
+        dest_dir="$JNILIBS_DIR/$abi"
+        mkdir -p "$dest_dir"
+        cp "$TARGET_DIR/$rust_target/release/libuploader.so" "$dest_dir/libuploader.so"
+        echo -e "${GREEN}✓ $abi → android/src/main/jniLibs/$abi/libuploader.so${NC}"
+    done
+
+    echo -e "${GREEN}✓ Android build successful${NC}"
     echo ""
 fi
 
@@ -164,12 +294,13 @@ fi
 
 # Usage
 if [[ -z "$1" ]] || [[ "$1" == "help" ]]; then
-    echo "Usage: ./build.sh [ios|wasm|all]"
+    echo "Usage: ./build.sh [ios|android|wasm|all]"
     echo ""
     echo "Examples:"
-    echo "  ./build.sh ios    - Build only for iOS"
-    echo "  ./build.sh wasm   - Build only for WASM"
-    echo "  ./build.sh all    - Build for both platforms"
+    echo "  ./build.sh ios     - Build only for iOS"
+    echo "  ./build.sh android - Build only for Android (all ABIs)"
+    echo "  ./build.sh wasm    - Build only for WASM"
+    echo "  ./build.sh all     - Build for all platforms"
     exit 0
 fi
 

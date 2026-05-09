@@ -23,4 +23,27 @@ const androidWorkaround = async () => {
  const str = await readFile(androidOnLoadFile, { encoding: 'utf8' })
  await writeFile(androidOnLoadFile, str.replace(/margelo\/nitro\//g, ''))
 }
+const iosWorkaround = async () => {
+  const cxxBridgeFile = path.join(
+    process.cwd(),
+    'nitrogen/generated/ios/swift',
+    'HybridS3BgUploaderSpec_cxx.swift'
+  )
+
+  const str = await readFile(cxxBridgeFile, { encoding: 'utf8' })
+  // String(x) where x: std.string fails in Release builds because std.string does not
+  // conform to LosslessStringConvertible under optimization (-O). Fix by collecting
+  // all parameter names typed as std.string and replacing their String(...) conversions.
+  const stdStringParams = [...str.matchAll(/(\w+):\s*std\.string\b/g)].map(m => m[1])
+  let fixed = str
+  for (const param of stdStringParams) {
+    fixed = fixed.replace(
+      new RegExp(`String\\(${param}\\)`, 'g'),
+      `String(cString: Array(${param}) + [0])`
+    )
+  }
+  await writeFile(cxxBridgeFile, fixed)
+}
+
 androidWorkaround()
+iosWorkaround()
