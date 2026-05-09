@@ -304,7 +304,7 @@ export default function App(): React.JSX.Element {
           editable={sessionState === 'idle'}
         />
         <TouchableOpacity style={styles.addButton} onPress={handleAddFiles}>
-          <Text style={styles.addButtonText}>+ Dateien</Text>
+          <Text style={styles.addButtonText}>+ Files</Text>
         </TouchableOpacity>
       </View>
 
@@ -312,7 +312,7 @@ export default function App(): React.JSX.Element {
       {hasMissing && (
         <View style={styles.missingBanner}>
           <Text style={styles.missingBannerText}>
-            ⚠ Dateien aus letzter Sitzung fehlen — erneut auswählen oder abbrechen.
+            ⚠ Files from last session are missing — reselect or cancel.
           </Text>
         </View>
       )}
@@ -331,7 +331,7 @@ export default function App(): React.JSX.Element {
                   <>
                     <Text style={styles.transferStats}>
                       {tPct}% · {formatBytes(tp.uploadedSize)}/{formatBytes(tp.totalSize)}
-                      {'  '}{tp.completedFiles}/{tp.totalFiles} Dateien
+                      {'  '}{tp.completedFiles}/{tp.totalFiles} Files
                     </Text>
                     <View style={styles.transferTrack}>
                       <View
@@ -348,7 +348,7 @@ export default function App(): React.JSX.Element {
                 )}
               </View>
               <TouchableOpacity style={styles.cancelTransferBtn} onPress={() => handleCancelTransfer(tid)}>
-                <Text style={styles.cancelBtnText}>Abbrechen</Text>
+                <Text style={styles.cancelBtnText}>Cancel</Text>
               </TouchableOpacity>
             </View>
 
@@ -360,14 +360,14 @@ export default function App(): React.JSX.Element {
                   <View style={styles.fileInfo}>
                     <View style={styles.fileNameRow}>
                       <Text style={styles.fileName} numberOfLines={1}>{item.name}</Text>
-                      {item.isMissing && <Text style={styles.missingTag}>Fehlt</Text>}
+                      {item.isMissing && <Text style={styles.missingTag}>Missing</Text>}
                       {item.isLoading && <ActivityIndicator size="small" color="#007AFF" />}
                     </View>
 
                     {item.isLoading ? (
-                      <Text style={styles.fileStatusText}>Wird verarbeitet…</Text>
+                      <Text style={styles.fileStatusText}>Processing…</Text>
                     ) : item.isMissing ? (
-                      <Text style={styles.missingHint}>Erneut auswählen oder abbrechen</Text>
+                      <Text style={styles.missingHint}>Reselect or cancel</Text>
                     ) : item.progress && item.progress.state !== 'NOT_STARTED' ? (
                       <View style={styles.fileProgressRow}>
                         <View style={styles.miniTrack}>
@@ -388,7 +388,7 @@ export default function App(): React.JSX.Element {
                         <Text style={styles.fileStateLabel}>{state}</Text>
                       </View>
                     ) : (
-                      <Text style={styles.fileStatusText}>Bereit</Text>
+                      <Text style={styles.fileStatusText}>Ready</Text>
                     )}
                   </View>
 
@@ -407,7 +407,7 @@ export default function App(): React.JSX.Element {
       })}
 
       {queue.length === 0 && (
-        <Text style={styles.emptyHint}>Wähle Dateien aus und weise sie einem Transfer zu.</Text>
+        <Text style={styles.emptyHint}>Select files and assign them to a transfer.</Text>
       )}
 
       {/* Session progress bar */}
@@ -426,20 +426,20 @@ export default function App(): React.JSX.Element {
           <Text style={styles.progressDetails}>
             {formatBytes(sessionProgress.uploadedSize)} / {formatBytes(sessionProgress.totalSize)}
             {'  ·  '}
-            {sessionProgress.completedFiles}/{sessionProgress.totalFiles} Dateien
+            {sessionProgress.completedFiles}/{sessionProgress.totalFiles} Files
           </Text>
         </View>
       )}
 
       {/* Action buttons */}
       <View style={styles.actionRow}>
-        {/* Hochladen — only when there are ready files and not yet running */}
+        {/* Upload — only when there are ready files and not yet running */}
         {hasReady && sessionState !== 'running' && (
           <TouchableOpacity
             style={[styles.actionBtn, styles.uploadBtn, isLoading && styles.buttonDisabled]}
             onPress={handleUploadAll}
             disabled={isLoading}>
-            <Text style={styles.actionBtnText}>Hochladen</Text>
+            <Text style={styles.actionBtnText}>Upload</Text>
           </TouchableOpacity>
         )}
 
@@ -454,13 +454,13 @@ export default function App(): React.JSX.Element {
             style={[styles.actionBtn, styles.resumeBtn, (isLoading || hasMissing) && styles.buttonDisabled]}
             onPress={handleResume}
             disabled={isLoading || hasMissing}>
-            <Text style={styles.actionBtnText}>Fortsetzen</Text>
+            <Text style={styles.actionBtnText}>Resume</Text>
           </TouchableOpacity>
         )}
 
         {(sessionState !== 'idle' || queue.length > 0) && (
           <TouchableOpacity style={[styles.actionBtn, styles.cancelAllBtn]} onPress={handleCancelAll}>
-            <Text style={styles.actionBtnText}>Alles abbrechen</Text>
+            <Text style={styles.actionBtnText}>Cancel all</Text>
           </TouchableOpacity>
         )}
       </View>
