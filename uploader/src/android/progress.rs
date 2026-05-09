@@ -1,18 +1,86 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::sync::{Mutex, OnceLock};
-use crate::core::progress::{ProgressManager, ProgressNotifier, UploadProgress};
 
+use crate::core::progress::{ProgressManager, ProgressNotifier};
+use crate::core::runtime;
+use crate::core::session::{AggregateProgress, FileProgress};
+
+// ---------------------------------------------------------------------------
+// Callback and static storage
+// ---------------------------------------------------------------------------
+
+/// JNI callback: fn(file_key, file_name, file_hash, transfer_id, total_bytes, ...)
+pub type AndroidProgressCallback = Box<
+    dyn Fn(
+            &str, // file_key
+            &str, // file_name
+            &str, // file_hash
+            &str, // transfer_id
+            u64,
+            u64,
+            u32,
+            u32,
+            f64,
+            &str,
+            f64,
+            u64,
+            u64,
+            u32,
+            u32,
+            &str,
+            f64,
+            u64,
+            u64,
+            u32,
+            u32,
+            u32,
+            u32,
+            &str,
+        ) + Send
+        + Sync,
+>;
+
+static PROGRESS_CALLBACK: Mutex<Option<AndroidProgressCallback>> = Mutex::new(None);
 static PROGRESS_MANAGER: OnceLock<ProgressManager<AndroidProgressNotifier>> = OnceLock::new();
-static PROGRESS_CALLBACK: Mutex<Option<ProgressCallback>> = Mutex::new(None);
-
-// JNI callback: fn(total_bytes, uploaded_bytes, completed_parts, total_parts, percentage, state_str)
-pub type ProgressCallback = Box<dyn Fn(u64, u64, u32, u32, f64, &str) + Send + Sync>;
 
 pub struct AndroidProgressNotifier;
 
 impl ProgressNotifier for AndroidProgressNotifier {
-    fn notify(&self, progress: &UploadProgress) {
-        notify_progress(progress);
+    fn notify(
+        &self,
+        fp: &FileProgress,
+        session_agg: &AggregateProgress,
+        transfer_agg: &AggregateProgress,
+    ) {
+        let cb = PROGRESS_CALLBACK.lock().unwrap();
+        if let Some(ref callback) = *cb {
+            callback(
+                fp.file_key.as_deref().unwrap_or(""),
+                &fp.file_name,
+                &fp.file_hash,
+                &fp.transfer_id,
+                fp.total_bytes,
+                fp.uploaded_bytes,
+                fp.completed_parts,
+                fp.total_parts,
+                fp.percentage,
+                fp.state.as_str(),
+                transfer_agg.percentage,
+                transfer_agg.total_size,
+                transfer_agg.uploaded_size,
+                transfer_agg.total_files,
+                transfer_agg.completed_files,
+                transfer_agg.state.as_str(),
+                session_agg.percentage,
+                session_agg.total_size,
+                session_agg.uploaded_size,
+                session_agg.total_transfers.unwrap_or(0),
+                session_agg.completed_transfers.unwrap_or(0),
+                session_agg.total_files,
+                session_agg.completed_files,
+                session_agg.state.as_str(),
+            );
+        }
     }
 }
 
@@ -20,46 +88,31 @@ pub fn progress_manager() -> &'static ProgressManager<AndroidProgressNotifier> {
     PROGRESS_MANAGER.get_or_init(|| ProgressManager::new(AndroidProgressNotifier))
 }
 
-pub fn update_progress<F>(update_fn: F)
-where
-    F: FnOnce(&ProgressManager<AndroidProgressNotifier>),
-{
-    let manager = progress_manager();
-    update_fn(manager);
+pub fn set_progress_callback(callback: Option<AndroidProgressCallback>) {
+    *PROGRESS_CALLBACK.lock().unwrap() = callback;
 }
 
-pub fn set_progress_callback(callback: Option<ProgressCallback>) {
-    let mut cb = PROGRESS_CALLBACK.lock().unwrap();
-    *cb = callback;
-}
+// ---------------------------------------------------------------------------
+// ProgressReader
+// ---------------------------------------------------------------------------
 
-fn notify_progress(progress: &UploadProgress) {
-    let cb = PROGRESS_CALLBACK.lock().unwrap();
-    if let Some(ref callback) = *cb {
-        callback(
-            progress.total_bytes,
-            progress.uploaded_bytes(),
-            progress.completed_parts,
-            progress.total_parts,
-            progress.percentage(),
-            progress.status.as_str(),
-        );
-    }
-}
-
-const NOTIFY_EVERY_BYTES: u64 = 256 * 1024; // alle 256 KB
+const NOTIFY_EVERY_BYTES: u64 = 256 * 1024;
 
 pub struct ProgressReader {
     inner: Cursor<Vec<u8>>,
+    file_key: String,
+    run_version: u64,
     part_number: u32,
     bytes_read: u64,
     last_notified: u64,
 }
 
 impl ProgressReader {
-    pub fn new(data: Vec<u8>, part_number: u32) -> Self {
+    pub fn new(data: Vec<u8>, file_key: String, run_version: u64, part_number: u32) -> Self {
         Self {
             inner: Cursor::new(data),
+            file_key,
+            run_version,
             part_number,
             bytes_read: 0,
             last_notified: 0,
@@ -69,12 +122,23 @@ impl ProgressReader {
 
 impl Read for ProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "paused"));
+        }
+        if !crate::core::session::is_current_run(&self.file_key, self.run_version) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stale run"));
+        }
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.bytes_read += n as u64;
             if self.bytes_read - self.last_notified >= NOTIFY_EVERY_BYTES {
                 self.last_notified = self.bytes_read;
-                update_progress(|m| m.update_in_flight(self.part_number, self.bytes_read));
+                runtime::update_in_flight(
+                    progress_manager(),
+                    &self.file_key,
+                    self.part_number,
+                    self.bytes_read,
+                );
             }
         }
         Ok(n)
@@ -84,7 +148,6 @@ impl Read for ProgressReader {
 impl Seek for ProgressReader {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let new_pos = self.inner.seek(pos)?;
-        // Reset bei Seek (für Retry-Szenarien)
         self.bytes_read = new_pos;
         self.last_notified = new_pos;
         Ok(new_pos)
