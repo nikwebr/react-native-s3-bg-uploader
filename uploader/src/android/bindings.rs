@@ -427,19 +427,19 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetProgres
     mut env: JNIEnv,
     _class: JClass,
     transfer_id: JString,
-    file_key: JString,
+    file_hash: JString,
 ) -> jstring {
     let tid: Option<String> = env
         .get_string(&transfer_id)
         .map(|s| s.into())
         .ok()
         .filter(|s: &String| !s.is_empty());
-    let fk: Option<String> = env
-        .get_string(&file_key)
+    let fh: Option<String> = env
+        .get_string(&file_hash)
         .map(|s| s.into())
         .ok()
         .filter(|s: &String| !s.is_empty());
-    let progress = session::session().get_progress(tid.as_deref(), fk.as_deref());
+    let progress = session::session().get_progress(tid.as_deref(), fh.as_deref());
     let json: Vec<_> = progress.iter().map(|p| p.to_json()).collect();
     let s = serde_json::to_string(&json).unwrap_or_else(|_| "[]".to_string());
     env.new_string(&s)
@@ -452,23 +452,23 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetLivePro
     mut env: JNIEnv,
     _class: JClass,
     transfer_id: JString,
-    file_key: JString,
+    file_hash: JString,
 ) -> jstring {
     let tid: Option<String> = env
         .get_string(&transfer_id)
         .map(|s| s.into())
         .ok()
         .filter(|s: &String| !s.is_empty());
-    let fk: Option<String> = env
-        .get_string(&file_key)
+    let fh: Option<String> = env
+        .get_string(&file_hash)
         .map(|s| s.into())
         .ok()
         .filter(|s: &String| !s.is_empty());
 
-    let live = androidProgress::progress_manager().get_live_progress(tid.as_deref(), fk.as_deref());
+    let live = androidProgress::progress_manager().get_live_progress(tid.as_deref(), fh.as_deref());
     let live_keys: std::collections::HashSet<String> =
         live.iter().filter_map(|p| p.file_key.clone()).collect();
-    let session_entries = session::session().get_progress(tid.as_deref(), fk.as_deref());
+    let session_entries = session::session().get_progress(tid.as_deref(), fh.as_deref());
     let mut merged: Vec<_> = live;
     for p in session_entries {
         if p.file_key.as_ref().map_or(true, |k| !live_keys.contains(k)) {

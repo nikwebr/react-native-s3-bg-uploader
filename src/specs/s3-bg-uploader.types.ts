@@ -134,10 +134,10 @@ export interface S3BgUploaderAPI extends BaseUploaderAPI {
   /**
    * Returns per-file progress, optionally filtered.
    * @param transferId  Only return files in this transfer.
-   * @param fileKey     Only return the entry for this fileKey.
+   * @param fileHash    Only return the entry for this file.
    */
-  getProgress(transferId?: string, fileKey?: string): UploadProgress[]
-  
+  getProgress(transferId?: string, fileHash?: string): UploadProgress[]
+
   /**
    * Returns aggregate progress for the whole session, or just one transfer.
    * @param transferId  Scope to this transfer (omits totalTransfers / completedTransfers).
@@ -163,9 +163,9 @@ export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
   /**
    * Returns per-file progress, optionally filtered.
    * @param transferId  Only return files in this transfer.
-   * @param fileKey     Only return the entry for this fileKey.
+   * @param fileHash    Only return the entry for this file.
    */
-  getProgress(transferId?: string, fileKey?: string): UploadProgress[]
+  getProgress(transferId?: string, fileHash?: string): UploadProgress[]
 
   /**
    * Returns aggregate progress for the whole session, or just one transfer.
@@ -192,9 +192,9 @@ export interface WebS3BgUploaderAPI extends BaseUploaderAPI {
   /**
    * Returns per-file progress, optionally filtered.
    * @param transferId  Only return files in this transfer.
-   * @param fileKey     Only return the entry for this fileKey.
+   * @param fileHash    Only return the entry for this file.
    */
-  getProgress(transferId?: string, fileKey?: string): Promise<UploadProgress[]>
+  getProgress(transferId?: string, fileHash?: string): Promise<UploadProgress[]>
 
   /**
    * Returns aggregate progress for the whole session, or just one transfer.
