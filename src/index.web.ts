@@ -117,7 +117,7 @@ onmessage = async function (e) {
     case 'getProgress': {
       const result = wasm.wasm_get_progress(
         payload.transferId ?? undefined,
-        payload.fileKey ?? undefined,
+        payload.fileHash ?? undefined,
       );
       postMessage({ type: 'result', requestId, ok: true, value: result });
       break;
@@ -263,8 +263,8 @@ export const S3BgUploader: WebS3BgUploaderAPI = {
     }
   },
 
-  async getProgress(transferId?: string, fileKey?: string): Promise<UploadProgress[]> {
-    return sendRequest('getProgress', { transferId: transferId ?? null, fileKey: fileKey ?? null }) as Promise<UploadProgress[]>
+  async getProgress(transferId?: string, fileHash?: string): Promise<UploadProgress[]> {
+    return sendRequest('getProgress', { transferId: transferId ?? null, fileHash: fileHash ?? null }) as Promise<UploadProgress[]>
   },
 
   async getAggregateProgress(transferId?: string): Promise<AggregateProgress> {

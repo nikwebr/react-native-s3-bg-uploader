@@ -1,7 +1,7 @@
 {
   "name": "react-native-s3-bg-uploader",
-  "version": "1.1.0",
-  "description": "react-native-s3-bg-uploader is a react native package built with Nitro",
+  "version": "1.1.2",
+  "description": "Seamless file uploads that continue even when your app goes to background. Pausable, resumable, and built for the S3 API. This is a react native package built with Nitro and Rust. It is compiled to native modules on iOS and Android, and to WebAssembly for the web.",
   "main": "./lib/commonjs/index.js",
   "module": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
@@ -23,7 +23,12 @@
   },
   "keywords": [
     "react-native",
-    "react-native-s3-bg-uploader"
+    "react-native-s3-bg-uploader",
+    "background upload",
+    "s3 upload",
+    "multipart upload",
+    "object storage upload",
+    "chunked upload"
   ],
   "files": [
     "src",
@@ -52,7 +57,7 @@
   "author": "Niklas Weber",
   "license": "MIT",
   "bugs": "https://github.com/nikwebr/react-native-s3-bg-uploader/issues",
-  "homepage": "https://github.com/nikwebr/react-native-s3-bg-uploader#readme",
+  "homepage": "https://uploader.ysendit.com",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
@@ -60,6 +65,7 @@
   "devDependencies": {
     "@jamesacarr/eslint-formatter-github-actions": "^0.2.0",
     "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/exec": "^6.0.3",
     "@semantic-release/git": "^10.0.1",
     "@types/jest": "^29.5.12",
     "@types/react": "19.2.0",
