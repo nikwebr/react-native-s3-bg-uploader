@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "android": "react-native run-android",
-    "ios": "react-native run-ios --simulator='iPhone 16'",
+    "ios": "react-native run-ios --simulator='iPhone 17'",
     "lint": "eslint .",
     "start": "react-native start --reset-cache",
     "test": "jest",
@@ -14,7 +14,7 @@
   "dependencies": {
     "@react-native/new-app-screen": "0.84.1",
     "react": "19.2.3",
-    "react-dom": "^19.2.3",
+    "react-dom": "19.2.3",
     "react-native": "0.84.1",
     "@react-native-documents/picker": "^12.0.1",
     "react-native-nitro-modules": "0.35.1",

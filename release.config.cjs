@@ -15,7 +15,7 @@ const sortMap = Object.fromEntries(
  * @type {import('semantic-release').GlobalConfig}
  */
 module.exports = {
-  branches: ['main', { name: 'next', prerelease: 'next' }],
+  branches: ['master', { name: 'next', prerelease: 'next' }],
   plugins: [
     [
       '@semantic-release/commit-analyzer',
@@ -50,6 +50,12 @@ module.exports = {
     ],
     '@semantic-release/npm',
     '@semantic-release/github',
+    [
+      '@semantic-release/exec',
+      {
+        publishCmd: 'node scripts/sync-docs-repo.js ${nextRelease.version}',
+      },
+    ],
     [
       '@semantic-release/git',
       {
