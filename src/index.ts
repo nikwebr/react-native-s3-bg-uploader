@@ -66,8 +66,8 @@ export const S3BgUploader: S3BgUploaderAPI = {
     }
   },
 
-  getProgress(transferId?: string, fileKey?: string): UploadProgress[] {
-    return Native.getProgress(transferId, fileKey)
+  getProgress(transferId?: string, fileHash?: string): UploadProgress[] {
+    return Native.getProgress(transferId, fileHash)
   },
 
   getAggregateProgress(transferId?: string): AggregateProgress {

@@ -136,10 +136,10 @@ pub fn wasm_resume_all() -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen]
-pub fn wasm_get_progress(transfer_id: JsValue, file_key: JsValue) -> JsValue {
+pub fn wasm_get_progress(transfer_id: JsValue, file_hash: JsValue) -> JsValue {
     let tid = transfer_id.as_string().filter(|s| !s.is_empty());
-    let fk = file_key.as_string().filter(|s| !s.is_empty());
-    let progress = session::session().get_progress(tid.as_deref(), fk.as_deref());
+    let fh = file_hash.as_string().filter(|s| !s.is_empty());
+    let progress = session::session().get_progress(tid.as_deref(), fh.as_deref());
     let arr = js_sys::Array::new();
     for p in &progress {
         let json_str = serde_json::to_string(&p.to_json()).unwrap_or_default();

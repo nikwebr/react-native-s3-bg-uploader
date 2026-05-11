@@ -628,14 +628,14 @@ impl Session {
     pub fn get_progress(
         &self,
         transfer_id: Option<&str>,
-        file_key: Option<&str>,
+        file_hash: Option<&str>,
     ) -> Vec<FileProgress> {
         let mut result: Vec<FileProgress> = self
             .files
             .values()
             .filter(|e| {
                 transfer_id.map_or(true, |t| e.transfer_id == t)
-                    && file_key.map_or(true, |k| e.file_key == k)
+                    && file_hash.map_or(true, |h| e.file_hash == h)
             })
             .map(|e| FileProgress {
                 file_key: Some(e.file_key.clone()),
@@ -652,8 +652,8 @@ impl Session {
             .collect();
 
         // Include pending (pre-registered, start_api not yet called) entries.
-        // Only included when not filtering by file_key (pending files have none).
-        if file_key.is_none() {
+        // Only included when not filtering by file_hash (pending files always have a hash).
+        if file_hash.is_none() {
             for p in self.pending_files.values() {
                 if transfer_id.map_or(true, |t| p.transfer_id == t) {
                     result.push(FileProgress {
