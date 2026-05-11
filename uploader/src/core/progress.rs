@@ -308,17 +308,17 @@ impl<N: ProgressNotifier> ProgressManager<N> {
     }
 
     /// Return live FileProgress snapshots (including in-flight bytes) for all tracked files.
-    /// Optionally filtered by transfer_id or file_key.
+    /// Optionally filtered by transfer_id or file_hash.
     pub fn get_live_progress(
         &self,
         transfer_id: Option<&str>,
-        file_key: Option<&str>,
+        file_hash: Option<&str>,
     ) -> Vec<FileProgress> {
         let lock = self.progress.lock().unwrap();
         lock.values()
             .filter(|p| {
                 transfer_id.map_or(true, |t| p.transfer_id == t)
-                    && file_key.map_or(true, |k| p.file_key == k)
+                    && file_hash.map_or(true, |h| p.file_hash == h)
             })
             .map(|p| p.to_file_progress())
             .collect()
