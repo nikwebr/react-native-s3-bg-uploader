@@ -1,223 +1,182 @@
+mod bindings;
+mod hash;
 pub mod progress;
-pub mod api;
+mod upload;
 
-use std::os::raw::{c_char, c_ulonglong};
-use std::ffi::{CStr, CString};
-use std::io::{BufReader, Read, Seek, SeekFrom, Cursor};
-use std::fs::File;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Condvar, Mutex, Once};
 use std::thread;
-use std::sync::Once;
 
-use crate::core::{
-    ChunkUploadResult,
-    MAX_CONCURRENT_UPLOADS, MAX_RETRIES,
-    get_urls_endpoint,
-    complete_upload_endpoint,
-    clean_etag
-};
-use crate::core::api::{CompleteRequest, UploadUrlsResponse};
-use crate::core::chunk::{self, ChunkInfo};
-use crate::core::progress::{ProgressNotifier};
-use crate::core::retry::{self, RetryPolicy};
-use crate::ios::progress::{self as iosProgress, ProgressReader};
+use crate::core::{session, upload as core_upload};
+use crate::core::session::UploadState;
+use crate::core::upload::StartResult;
+use crate::native::{BlockingNetwork, NativeApiClient};
 
-static INIT: Once = Once::new();
+pub(crate) static INIT: Once = Once::new();
 
-fn init_nyquest() {
+pub(crate) struct UploadQueue {
+    pub pending: std::collections::VecDeque<String>,
+    pub pending_keys: HashSet<String>,
+}
+
+pub(crate) static QUEUE: std::sync::LazyLock<Mutex<UploadQueue>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(UploadQueue {
+            pending: std::collections::VecDeque::new(),
+            pending_keys: HashSet::new(),
+        })
+    });
+pub(crate) static QUEUE_SIGNAL: Condvar = Condvar::new();
+static WORKER_STARTED: Once = Once::new();
+pub(crate) static PAUSE_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Phase 1: hash the file and pre-register it in the session (before start_api).
+/// Returns the file hash on success.
+pub(super) fn hash_and_pre_register(
+    file_path: &str,
+    transfer_id: &str,
+    user_params: HashMap<String, String>,
+) -> Result<String, String> {
+    let file_hash = hash::hash_file(file_path, transfer_id)?;
+    {
+        let sess = session::session();
+        if let Some(entry) = sess.find_by_hash(&file_hash) {
+            if entry.state == UploadState::Completed {
+                return Ok(file_hash);
+            }
+            if !entry.is_resumable() {
+                return Err(format!("DUPLICATE_FILE: file with hash {} is already active in this session", file_hash));
+            }
+        } else if sess.pending_files.contains_key(&file_hash) {
+            return Err(format!("DUPLICATE_FILE: file with hash {} is already pending in this session", file_hash));
+        }
+    }
+    let file_name = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let file_size = std::fs::metadata(file_path)
+        .map_err(|e| e.to_string())?
+        .len();
+    session::session().pre_register_file(
+        file_hash.clone(),
+        transfer_id.to_string(),
+        file_path.to_string(),
+        file_name,
+        file_size,
+        user_params,
+    );
+    Ok(file_hash)
+}
+
+/// Phase 2: call start_api for a pre-registered file, then enqueue it for upload.
+/// Returns the file key on success.
+pub(super) fn initialize_and_enqueue(
+    file_hash: &str,
+    transfer_id: &str,
+) -> Result<String, String> {
+    init_nyquest();
+    let pending = session::session()
+        .pending_files
+        .get(file_hash)
+        .cloned()
+        .ok_or_else(|| format!("no pending entry for hash {}", file_hash))?;
+
+    let client = nyquest::ClientBuilder::default()
+        .request_timeout(std::time::Duration::from_secs(30))
+        .build_blocking()
+        .map_err(|e| format!("Failed to create client: {:?}", e))?;
+    let api = NativeApiClient { network: IosNetwork { client } };
+    let result = pollster::block_on(core_upload::start_and_register(
+        file_hash.to_string(),
+        transfer_id,
+        pending.file_path.clone(),
+        pending.file_name.clone(),
+        pending.file_size,
+        pending.user_params.clone(),
+        &api,
+    ))?;
+    // Check if cancel_all fired while we were blocked on the network call.
+    // cancel_all clears pending_files; if our hash is gone, the session was reset.
+    let still_active = session::session().pending_files.contains_key(file_hash);
+    session::session().pending_files.remove(file_hash);
+    if !still_active {
+        // Undo the session.files insertion made by start_and_register.
+        session::session().cancel_file(result.file_key());
+        return Err("cancelled".to_string());
+    }
+    if result.should_upload() {
+        if let StartResult::Resumed(ref file_key) = result {
+            session::session().update_file_path(file_key, pending.file_path.clone());
+        }
+        enqueue_key(result.file_key().to_string());
+    }
+    Ok(result.file_key().to_string())
+}
+
+pub(crate) fn enqueue_key(file_key: String) {
+    start_worker_thread();
+    let has_progress = session::session()
+        .files
+        .get(&file_key)
+        .map(|e| e.uploaded_bytes > 0)
+        .unwrap_or(false);
+    let mut q = QUEUE.lock().unwrap();
+    if !q.pending_keys.insert(file_key.clone()) {
+        return;
+    }
+    // Files that already have progress go to the front so they resume before fresh files.
+    if has_progress {
+        q.pending.push_front(file_key);
+    } else {
+        q.pending.push_back(file_key);
+    }
+    QUEUE_SIGNAL.notify_one();
+}
+
+#[derive(Clone)]
+pub(crate) struct IosNetwork {
+    pub client: nyquest::BlockingClient,
+}
+
+pub(crate) fn init_nyquest() {
     INIT.call_once(|| {
         nyquest_backend_nsurlsession::register();
     });
 }
 
-#[no_mangle]
-pub extern "C" fn add(one: i32, two: i32) -> i32 {
-    one + two
-}
-
-#[no_mangle]
-pub extern "C" fn upload_file(path: *const c_char) -> i32 {
-    if path.is_null() {
-        return -1;
-    }
-
-    let c_str = unsafe { CStr::from_ptr(path) };
-    let file_path = match c_str.to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return -1,
-    };
-
-    match upload_file_internal(&file_path) {
-        Ok(_) => 0,
-        Err(_) => -1,
-    }
-}
-
-fn upload_file_internal(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    init_nyquest();
-
-    let file = File::open(file_path)?;
-    let file_size = file.metadata()?.len();
-
-    // HTTP Client erstellen
-    let client = nyquest::ClientBuilder::default()
-        .build_blocking()
-        .map_err(|e| format!("Failed to create client: {:?}", e))?;
-
-    // Upload URLs abrufen
-    let upload_info = api::fetch_upload_urls(&client, file_size)?;
-
-    // Progress initialisieren
-    iosProgress::update_progress(|m| m.init(file_size, upload_info.chunk_count()));
-
-    // Chunk-Infos generieren
-    let chunk_infos = chunk::generate_chunk_infos(file_size, &upload_info)
-        .map_err(|e| format!("Failed to generate chunk infos: {}", e))?;
-
-    // Chunks parallel hochladen
-    let completed_parts = upload_chunks_parallel(file_path, &chunk_infos)?;
-
-    // Upload abschließen
-    api::complete_upload(&client, &upload_info, completed_parts)?;
-
-    Ok(())
-}
-
-fn upload_chunks_parallel(
-    file_path: &str,
-    chunk_infos: &[ChunkInfo],
-) -> Result<Vec<ChunkUploadResult>, Box<dyn std::error::Error>> {
-    let completed_parts = Arc::new(Mutex::new(Vec::new()));
-    let file_path_arc = Arc::new(file_path.to_string());
-    let chunk_infos_arc = Arc::new(chunk_infos.to_vec());
-
-    // Channel für Worker-Threads
-    let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(MAX_CONCURRENT_UPLOADS);
-    let rx = Arc::new(Mutex::new(rx));
-
-    // Worker Threads erstellen
-    let mut handles = vec![];
-    for _ in 0..MAX_CONCURRENT_UPLOADS {
-        let rx = rx.clone();
-        let file_path = file_path_arc.clone();
-        let chunk_infos = chunk_infos_arc.clone();
-        let completed_parts = completed_parts.clone();
-
-        let handle = thread::spawn(move || {
-            let client = nyquest::ClientBuilder::default()
-                .build_blocking()
-                .expect("Failed to create client in worker thread");
-
-            loop {
-                let work = {
-                    let receiver = rx.lock().unwrap();
-                    receiver.recv()
-                };
-
-                let chunk_index = match work {
-                    Ok(i) => i,
-                    Err(_) => break, // Channel closed
-                };
-
-                let chunk_info = &chunk_infos[chunk_index];
-
-                // Chunk aus Datei lesen
-                let chunk = match read_chunk_from_file(&file_path, &chunk_info) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        eprintln!("Failed to read chunk {}: {:?}", chunk_info.part_number, e);
-                        continue;
+fn start_worker_thread() {
+    WORKER_STARTED.call_once(|| {
+        thread::spawn(|| loop {
+            let file_key = {
+                let mut q = QUEUE.lock().unwrap();
+                loop {
+                    // Wait while paused or queue is empty.
+                    if !PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(k) = q.pending.pop_front() {
+                            q.pending_keys.remove(&k);
+                            break k;
+                        }
                     }
-                };
-
-                // Upload mit Retry und Progress-Tracking
-                let etag = match upload_chunk_with_retry(&client, &chunk_info.url, &chunk, chunk_info.part_number) {
-                    Ok(tag) => tag,
-                    Err(e) => {
-                        eprintln!("Failed to upload part {}: {:?}", chunk_info.part_number, e);
-                        continue;
-                    }
-                };
-
-                // Completed part speichern
-                {
-                    let mut parts = completed_parts.lock().unwrap();
-                    parts.push(ChunkUploadResult {
-                        part_number: chunk_info.part_number,
-                        etag
-                    });
+                    q = QUEUE_SIGNAL.wait(q).unwrap();
                 }
-            }
+            };
+            upload::run_upload(&file_key);
         });
-
-        handles.push(handle);
-    }
-
-    // Chunk-Indizes an Worker senden
-    for i in 0..chunk_infos.len() {
-        tx.send(i).ok();
-    }
-    drop(tx); // Sender closen
-
-    // Auf alle Worker warten
-    for handle in handles {
-        handle.join().ok();
-    }
-
-    let parts = completed_parts.lock().unwrap().clone();
-    Ok(parts)
+    });
 }
 
-fn upload_chunk_with_retry(
-    client: &nyquest::BlockingClient,
-    url: &str,
-    data: &[u8],
-    part_number: u32,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let chunk_size = data.len() as u64;
-    let policy = RetryPolicy::new(MAX_RETRIES);
-
-    let result = retry::run_with_retry_string(
-        &policy,
-        |_attempt| {
-            // Reset in-flight progress für diesen Chunk bei jedem Versuch
-            iosProgress::update_progress(|m| m.update_in_flight(part_number, 0));
-
-            // ProgressReader für diesen Chunk erstellen
-            let progress_reader = ProgressReader::new(data.to_vec(), part_number);
-
-            // Body::stream mit dem ProgressReader verwenden
-            let body = nyquest::blocking::Body::stream(progress_reader, "application/octet-stream", chunk_size);
-            let request = nyquest::Request::put(url.to_string()).with_body(body);
-
-            match client.request(request) {
-                Ok(response) => {
-                    // Chunk als abgeschlossen markieren
-                    iosProgress::update_progress(|m| m.complete_chunk(part_number, chunk_size));
-
-                    // ETag aus Response Headers extrahieren
-                    match response.get_header("etag") {
-                        Ok(etag_vec) if !etag_vec.is_empty() => Ok(clean_etag(&etag_vec[0])),
-                        _ => Err("No ETag in response".to_string()),
-                    }
-                }
-                Err(e) => Err(format!("{:?}", e)),
-            }
-        },
-        |attempt, err, delay_ms| {
-            eprintln!(
-                "Upload attempt {} failed for part {}: {}, retrying in {}ms",
-                attempt, part_number, err, delay_ms
-            );
-            thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
-        },
-    );
-
-    result.map_err(|e| e.into())
-}
-
-fn read_chunk_from_file(path: &str, chunk: &ChunkInfo) -> std::io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    chunk.read(&mut reader)
+impl BlockingNetwork for IosNetwork {
+    fn post_json(
+        &self,
+        url: &str,
+        body_json: String,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let body = nyquest::Body::bytes(body_json.into_bytes(), "application/json");
+        let request = nyquest::Request::post(url.to_string()).with_body(body);
+        let response = self.client.request(request)?;
+        response.text().map_err(|e| e.into())
+    }
 }

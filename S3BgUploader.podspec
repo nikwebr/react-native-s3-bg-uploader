@@ -11,7 +11,7 @@ Pod::Spec.new do |s|
   s.authors      = package["author"]
 
   s.platforms    = { :ios => min_ios_version_supported, :visionos => 1.0 }
-  s.source       = { :git => "https://github.com/niklasweber/react-native-s3-bg-uploader.git", :tag => "#{s.version}" }
+  s.source       = { :git => "https://github.com/nikwebr/react-native-s3-bg-uploader.git", :tag => "#{s.version}" }
 
   s.source_files = [
     # Implementation (Swift)
@@ -25,7 +25,6 @@ Pod::Spec.new do |s|
   s.vendored_frameworks = 'ios/rust/libuploader.xcframework'
 
   s.pod_target_xcconfig = {
-    'SWIFT_INCLUDE_PATHS' => '${PODS_TARGET_SRCROOT}/ios',
     'HEADER_SEARCH_PATHS' => '${PODS_TARGET_SRCROOT}/ios'
   }
 

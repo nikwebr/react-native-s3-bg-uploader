@@ -1,15 +1,6 @@
 import { type HybridObject } from 'react-native-nitro-modules'
+import type { NativeS3BgUploaderAPI } from './s3-bg-uploader.types'
 
-export interface UploadProgress {
-  totalBytes: number
-  uploadedBytes: number
-  completedParts: number
-  totalParts: number
-  percentage: number
-}
-
-export interface S3BgUploader extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
-  sum(num1: number, num2: number): number
-  uploadFile(filePath: string): Promise<void>
-  setProgressCallback(callback: ((progress: UploadProgress) => void) | null): void
-}
+export interface S3BgUploader
+  extends HybridObject<{ ios: 'swift'; android: 'kotlin' }>,
+    NativeS3BgUploaderAPI {}

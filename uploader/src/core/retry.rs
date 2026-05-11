@@ -34,6 +34,10 @@ where
         match op(attempt) {
             Ok(value) => return Ok(value),
             Err(err) => {
+                // Don't retry pause/stale interrupts — propagate immediately.
+                if err.contains("paused") || err.contains("Interrupted") || err.contains("stale run") {
+                    return Err(err);
+                }
                 last_error = Some(err);
                 if let Some(delay_ms) = policy.delay_ms(attempt) {
                     if let Some(ref err_str) = last_error {

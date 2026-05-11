@@ -5,7 +5,7 @@ buildscript {
   }
 
   dependencies {
-    classpath "com.android.tools.build:gradle:8.8.0"
+    classpath "com.android.tools.build:gradle:9.2.1"
   }
 }
 
@@ -127,7 +127,6 @@ repositories {
   mavenCentral()
   google()
 }
-
 
 dependencies {
   // For < 0.71, this will be from the local maven repo
