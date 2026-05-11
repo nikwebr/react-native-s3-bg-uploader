@@ -33,7 +33,7 @@ jobs:
           app-id: ${{ secrets.RELEASE_BOT_SEMANTIC_RELEASE_ID }}
           private-key: ${{ secrets.RELEASE_BOT_SEMANTIC_RELEASE_PRIVATE_KEY }}
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           token: ${{ steps.generate_token.outputs.token }}
           fetch-depth: 0
@@ -44,7 +44,7 @@ jobs:
           bun-version: latest
       - name: Cache bun dependencies
         id: bun-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb') }}
