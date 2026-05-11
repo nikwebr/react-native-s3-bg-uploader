@@ -192,9 +192,9 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
 
     override fun getProgress(
         transferId: String?,
-        fileKey: String?,
+        fileHash: String?,
     ): Array<UploadProgress> {
-        val json = nativeGetProgressJson(transferId, fileKey)
+        val json = nativeGetProgressJson(transferId, fileHash)
         return parseUploadProgressArray(json)
     }
 
@@ -303,7 +303,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         /** Returns JSON array string of UploadProgress objects. Nullable filters. */
         @JvmStatic external fun nativeGetProgressJson(
             transferId: String?,
-            fileKey: String?,
+            fileHash: String?,
         ): String
 
         /** Returns JSON object string of AggregateProgress. Nullable filter. */
@@ -312,7 +312,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         /** Live per-file progress including in-flight bytes from ProgressManager. */
         @JvmStatic external fun nativeGetLiveProgressJson(
             transferId: String?,
-            fileKey: String?,
+            fileHash: String?,
         ): String
 
         /** Live aggregate progress including in-flight bytes from ProgressManager. */

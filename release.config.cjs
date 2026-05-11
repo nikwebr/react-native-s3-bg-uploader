@@ -51,6 +51,12 @@ module.exports = {
     '@semantic-release/npm',
     '@semantic-release/github',
     [
+      '@semantic-release/exec',
+      {
+        publishCmd: 'node scripts/sync-docs-repo.js ${nextRelease.version}',
+      },
+    ],
+    [
       '@semantic-release/git',
       {
         assets: ['package.json', 'CHANGELOG.md', 'example/package.json'],
