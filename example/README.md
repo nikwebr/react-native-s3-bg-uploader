@@ -1,5 +1,12 @@
 # Getting Started
 
+This app demonstrates the features offered by react-native-s3-bg-uploader. Please be aware that files uploaded via this app are uploaded to a demo s3 bucket and are only irregularly deleted.
+
+<img src="ExampleApp.png" alt="isolated" width="200"/>
+<img src="BGContinuedProcessingTask.PNG" alt="isolated" width="200"/>
+
+<br />
+
 > **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
 
 To run the example application, go to the root directory of this repository and then execute
