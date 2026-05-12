@@ -47,15 +47,6 @@
     "*.podspec",
     "README.md"
   ],
-  "overrides": {
-    "picomatch": "2.3.2",
-    "tinyglobby": {
-      "picomatch": "4.0.4"
-    },
-    "fdir": {
-      "picomatch": "4.0.4"
-    }
-  },
   "workspaces": [
     "example"
   ],
