@@ -74,6 +74,18 @@ async function putFile(filePath, content, message) {
   console.log(`  ✓ ${filePath}`)
 }
 
+async function triggerWorkflow(workflowFile) {
+  const res = await request(
+    'POST',
+    `/repos/${DOCS_REPO}/actions/workflows/${workflowFile}/dispatches`,
+    { ref: BRANCH }
+  )
+  if (res.status >= 400) {
+    throw new Error(`Failed to trigger ${workflowFile}: ${JSON.stringify(res.body)}`)
+  }
+  console.log(`  ✓ Triggered ${workflowFile}`)
+}
+
 async function main() {
   console.log(`Syncing docs repo for v${VERSION}...`)
 
@@ -86,6 +98,8 @@ async function main() {
 
   const sharedContent = `export const version = '${VERSION}'\n`
   await putFile('lib/version.ts', sharedContent, `chore: bump version to v${VERSION} [skip ci]`)
+
+  await triggerWorkflow('deploy.yml')
 
   console.log(`✅ Done`)
 }
