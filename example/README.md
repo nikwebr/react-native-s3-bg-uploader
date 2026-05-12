@@ -1,6 +1,6 @@
 # Getting Started
 
-This app demonstrates the features offered by react-native-s3-bg-uploader. Please be aware that files uploaded via this app are uploaded to a demo s3 bucket and are only irregulary deleted.
+This app demonstrates the features offered by react-native-s3-bg-uploader. Please be aware that files uploaded via this app are uploaded to a demo s3 bucket and are only irregularly deleted.
 
 <img src="ExampleApp.png" alt="isolated" width="200"/>
 <img src="BGContinuedProcessingTask.PNG" alt="isolated" width="200"/>

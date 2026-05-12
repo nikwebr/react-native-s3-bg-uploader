@@ -84,7 +84,10 @@ npm run example:web
 ```
 
 > [!IMPORTANT]  
-> The iOS example app does only work on a physical device and does not work on the simulator because the simulator does not support BGContinuedProcessingTask
+> Background uploads on iOS only work on a physical device as the simulator does not support the BGContinuedProcessingTask API.
+
+> [!IMPORTANT]  
+> Please do not upload confidential files. The example app is connected to a demo s3 bucket. Files are only deleted irregularly from this bucket.
 
 ### Production Builds
 #### Android
