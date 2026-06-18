@@ -33,7 +33,7 @@ jobs:
           app-id: ${{ secrets.RELEASE_BOT_SEMANTIC_RELEASE_ID }}
           private-key: ${{ secrets.RELEASE_BOT_SEMANTIC_RELEASE_PRIVATE_KEY }}
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           token: ${{ steps.generate_token.outputs.token }}
           fetch-depth: 0
