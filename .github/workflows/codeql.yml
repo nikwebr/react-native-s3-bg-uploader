@@ -23,11 +23,11 @@ jobs:
         language: [actions, javascript-typescript, ruby, rust]
     steps:
       - uses: actions/checkout@v6
-      - uses: github/codeql-action/init@v4
+      - uses: github/codeql-action/init@v4.37.4
         with:
           languages: ${{ matrix.language }}
           build-mode: none
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/analyze@v4.37.4
         with:
           category: "/language:${{ matrix.language }}"
 
@@ -55,7 +55,7 @@ jobs:
       - name: Generate iOS native bindings
         run: bun run build:ios
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@v4.37.4
         with:
           languages: swift,c-cpp
           build-mode: manual
@@ -75,7 +75,7 @@ jobs:
             -destination 'platform=iOS Simulator,name=iPhone 16' \
             build \
             CODE_SIGNING_ALLOWED=NO
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/analyze@v4.37.4
         with:
           category: "/language:swift+c-cpp"
 
@@ -104,7 +104,7 @@ jobs:
       - name: Generate Android native bindings
         run: bun run build:android
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@v4.37.4
         with:
           languages: java-kotlin,c-cpp
           build-mode: manual
@@ -114,6 +114,6 @@ jobs:
       - name: Stop Gradle daemon
         working-directory: example/android
         run: ./gradlew --stop
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/analyze@v4.37.4
         with:
           category: "/language:java-kotlin+c-cpp"
