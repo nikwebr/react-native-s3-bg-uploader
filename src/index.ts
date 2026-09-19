@@ -42,6 +42,21 @@ export const S3BgUploader: S3BgUploaderAPI = {
     }
   },
 
+  async encryptAndUploadFile(file: string | File, transferId: string, encryptionKey: string, encryptionNonce: string, userParams?: Record<string, string>): Promise<string> {
+    if (typeof file !== 'string') {
+      throw new TypeError(
+        'S3BgUploader: On native platforms, encryptAndUploadFile requires a string file path.',
+      )
+    }
+    try {
+      return await Native.encryptAndUploadFile(file, transferId, encryptionKey, encryptionNonce, userParams)
+    } catch (e: unknown) {
+      const msg = (e as Error)?.message ?? String(e)
+      if (msg.includes('DUPLICATE_FILE')) throw new S3BgUploaderDuplicateFileError(msg)
+      throw e
+    }
+  },
+
   cancelFile(fileHash: string) {
     Native.cancelFile(fileHash)
   },

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 
 use crate::core::api::ApiClient;
 use crate::core::chunk::ChunkInfo;
+use crate::core::encryption::ArcEncryptor;
 use crate::native::NativeApiClient;
 use crate::core::runtime;
 use crate::core::session::{self, UploadState};
@@ -23,7 +24,7 @@ use crate::ios::{enqueue_key, init_nyquest, IosNetwork, PAUSE_FLAG};
 pub(super) fn run_upload(file_key: &str) {
     init_nyquest();
 
-    let (file_path, run_version) = {
+    let (file_path, run_version, encryption_config) = {
         let sess = session::session();
         match sess.files.get(file_key) {
             Some(e)
@@ -36,7 +37,7 @@ pub(super) fn run_upload(file_key: &str) {
                         | UploadState::Failed
                 ) =>
             {
-                (e.file_path.clone(), e.run_version)
+                (e.file_path.clone(), e.run_version, e.encryption_config.clone())
             }
             None => return,
             _ => return,
@@ -57,6 +58,7 @@ pub(super) fn run_upload(file_key: &str) {
         file_key: file_key.to_string(),
         file_path,
         run_version,
+        encryption_config,
         api: NativeApiClient {
             network: IosNetwork { client },
         },
@@ -89,6 +91,7 @@ struct IosUploadBackend {
     file_key: String,
     file_path: String,
     run_version: u64,
+    encryption_config: Option<ArcEncryptor>,
     api: NativeApiClient<IosNetwork>,
 }
 
@@ -112,6 +115,10 @@ impl UploadBackend for IosUploadBackend {
         session::is_current_run(&self.file_key, self.run_version)
     }
 
+    fn ciphertext_overhead(&self) -> u64 {
+        self.encryption_config.as_ref().map(|e| e.ciphertext_overhead() as u64).unwrap_or(0)
+    }
+
     fn total_bytes(&self) -> Result<u64, String> {
         let file = File::open(&self.file_path).map_err(|e| e.to_string())?;
         Ok(file.metadata().map_err(|e| e.to_string())?.len())
@@ -127,6 +134,9 @@ impl UploadBackend for IosUploadBackend {
             file_key: self.file_key.clone(),
             upload_id: prepared.upload_id.clone(),
             run_version: self.run_version,
+            encryption_config: self.encryption_config.clone(),
+            total_data_parts: prepared.total_parts,
+            effective_part_size: prepared.part_size,
             network: self.api.network.clone(),
         });
         upload_engine::run_blocking_upload(
@@ -156,6 +166,9 @@ struct IosAdapter {
     file_key: String,
     upload_id: String,
     run_version: u64,
+    encryption_config: Option<ArcEncryptor>,
+    total_data_parts: u32,
+    effective_part_size: u64,
     network: IosNetwork,
 }
 
@@ -184,6 +197,9 @@ impl BlockingPlatformAdapter for IosAdapter {
             file_path: self.file_path.clone(),
             client,
             run_version: self.run_version,
+            encryption_config: self.encryption_config.clone(),
+            total_data_parts: self.total_data_parts,
+            effective_part_size: self.effective_part_size,
         }))
     }
 
@@ -206,13 +222,25 @@ struct IosWorker {
     file_path: String,
     client: nyquest::BlockingClient,
     run_version: u64,
+    encryption_config: Option<ArcEncryptor>,
+    total_data_parts: u32,
+    effective_part_size: u64,
 }
 
 impl BlockingWorker for IosWorker {
     fn read_chunk(&self, chunk: &ChunkInfo) -> Result<Vec<u8>, String> {
-        let file = File::open(&self.file_path).map_err(|e| e.to_string())?;
-        let mut reader = BufReader::new(file);
-        chunk.read(&mut reader).map_err(|e| e.to_string())
+        if let Some(enc) = &self.encryption_config {
+            if chunk.part_number == self.total_data_parts + 1 {
+                return Ok(enc.compute_footer(self.total_data_parts, self.effective_part_size).unwrap_or_default());
+            }
+            let file = File::open(&self.file_path).map_err(|e| e.to_string())?;
+            let mut reader = BufReader::new(file);
+            Ok(enc.encrypt_chunk(&chunk.read(&mut reader).map_err(|e| e.to_string())?, chunk.part_number))
+        } else {
+            let file = File::open(&self.file_path).map_err(|e| e.to_string())?;
+            let mut reader = BufReader::new(file);
+            chunk.read(&mut reader).map_err(|e| e.to_string())
+        }
     }
 
     fn upload_chunk(

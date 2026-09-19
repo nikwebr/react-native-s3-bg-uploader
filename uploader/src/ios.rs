@@ -9,6 +9,7 @@ use std::sync::{Condvar, Mutex, Once};
 use std::thread;
 
 use crate::core::{session, upload as core_upload};
+use crate::core::encryption::ArcEncryptor;
 use crate::core::session::UploadState;
 use crate::core::upload::StartResult;
 use crate::native::{BlockingNetwork, NativeApiClient};
@@ -37,6 +38,7 @@ pub(super) fn hash_and_pre_register(
     file_path: &str,
     transfer_id: &str,
     user_params: HashMap<String, String>,
+    encryption_config: Option<ArcEncryptor>,
 ) -> Result<String, String> {
     let file_hash = hash::hash_file(file_path, transfer_id)?;
     {
@@ -67,6 +69,7 @@ pub(super) fn hash_and_pre_register(
         file_name,
         file_size,
         user_params,
+        encryption_config,
     );
     Ok(file_hash)
 }
@@ -110,6 +113,9 @@ pub(super) fn initialize_and_enqueue(
     if result.should_upload() {
         if let StartResult::Resumed(ref file_key) = result {
             session::session().update_file_path(file_key, pending.file_path.clone());
+            if let Some(config) = pending.encryption_config {
+                session::session().update_encryption_config(file_key, config);
+            }
         }
         enqueue_key(result.file_key().to_string());
     }

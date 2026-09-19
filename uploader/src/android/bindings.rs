@@ -9,6 +9,7 @@ use jni::{JavaVM, JNIEnv};
 
 use crate::android::progress as androidProgress;
 use crate::android::{enqueue_front, PAUSE_FLAG, QUEUE_SIGNAL};
+use crate::core::encryption::XChaCha20Poly1305Encryptor;
 use crate::native::NativeSessionStore;
 use crate::core::runtime;
 use crate::core::session::{self, register_store, format_template, GlobalUploaderState, UploadState};
@@ -185,7 +186,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPre
     let user_params: HashMap<String, String> =
         serde_json::from_str(&params_str).unwrap_or_default();
 
-    match super::hash_and_pre_register(fd as RawFd, name, &tid, user_params) {
+    match super::hash_and_pre_register(fd as RawFd, name, &tid, user_params, None) {
         Ok(file_hash) => {
             env.new_string(&file_hash)
                 .map(|s| s.into_raw())
@@ -196,6 +197,41 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPre
                 .map(|s| s.into_raw())
                 .unwrap_or(empty_jstring(&mut env))
         }
+    }
+}
+
+/// Phase 1 (encrypted): hash fd and pre-register with XChaCha20-Poly1305 encryptor.
+/// `key_hex` = 64 hex chars (32 bytes), `nonce_hex` = 48 hex chars (24 bytes).
+#[no_mangle]
+pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPreRegisterEncrypted(
+    mut env: JNIEnv,
+    _class: JClass,
+    fd: jint,
+    file_name: JString,
+    transfer_id: JString,
+    key_hex: JString,
+    nonce_hex: JString,
+    user_params_json: JString,
+) -> jstring {
+    let name: String = env.get_string(&file_name).map(|s| s.into()).unwrap_or_else(|_| "file".to_string());
+    let tid: String = env.get_string(&transfer_id).map(|s| s.into()).unwrap_or_default();
+    let key: String = env.get_string(&key_hex).map(|s| s.into()).unwrap_or_default();
+    let nonce: String = env.get_string(&nonce_hex).map(|s| s.into()).unwrap_or_default();
+    let params_str: String = env.get_string(&user_params_json).map(|s| s.into()).unwrap_or_else(|_| "{}".to_string());
+    let user_params: HashMap<String, String> = serde_json::from_str(&params_str).unwrap_or_default();
+
+    let encryptor = match XChaCha20Poly1305Encryptor::from_hex(&key, &nonce) {
+        Ok(e) => Arc::new(e),
+        Err(e) => {
+            return env.new_string(format!("ERROR:{}", e))
+                .map(|s| s.into_raw())
+                .unwrap_or(empty_jstring(&mut env));
+        }
+    };
+
+    match super::hash_and_pre_register(fd as RawFd, name, &tid, user_params, Some(encryptor)) {
+        Ok(file_hash) => env.new_string(&file_hash).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env)),
+        Err(e) => env.new_string(format!("ERROR:{}", e)).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env)),
     }
 }
 

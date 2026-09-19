@@ -7,6 +7,7 @@ use wasm_bindgen_futures::JsFuture;
 use async_trait::async_trait;
 
 use crate::core::chunk::ChunkInfo;
+use crate::core::encryption::ArcEncryptor;
 use crate::core::runtime;
 use crate::core::upload::PreparedUpload;
 use crate::wasm::upload_engine::{self, AsyncPlatformAdapter};
@@ -17,9 +18,14 @@ use crate::wasm::progress::{self as wasmProgress, WasmProgressNotifier};
 use crate::wasm::is_pause_requested;
 
 pub(super) async fn run_upload(file_key: &str, file: web_sys::File) -> UploadOutcome {
+    let encryption_config = crate::core::session::session()
+        .files
+        .get(file_key)
+        .and_then(|e| e.encryption_config.clone());
     let backend = WasmUploadBackend {
         file_key: file_key.to_string(),
         file: std::sync::Arc::new(file),
+        encryption_config,
         api: WasmApiClient,
     };
     upload_orchestrator::run_upload(&backend).await
@@ -28,6 +34,7 @@ pub(super) async fn run_upload(file_key: &str, file: web_sys::File) -> UploadOut
 struct WasmUploadBackend {
     file_key: String,
     file: std::sync::Arc<web_sys::File>,
+    encryption_config: Option<ArcEncryptor>,
     api: WasmApiClient,
 }
 
@@ -47,6 +54,10 @@ impl UploadBackend for WasmUploadBackend {
         is_pause_requested()
     }
 
+    fn ciphertext_overhead(&self) -> u64 {
+        self.encryption_config.as_ref().map(|e| e.ciphertext_overhead() as u64).unwrap_or(0)
+    }
+
     fn on_session_completed(&self) {
         wasmProgress::progress_manager().clear();
     }
@@ -63,6 +74,9 @@ impl UploadBackend for WasmUploadBackend {
         let adapter = std::sync::Arc::new(WasmAdapter {
             file_key: self.file_key.clone(),
             upload_id: prepared.upload_id.clone(),
+            encryption_config: self.encryption_config.clone(),
+            total_data_parts: prepared.total_parts,
+            effective_part_size: prepared.part_size,
         });
         upload_engine::run_async_upload(
             adapter,
@@ -88,6 +102,9 @@ impl UploadBackend for WasmUploadBackend {
 struct WasmAdapter {
     file_key: String,
     upload_id: String,
+    encryption_config: Option<ArcEncryptor>,
+    total_data_parts: u32,
+    effective_part_size: u64,
 }
 
 impl AsyncPlatformAdapter for WasmAdapter {
@@ -112,7 +129,15 @@ impl AsyncPlatformAdapter for WasmAdapter {
     }
 
     fn read_chunk(&self, file: &web_sys::File, chunk: &ChunkInfo) -> Result<Vec<u8>, String> {
-        read_chunk_from_web_file(file, chunk)
+        if let Some(enc) = &self.encryption_config {
+            // Footer part: return encrypted chunk count instead of file data.
+            if chunk.part_number == self.total_data_parts + 1 {
+                return Ok(enc.compute_footer(self.total_data_parts, self.effective_part_size).unwrap_or_default());
+            }
+            Ok(enc.encrypt_chunk(&read_chunk_from_web_file(file, chunk)?, chunk.part_number))
+        } else {
+            read_chunk_from_web_file(file, chunk)
+        }
     }
 
     fn upload_chunk(

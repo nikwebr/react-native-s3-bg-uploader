@@ -26,6 +26,11 @@ pub trait UploadBackend {
         true
     }
 
+    /// Bytes added per chunk by AEAD tag (0 for plain uploads).
+    /// Used to compute the effective plaintext part size so ciphertext fits
+    /// exactly into the presigned-URL slot.
+    fn ciphertext_overhead(&self) -> u64 { 0 }
+
     fn total_bytes(&self) -> Result<u64, String>;
 
     async fn upload_parts(
@@ -105,7 +110,7 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
         Ok(b) => b,
         Err(e) => return UploadOutcome::Failed(e),
     };
-    let prepared = match upload::prepare_upload(&file_key, total_bytes) {
+    let prepared = match upload::prepare_upload(&file_key, total_bytes, backend.ciphertext_overhead()) {
         Ok(p) => p,
         Err(e) => return UploadOutcome::Failed(e),
     };

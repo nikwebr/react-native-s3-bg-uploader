@@ -227,6 +227,60 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
         }
     }
 
+    func encryptAndUploadFile(filePath: String, transferId: String, encryptionKey: String, encryptionNonce: String, userParams: [String: String]?) throws -> Promise<String> {
+        return Promise.parallel(HybridS3BgUploader.hashQueue) { [self] in
+            let paramsJson: String
+            if let params = userParams, !params.isEmpty {
+                let data = try JSONSerialization.data(withJSONObject: params)
+                paramsJson = String(data: data, encoding: .utf8) ?? "{}"
+            } else {
+                paramsJson = "{}"
+            }
+
+            let rawResult: String = filePath.withCString { pathPtr in
+                transferId.withCString { tidPtr in
+                    encryptionKey.withCString { keyPtr in
+                        encryptionNonce.withCString { noncePtr in
+                            paramsJson.withCString { paramsPtr in
+                                if let ptr = hash_and_pre_register_encrypted(pathPtr, tidPtr, keyPtr, noncePtr, paramsPtr) {
+                                    let h = String(cString: ptr); free_string(ptr); return h
+                                }
+                                return ""
+                            }
+                        }
+                    }
+                }
+            }
+
+            guard !rawResult.isEmpty else {
+                throw NSError(domain: "S3BgUploader", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "hash_and_pre_register_encrypted failed"])
+            }
+            guard !rawResult.hasPrefix("ERROR:") else {
+                let message = String(rawResult.dropFirst("ERROR:".count))
+                throw NSError(domain: "S3BgUploader", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: message])
+            }
+            let fileHash = rawResult
+
+            let globalState: String
+            if let ptr = get_global_state() {
+                globalState = String(cString: ptr); free_string(ptr)
+            } else {
+                globalState = "NOT_STARTED"
+            }
+            if globalState == "RUNNING" || globalState == "RUNNING_IN_BG" {
+                self.triggerInitApi(hash: fileHash, transferId: transferId)
+            } else {
+                HybridS3BgUploader.pendingHashesLock.lock()
+                HybridS3BgUploader.pendingHashes.append((hash: fileHash, transferId: transferId))
+                HybridS3BgUploader.pendingHashesLock.unlock()
+            }
+
+            return fileHash
+        }
+    }
+
     private func triggerInitApi(hash: String, transferId: String) {
         HybridS3BgUploader.initApiQueue.async {
             HybridS3BgUploader.initApiSemaphore.wait()

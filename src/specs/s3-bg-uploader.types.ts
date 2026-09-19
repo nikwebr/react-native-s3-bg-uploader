@@ -119,7 +119,7 @@ interface BaseUploaderAPI {
 export interface S3BgUploaderAPI extends BaseUploaderAPI {
   /**
    * Enqueue a file for upload. Can be called in any `GlobalUploaderState`.
-   * 
+   *
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
@@ -128,6 +128,25 @@ export interface S3BgUploaderAPI extends BaseUploaderAPI {
   uploadFile(
     file: string | File,
     transferId: string,
+    userParams?: Record<string, string>,
+  ): Promise<string>
+
+  /**
+   * Enqueue a file for encrypted upload. Each chunk is encrypted with AES-256-CTR before uploading.
+   * The encryption is resumable: the same key and nonce must be re-provided after a restart.
+   *
+   * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
+   * @param encryptionKey 64 hex characters (32 bytes) AES-256 key
+   * @param encryptionNonce 48 hex characters (24 bytes) base nonce; per-part nonce is derived deterministically
+   * @param userParams these params are added to the `startUpload()` backend call
+   * @param transferId group files in transfers to get aggregated progress reporting
+   * @returns hash of the file (considers file content, size & transferId)
+   */
+  encryptAndUploadFile(
+    file: string | File,
+    transferId: string,
+    encryptionKey: string,
+    encryptionNonce: string,
     userParams?: Record<string, string>,
   ): Promise<string>
 
@@ -148,7 +167,7 @@ export interface S3BgUploaderAPI extends BaseUploaderAPI {
 export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
   /**
    * Enqueue a file for upload. Can be called in any `GlobalUploaderState`.
-   * 
+   *
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
@@ -157,6 +176,25 @@ export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
   uploadFile(
     filePath: string,
     transferId: string,
+    userParams?: Record<string, string>,
+  ): Promise<string>
+
+  /**
+   * Enqueue a file for encrypted upload. Each chunk is encrypted with AES-256-CTR before uploading.
+   * The encryption is resumable: the same key and nonce must be re-provided after a restart.
+   *
+   * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
+   * @param encryptionKey 64 hex characters (32 bytes) AES-256 key
+   * @param encryptionNonce 48 hex characters (24 bytes) base nonce; per-part nonce is derived deterministically
+   * @param userParams these params are added to the `startUpload()` backend call
+   * @param transferId group files in transfers to get aggregated progress reporting
+   * @returns hash of the file (considers file content, size & transferId)
+   */
+  encryptAndUploadFile(
+    filePath: string,
+    transferId: string,
+    encryptionKey: string,
+    encryptionNonce: string,
     userParams?: Record<string, string>,
   ): Promise<string>
 
@@ -177,7 +215,7 @@ export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
 export interface WebS3BgUploaderAPI extends BaseUploaderAPI {
   /**
    * Enqueue a file for upload. Can be called in any `GlobalUploaderState`.
-   * 
+   *
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
@@ -186,6 +224,25 @@ export interface WebS3BgUploaderAPI extends BaseUploaderAPI {
   uploadFile(
     file: File,
     transferId: string,
+    userParams?: Record<string, string>,
+  ): Promise<string>
+
+  /**
+   * Enqueue a file for encrypted upload. Each chunk is encrypted with AES-256-CTR before uploading.
+   * The encryption is resumable: the same key and nonce must be re-provided after a restart.
+   *
+   * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
+   * @param encryptionKey 64 hex characters (32 bytes) AES-256 key
+   * @param encryptionNonce 48 hex characters (24 bytes) base nonce; per-part nonce is derived deterministically
+   * @param userParams these params are added to the `startUpload()` backend call
+   * @param transferId group files in transfers to get aggregated progress reporting
+   * @returns hash of the file (considers file content, size & transferId)
+   */
+  encryptAndUploadFile(
+    file: File,
+    transferId: string,
+    encryptionKey: string,
+    encryptionNonce: string,
     userParams?: Record<string, string>,
   ): Promise<string>
 

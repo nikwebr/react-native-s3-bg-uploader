@@ -1,7 +1,9 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+use crate::core::encryption::ArcEncryptor;
 
 // ---------------------------------------------------------------------------
 // State enums
@@ -83,6 +85,13 @@ pub struct FileEntry {
     pub run_version: u64,
     /// Extra params forwarded to startUploadApi.
     pub user_params: HashMap<String, String>,
+    /// True when this file was enqueued via encryptAndUploadFile().
+    /// Persisted so callers know to re-provide the key+nonce on resume.
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Active encryptor — not persisted, re-provided by the caller on each run.
+    #[serde(skip)]
+    pub encryption_config: Option<ArcEncryptor>,
 }
 
 impl FileEntry {
@@ -111,6 +120,8 @@ impl FileEntry {
             completed_chunk_etags: Vec::new(),
             run_version: 0,
             user_params,
+            encrypted: false,
+            encryption_config: None,
         }
     }
 
@@ -232,6 +243,8 @@ pub struct PendingFileEntry {
     pub file_name: String,
     pub file_size: u64,
     pub user_params: HashMap<String, String>,
+    /// Encryptor to apply per chunk — not persisted.
+    pub encryption_config: Option<ArcEncryptor>,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +369,15 @@ impl Session {
         }
     }
 
+    /// Re-attach an encryptor to an existing entry after an app restart.
+    /// Called when the user re-invokes encryptAndUploadFile() for a resumable file.
+    pub fn update_encryption_config(&mut self, file_key: &str, config: ArcEncryptor) {
+        if let Some(entry) = self.files.get_mut(file_key) {
+            entry.encrypted = true;
+            entry.encryption_config = Some(config);
+        }
+    }
+
     /// Phase 1 of the new upload flow: store hash + metadata; start_api not yet called.
     pub fn pre_register_file(
         &mut self,
@@ -365,6 +387,7 @@ impl Session {
         file_name: String,
         file_size: u64,
         user_params: HashMap<String, String>,
+        encryption_config: Option<ArcEncryptor>,
     ) {
         self.pending_files.insert(
             file_hash.clone(),
@@ -375,6 +398,7 @@ impl Session {
                 file_name,
                 file_size,
                 user_params,
+                encryption_config,
             },
         );
         // File is being re-provided — no longer missing.
@@ -407,6 +431,10 @@ impl Session {
         entry.upload_id = Some(upload_id);
         entry.part_size = Some(part_size);
         entry.total_parts = total_parts;
+        if let Some(config) = pending.encryption_config {
+            entry.encrypted = true;
+            entry.encryption_config = Some(config);
+        }
         self.hash_to_key.insert(file_hash.to_string(), file_key.clone());
         self.files.insert(file_key.clone(), entry);
         let transfer = self

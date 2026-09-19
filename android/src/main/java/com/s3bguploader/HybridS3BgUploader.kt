@@ -114,6 +114,46 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         }
     }
 
+    override fun encryptAndUploadFile(
+        filePath: String,
+        transferId: String,
+        encryptionKey: String,
+        encryptionNonce: String,
+        userParams: Map<String, String>?,
+    ): Promise<String> {
+        return Promise.async(hashScope) {
+            val context = appContext() ?: throw IllegalStateException("No application context")
+            StoragePathInit.ensureInit(context)
+
+            val paramsJson = if (!userParams.isNullOrEmpty()) {
+                JSONObject(userParams as Map<*, *>).toString()
+            } else {
+                "{}"
+            }
+
+            val pfd = UploadForegroundService.openAsPfdStatic(context, filePath)
+                ?: throw IllegalArgumentException("Cannot open file: $filePath")
+            val fd = pfd.detachFd()
+            val fileName = resolveFileName(context, filePath)
+
+            val rawResult = nativeHashAndPreRegisterEncrypted(fd, fileName, transferId, encryptionKey, encryptionNonce, paramsJson)
+            if (rawResult.isEmpty()) throw RuntimeException("hash_and_pre_register_encrypted failed for $filePath")
+            if (rawResult.startsWith("ERROR:")) throw RuntimeException(rawResult.removePrefix("ERROR:"))
+            val fileHash = rawResult
+
+            val globalState = nativeGetGlobalState()
+            if (globalState == "RUNNING" || globalState == "RUNNING_IN_BG") {
+                launchInitApi(fileHash, transferId, filePath)
+            } else {
+                synchronized(pendingFiles) {
+                    pendingFiles.add(PendingFile(fileHash, transferId, filePath))
+                }
+            }
+
+            fileHash
+        }
+    }
+
     private fun launchInitApi(hash: String, transferId: String, filePath: String) {
         initApiScope.launch {
             initApiSemaphore.withPermit {
@@ -282,6 +322,16 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             fd: Int,
             fileName: String,
             transferId: String,
+            userParamsJson: String,
+        ): String
+
+        /** Phase 1 (encrypted): hash fd, pre-register with encryption config. Returns file hash. Takes ownership of fd. */
+        @JvmStatic external fun nativeHashAndPreRegisterEncrypted(
+            fd: Int,
+            fileName: String,
+            transferId: String,
+            keyHex: String,
+            nonceHex: String,
             userParamsJson: String,
         ): String
 

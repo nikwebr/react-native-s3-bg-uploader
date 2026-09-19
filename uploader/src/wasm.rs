@@ -8,9 +8,11 @@ pub mod upload_engine;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use wasm_bindgen_futures::spawn_local;
 
+use crate::core::encryption::ArcEncryptor;
 use crate::core::runtime;
 use crate::core::session::{self, UploadState};
 use crate::core::upload_orchestrator::UploadOutcome;
@@ -29,6 +31,9 @@ thread_local! {
     /// Stores the web_sys::File for each pending (hashed but not yet initialized) upload.
     /// Keyed by file_hash. Cleared when start_api succeeds or on cancel_all.
     pub(crate) static PENDING_WASM_FILES: RefCell<HashMap<String, web_sys::File>> = RefCell::new(HashMap::new());
+    /// Stores the encryptor for each pending encrypted upload. Keyed by file_hash.
+    /// Not persisted — the caller re-provides key+nonce on every call to encryptAndUploadFile.
+    pub(crate) static PENDING_WASM_ENCRYPTION: RefCell<HashMap<String, ArcEncryptor>> = RefCell::new(HashMap::new());
 }
 
 /// Phase 1 only: hash file, pre-register in session, fire NOT_STARTED callback.
@@ -46,6 +51,25 @@ pub(super) async fn start_and_enqueue(
     transfer_id: String,
     user_params: HashMap<String, String>,
 ) -> Result<String, String> {
+    start_and_enqueue_inner(file, transfer_id, user_params, None).await
+}
+
+/// Encrypted variant: same as `start_and_enqueue` but attaches an encryptor.
+pub(super) async fn start_and_enqueue_encrypted(
+    file: web_sys::File,
+    transfer_id: String,
+    user_params: HashMap<String, String>,
+    encryption_config: ArcEncryptor,
+) -> Result<String, String> {
+    start_and_enqueue_inner(file, transfer_id, user_params, Some(encryption_config)).await
+}
+
+async fn start_and_enqueue_inner(
+    file: web_sys::File,
+    transfer_id: String,
+    user_params: HashMap<String, String>,
+    encryption_config: Option<ArcEncryptor>,
+) -> Result<String, String> {
     let file_hash = hash::hash_web_file(&file, &transfer_id)?;
 
     // If this hash already exists in session (resumable or completed) don't create a
@@ -60,6 +84,9 @@ pub(super) async fn start_and_enqueue(
         Some((_, true)) => {
             session::session().files_needing_provision.remove(&file_hash);
             PENDING_WASM_FILES.with(|m| m.borrow_mut().insert(file_hash.clone(), file));
+            if let Some(config) = encryption_config {
+                PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().insert(file_hash.clone(), config));
+            }
             return Ok(file_hash);
         }
         Some(_) => {
@@ -79,9 +106,13 @@ pub(super) async fn start_and_enqueue(
         file.name(),
         file.size() as u64,
         user_params,
+        encryption_config.clone(),
     );
 
     PENDING_WASM_FILES.with(|m| m.borrow_mut().insert(file_hash.clone(), file));
+    if let Some(config) = encryption_config {
+        PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().insert(file_hash.clone(), config));
+    }
     Ok(file_hash)
 }
 
@@ -108,6 +139,7 @@ pub(crate) fn process_pending_files() {
     for (file_hash, transfer_id, file_name, file_size, user_params) in pending {
         let file_opt = PENDING_WASM_FILES.with(|m| m.borrow().get(&file_hash).cloned());
         let Some(file) = file_opt else { continue };
+        let enc_opt = PENDING_WASM_ENCRYPTION.with(|m| m.borrow().get(&file_hash).cloned());
         spawn_local(async move {
             let result = crate::core::upload::start_and_register(
                 file_hash.clone(),
@@ -127,10 +159,14 @@ pub(crate) fn process_pending_files() {
                     let still_active = session::session().pending_files.contains_key(&file_hash);
                     session::session().pending_files.remove(&file_hash);
                     PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
+                    PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().remove(&file_hash));
                     if !still_active {
                         // Undo the session.files insertion made by start_and_register.
                         session::session().cancel_file(&file_key);
                         return;
+                    }
+                    if let Some(config) = enc_opt {
+                        session::session().update_encryption_config(&file_key, config);
                     }
                     runtime::notify_file_registered(wasmProgress::progress_manager(), &file_key);
                     if result.should_upload() {
@@ -166,6 +202,11 @@ pub(crate) fn process_pending_files() {
             _ => continue,
         };
         PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
+        // Restore the encryption config if the caller re-provided it.
+        let enc_opt = PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().remove(&file_hash));
+        if let Some(config) = enc_opt {
+            session::session().update_encryption_config(&file_key, config);
+        }
         runtime::notify_file_registered(wasmProgress::progress_manager(), &file_key);
         enqueue_file(file_key, file);
     }

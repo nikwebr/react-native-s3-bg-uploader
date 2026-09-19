@@ -21,6 +21,13 @@ const START_UPLOAD_API = 'https://development1.ysendit.com/upload/MobileS3/start
 const GET_UPLOAD_URLS_API = 'https://development1.ysendit.com/upload/MobileS3/getUploadUrls';
 const COMPLETE_API = 'https://development1.ysendit.com/upload/MobileS3/complete';
 
+// Test encryption key (AES-256) and nonce — 32 bytes / 24 bytes, hex-encoded.
+// In a real app these would come from your key-management system.
+const ENCRYPT_KEY = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+const ENCRYPT_NONCE = 'cafebabecafebabecafebabecafebabecafebabecafebabe';
+
+const DECRYPT_COMMAND = `python3 scripts/decrypt.py \\\n  --key ${ENCRYPT_KEY} \\\n  --nonce ${ENCRYPT_NONCE} \\\n  <downloaded.enc> <output>`;
+
 let transferCounter = 0;
 function nextTransferId(): string {
   return `transfer-${++transferCounter}`;
@@ -54,6 +61,8 @@ interface QueuedFile {
   isLoading?: boolean;
   /** True if loaded from a persisted session but not yet re-provided via uploadFile(). */
   isMissing?: boolean;
+  /** True if this file is uploaded with AES-256-CTR chunk encryption. */
+  encrypted?: boolean;
 }
 
 type SessionState = 'idle' | 'running' | 'paused';
@@ -68,6 +77,7 @@ export default function App(): React.JSX.Element {
   const [sessionState, setSessionState] = useState<SessionState>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [transferIdInput, setTransferIdInput] = useState('transfer-1');
+  const [encryptEnabled, setEncryptEnabled] = useState(false);
 
   const webInputRef = useRef<HTMLInputElement | null>(null);
   const pendingTransferIdRef = useRef<string>('');
@@ -143,13 +153,12 @@ export default function App(): React.JSX.Element {
   // Concurrently with other uploads — each item updates independently.
   // ------------------------------------------------------------------
   const runUpload = useCallback(
-    async (id: string, fileOrPath: File | string, transferId: string) => {
+    async (id: string, fileOrPath: File | string, transferId: string, encrypted = false) => {
       try {
-        const fileHash = await S3BgUploader.uploadFile(fileOrPath, transferId);
+        const fileHash = encrypted
+          ? await S3BgUploader.encryptAndUploadFile(fileOrPath, transferId, ENCRYPT_KEY, ENCRYPT_NONCE)
+          : await S3BgUploader.uploadFile(fileOrPath, transferId);
         setQueue((prev) => {
-          // Remove any other entry with the same hash (same file re-provided after restart).
-          // Must use f.id === id guard so we keep the current placeholder even if the
-          // NOT_STARTED callback already cleared isMissing on the session-restored entry.
           const withoutDuplicate = prev.filter(
             (f) => f.id === id || f.fileHash !== fileHash,
           );
@@ -158,7 +167,6 @@ export default function App(): React.JSX.Element {
           );
         });
       } catch (e) {
-        // Remove the loading placeholder on error.
         setQueue((prev) => prev.filter((q) => q.id !== id));
         setErrorMsg((e as Error)?.message ?? String(e));
       }
@@ -178,15 +186,16 @@ export default function App(): React.JSX.Element {
         name: r.name ?? r.uri,
         path: uriToPath(r.uri),
         transferId: tid,
+        encrypted: encryptEnabled,
         isLoading: true,
       }));
       setQueue((prev) => [...prev, ...newItems]);
       startListening();
-      newItems.forEach((item) => runUpload(item.id, item.path!, item.transferId));
+      newItems.forEach((item) => runUpload(item.id, item.path!, item.transferId, item.encrypted));
     } catch (e) {
       setErrorMsg((e as Error)?.message ?? String(e));
     }
-  }, [transferIdInput, startListening, runUpload]);
+  }, [transferIdInput, encryptEnabled, startListening, runUpload]);
 
   const handleAddFilesWeb = useCallback(() => {
     pendingTransferIdRef.current = transferIdInput.trim() || nextTransferId();
@@ -203,14 +212,15 @@ export default function App(): React.JSX.Element {
         name: f.name,
         webFile: f,
         transferId: tid,
+        encrypted: encryptEnabled,
         isLoading: true,
       }));
       setQueue((prev) => [...prev, ...newItems]);
       startListening();
-      newItems.forEach((item) => runUpload(item.id, item.webFile!, item.transferId));
+      newItems.forEach((item) => runUpload(item.id, item.webFile!, item.transferId, item.encrypted));
       event.target.value = '';
     },
-    [startListening, runUpload],
+    [encryptEnabled, startListening, runUpload],
   );
 
   const handleAddFiles = Platform.OS === 'web' ? handleAddFilesWeb : handleAddFilesNative;
@@ -303,6 +313,11 @@ export default function App(): React.JSX.Element {
           placeholderTextColor="#aaa"
           editable={sessionState === 'idle'}
         />
+        <TouchableOpacity
+          style={[styles.encryptToggle, encryptEnabled && styles.encryptToggleOn]}
+          onPress={() => setEncryptEnabled((v) => !v)}>
+          <Text style={styles.encryptToggleText}>{encryptEnabled ? '🔒 On' : '🔓 Off'}</Text>
+        </TouchableOpacity>
         <TouchableOpacity style={styles.addButton} onPress={handleAddFiles}>
           <Text style={styles.addButtonText}>+ Files</Text>
         </TouchableOpacity>
@@ -314,6 +329,19 @@ export default function App(): React.JSX.Element {
           <Text style={styles.missingBannerText}>
             ⚠ Files from last session are missing — reselect or cancel.
           </Text>
+        </View>
+      )}
+
+      {/* Encryption parameters — visible whenever encrypt mode is on */}
+      {encryptEnabled && (
+        <View style={styles.cryptoCard}>
+          <Text style={styles.cryptoCardTitle}>Decryption parameters</Text>
+          <Text style={styles.cryptoLabel}>Key  (32 bytes, hex)</Text>
+          <Text style={styles.cryptoValue} selectable>{ENCRYPT_KEY}</Text>
+          <Text style={styles.cryptoLabel}>Nonce  (24 bytes, hex)</Text>
+          <Text style={styles.cryptoValue} selectable>{ENCRYPT_NONCE}</Text>
+          <Text style={styles.cryptoLabel}>Decrypt command</Text>
+          <Text style={styles.cryptoCommand} selectable>{DECRYPT_COMMAND}</Text>
         </View>
       )}
 
@@ -360,6 +388,7 @@ export default function App(): React.JSX.Element {
                   <View style={styles.fileInfo}>
                     <View style={styles.fileNameRow}>
                       <Text style={styles.fileName} numberOfLines={1}>{item.name}</Text>
+                      {item.encrypted && <Text style={styles.encryptBadge}>🔒</Text>}
                       {item.isMissing && <Text style={styles.missingTag}>Missing</Text>}
                       {item.isLoading && <ActivityIndicator size="small" color="#007AFF" />}
                     </View>
@@ -389,6 +418,13 @@ export default function App(): React.JSX.Element {
                       </View>
                     ) : (
                       <Text style={styles.fileStatusText}>Ready</Text>
+                    )}
+                    {item.encrypted && (item.fileKey || (item.progress?.totalParts ?? 0) > 0) && (
+                      <Text style={styles.cryptoMeta} selectable numberOfLines={2}>
+                        {item.progress?.totalParts ? `Parts: ${item.progress.totalParts}` : ''}
+                        {item.progress?.totalParts && item.fileKey ? '  ·  ' : ''}
+                        {item.fileKey ? `S3: ${item.fileKey}` : ''}
+                      </Text>
                     )}
                   </View>
 
@@ -550,4 +586,31 @@ const styles = StyleSheet.create({
   cancelAllBtn: { backgroundColor: '#FF3B30' },
   buttonDisabled: { opacity: 0.45 },
   errorText: { marginTop: 14, color: '#FF3B30', fontSize: 14, textAlign: 'center' },
+  encryptToggle: {
+    borderRadius: 8, paddingVertical: 10, paddingHorizontal: 12,
+    backgroundColor: '#e0e0e0', borderWidth: 1.5, borderColor: '#bbb',
+  },
+  encryptToggleOn: { backgroundColor: '#34C75922', borderColor: '#34C759' },
+  encryptToggleText: { fontSize: 13, fontWeight: '600', color: '#333' },
+  encryptBadge: { fontSize: 12 },
+  cryptoCard: {
+    backgroundColor: '#1a1a2e', borderRadius: 10, padding: 14,
+    marginBottom: 14, borderWidth: 1, borderColor: '#3a3a5c',
+  },
+  cryptoCardTitle: { fontSize: 13, fontWeight: '700', color: '#a0a8d0', marginBottom: 10 },
+  cryptoLabel: { fontSize: 11, color: '#6b7280', marginBottom: 2, marginTop: 6 },
+  cryptoValue: {
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontSize: 11, color: '#e2e8f0', letterSpacing: 0.3,
+    backgroundColor: '#0f0f1e', borderRadius: 4, padding: 6, overflow: 'hidden',
+  },
+  cryptoCommand: {
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontSize: 10, color: '#86efac', letterSpacing: 0.2,
+    backgroundColor: '#0f0f1e', borderRadius: 4, padding: 6, overflow: 'hidden',
+  },
+  cryptoMeta: {
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontSize: 10, color: '#6b7280', marginTop: 3,
+  },
 });

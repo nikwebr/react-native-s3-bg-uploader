@@ -11,6 +11,7 @@ use std::sync::{Condvar, Mutex, Once};
 use std::thread;
 
 use crate::core::{session, upload as core_upload};
+use crate::core::encryption::ArcEncryptor;
 use crate::core::session::{PendingFileEntry, UploadState};
 use crate::core::upload::StartResult;
 
@@ -36,6 +37,7 @@ pub(super) fn hash_and_pre_register(
     file_name: String,
     transfer_id: &str,
     user_params: HashMap<String, String>,
+    encryption_config: Option<ArcEncryptor>,
 ) -> Result<String, String> {
     init_logging();
     let file_hash = hash::hash_fd(raw_fd, transfer_id)?;
@@ -65,6 +67,7 @@ pub(super) fn hash_and_pre_register(
         file_name,
         file_size,
         user_params,
+        encryption_config,
     );
     Ok(file_hash)
 }
@@ -106,6 +109,11 @@ pub(super) fn initialize_and_enqueue(
         return Err("cancelled".to_string());
     }
     if result.should_upload() {
+        if let StartResult::Resumed(ref file_key) = result {
+            if let Some(config) = pending.encryption_config {
+                session::session().update_encryption_config(file_key, config);
+            }
+        }
         let dup = dup_fd(raw_fd).map_err(|e| e.to_string())?;
         enqueue(result.file_key().to_string(), dup);
     }

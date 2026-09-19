@@ -10,6 +10,7 @@ use crate::android::AndroidNetwork;
 use crate::android::{build_client, dup_fd, enqueue, enqueue_front, PAUSE_FLAG};
 use crate::core::api::ApiClient;
 use crate::core::chunk::ChunkInfo;
+use crate::core::encryption::ArcEncryptor;
 use crate::core::session::{self, UploadState};
 use crate::native::NativeApiClient;
 use crate::core::runtime;
@@ -22,8 +23,8 @@ use crate::core::{clean_etag, MAX_RETRIES};
 
 pub(super) fn run_upload(file_key: &str, raw_fd: RawFd) {
     use crate::core::session;
-    let run_version = match session::session().files.get(file_key) {
-        Some(e) => e.run_version,
+    let (run_version, encryption_config) = match session::session().files.get(file_key) {
+        Some(e) => (e.run_version, e.encryption_config.clone()),
         None => {
             unsafe { libc::close(raw_fd) };
             return;
@@ -34,6 +35,7 @@ pub(super) fn run_upload(file_key: &str, raw_fd: RawFd) {
         file_key: file_key.to_string(),
         raw_fd,
         run_version,
+        encryption_config,
         api: NativeApiClient {
             network: AndroidNetwork {
                 client: build_client(),
@@ -75,6 +77,7 @@ struct AndroidUploadBackend {
     file_key: String,
     raw_fd: RawFd,
     run_version: u64,
+    encryption_config: Option<ArcEncryptor>,
     api: NativeApiClient<AndroidNetwork>,
 }
 
@@ -98,6 +101,10 @@ impl UploadBackend for AndroidUploadBackend {
         session::is_current_run(&self.file_key, self.run_version)
     }
 
+    fn ciphertext_overhead(&self) -> u64 {
+        self.encryption_config.as_ref().map(|e| e.ciphertext_overhead() as u64).unwrap_or(0)
+    }
+
     fn total_bytes(&self) -> Result<u64, String> {
         let file = unsafe { File::from_raw_fd(dup_fd(self.raw_fd).map_err(|e| e.to_string())?) };
         Ok(file.metadata().map_err(|e| e.to_string())?.len())
@@ -113,6 +120,9 @@ impl UploadBackend for AndroidUploadBackend {
             file_key: self.file_key.clone(),
             upload_id: prepared.upload_id.clone(),
             run_version: self.run_version,
+            encryption_config: self.encryption_config.clone(),
+            total_data_parts: prepared.total_parts,
+            effective_part_size: prepared.part_size,
             network: self.api.network.clone(),
         });
         upload_engine::run_blocking_upload(
@@ -144,6 +154,9 @@ struct AndroidAdapter {
     file_key: String,
     upload_id: String,
     run_version: u64,
+    encryption_config: Option<ArcEncryptor>,
+    total_data_parts: u32,
+    effective_part_size: u64,
     network: AndroidNetwork,
 }
 
@@ -168,6 +181,9 @@ impl BlockingPlatformAdapter for AndroidAdapter {
             client: build_client(),
             raw_fd: self.raw_fd,
             run_version: self.run_version,
+            encryption_config: self.encryption_config.clone(),
+            total_data_parts: self.total_data_parts,
+            effective_part_size: self.effective_part_size,
         }))
     }
 
@@ -188,13 +204,19 @@ struct AndroidWorker {
     client: reqwest::blocking::Client,
     raw_fd: RawFd,
     run_version: u64,
+    encryption_config: Option<ArcEncryptor>,
+    total_data_parts: u32,
+    effective_part_size: u64,
 }
 
 impl BlockingWorker for AndroidWorker {
     fn read_chunk(&self, chunk: &ChunkInfo) -> Result<Vec<u8>, String> {
+        if let Some(enc) = &self.encryption_config {
+            if chunk.part_number == self.total_data_parts + 1 {
+                return Ok(enc.compute_footer(self.total_data_parts, self.effective_part_size).unwrap_or_default());
+            }
+        }
         // Use pread so concurrent workers don't corrupt each other's file position.
-        // libc::dup shares the underlying file offset, so BufReader+seek across
-        // multiple threads would interleave seeks and produce wrong/truncated data.
         let mut buffer = vec![0u8; chunk.chunk_size as usize];
         let mut total_read: usize = 0;
         while total_read < chunk.chunk_size as usize {
@@ -210,12 +232,16 @@ impl BlockingWorker for AndroidWorker {
             };
             match n {
                 -1 => return Err(std::io::Error::last_os_error().to_string()),
-                0 => break, // EOF
+                0 => break,
                 n => total_read += n as usize,
             }
         }
         buffer.truncate(total_read);
-        Ok(buffer)
+        if let Some(enc) = &self.encryption_config {
+            Ok(enc.encrypt_chunk(&buffer, chunk.part_number))
+        } else {
+            Ok(buffer)
+        }
     }
 
     fn upload_chunk(

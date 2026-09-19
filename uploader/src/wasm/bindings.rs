@@ -1,12 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use wasm_bindgen::prelude::*;
 
+use crate::core::encryption::XChaCha20Poly1305Encryptor;
 use crate::core::runtime;
 use crate::core::session::{self, register_store};
 use crate::wasm::progress as wasmProgress;
 use crate::wasm::store::WasmSessionStore;
-use crate::wasm::{FILE_QUEUE, PAUSE_REQUESTED, PENDING_WASM_FILES, QUEUE_RUNNING};
+use crate::wasm::{FILE_QUEUE, PAUSE_REQUESTED, PENDING_WASM_ENCRYPTION, PENDING_WASM_FILES, QUEUE_RUNNING};
 
 #[wasm_bindgen(start)]
 pub fn wasm_start() {
@@ -58,6 +60,32 @@ pub async fn upload_file(
     Ok(JsValue::from_str(&hash))
 }
 
+/// Encrypted upload: same as `upload_file` but encrypts each chunk with XChaCha20-Poly1305.
+/// `key_hex` = 64 hex chars (32 bytes), `nonce_hex` = 48 hex chars (24 bytes).
+#[wasm_bindgen]
+pub async fn upload_file_encrypted(
+    file: web_sys::File,
+    transfer_id: String,
+    key_hex: String,
+    nonce_hex: String,
+    user_params_js: JsValue,
+) -> Result<JsValue, JsValue> {
+    let user_params = parse_user_params(user_params_js);
+    let encryptor = XChaCha20Poly1305Encryptor::from_hex(&key_hex, &nonce_hex)
+        .map_err(|e| JsValue::from_str(&format!("Invalid encryption params: {}", e)))?;
+    let hash = super::start_and_enqueue_encrypted(file, transfer_id, user_params, Arc::new(encryptor))
+        .await
+        .map_err(|e| JsValue::from_str(&format!("Upload failed: {}", e)))?;
+
+    let is_running = QUEUE_RUNNING.with(|r| *r.borrow())
+        && !PAUSE_REQUESTED.with(|p| *p.borrow());
+    if is_running {
+        crate::wasm::process_pending_files();
+    }
+
+    Ok(JsValue::from_str(&hash))
+}
+
 #[wasm_bindgen]
 pub fn wasm_cancel_file(file_hash: String) {
     let (file_key, file_name, transfer_id, total_bytes, uploaded_bytes) = {
@@ -81,6 +109,7 @@ pub fn wasm_cancel_file(file_hash: String) {
         wasmProgress::progress_manager().remove(&file_key);
     }
     PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
+    PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().remove(&file_hash));
     session::cancel_file_by_hash(&file_hash);
 
     if !transfer_id.is_empty() {
@@ -114,6 +143,7 @@ pub fn wasm_cancel_transfer(transfer_id: String) {
 pub fn wasm_cancel_all() {
     FILE_QUEUE.with(|q| q.borrow_mut().clear());
     PENDING_WASM_FILES.with(|m| m.borrow_mut().clear());
+    PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().clear());
     PAUSE_REQUESTED.with(|p| *p.borrow_mut() = false);
     QUEUE_RUNNING.with(|r| *r.borrow_mut() = false);
     session::clear_session();

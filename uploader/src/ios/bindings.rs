@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::sync::Arc;
 
+use crate::core::encryption::XChaCha20Poly1305Encryptor;
 use crate::core::runtime;
 use crate::core::session::{self, register_store, UploadState};
 use crate::ios::progress as iosProgress;
@@ -72,7 +74,7 @@ pub extern "C" fn hash_and_pre_register(
         serde_json::from_str(json_str).unwrap_or_default()
     };
 
-    match super::hash_and_pre_register(&path, &tid, user_params) {
+    match super::hash_and_pre_register(&path, &tid, user_params, None) {
         Ok(file_hash) => {
             CString::new(file_hash)
                 .map(|s| s.into_raw())
@@ -83,6 +85,52 @@ pub extern "C" fn hash_and_pre_register(
                 .map(|s| s.into_raw())
                 .unwrap_or(std::ptr::null_mut())
         }
+    }
+}
+
+/// Phase 1 (encrypted): hash file, pre-register with XChaCha20-Poly1305 encryptor.
+/// `key_hex` = 64 hex chars (32 bytes), `nonce_hex` = 48 hex chars (24 bytes).
+/// Returns file hash as C string (caller frees).
+#[no_mangle]
+pub extern "C" fn hash_and_pre_register_encrypted(
+    file_path: *const c_char,
+    transfer_id: *const c_char,
+    key_hex: *const c_char,
+    nonce_hex: *const c_char,
+    user_params_json: *const c_char,
+) -> *mut c_char {
+    if file_path.is_null() || transfer_id.is_null() || key_hex.is_null() || nonce_hex.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let path = unsafe { CStr::from_ptr(file_path) }.to_str().unwrap_or("").to_string();
+    let tid = unsafe { CStr::from_ptr(transfer_id) }.to_str().unwrap_or("").to_string();
+    let key = unsafe { CStr::from_ptr(key_hex) }.to_str().unwrap_or("");
+    let nonce = unsafe { CStr::from_ptr(nonce_hex) }.to_str().unwrap_or("");
+
+    let user_params: HashMap<String, String> = if user_params_json.is_null() {
+        HashMap::new()
+    } else {
+        let json_str = unsafe { CStr::from_ptr(user_params_json) }.to_str().unwrap_or("{}");
+        serde_json::from_str(json_str).unwrap_or_default()
+    };
+
+    let encryptor = match XChaCha20Poly1305Encryptor::from_hex(key, nonce) {
+        Ok(e) => Arc::new(e),
+        Err(e) => {
+            return CString::new(format!("ERROR:{}", e))
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+        }
+    };
+
+    match super::hash_and_pre_register(&path, &tid, user_params, Some(encryptor)) {
+        Ok(file_hash) => CString::new(file_hash)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => CString::new(format!("ERROR:{}", e))
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
     }
 }
 

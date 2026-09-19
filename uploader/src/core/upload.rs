@@ -31,10 +31,14 @@ impl StartResult {
 pub struct PreparedUpload {
     pub transfer_id: String,
     pub upload_id: String,
+    /// Plaintext bytes per chunk (= server part_size - ciphertext_overhead).
+    /// Engines use this for `start_pos` and `chunk_size` calculations.
     pub part_size: u64,
+    /// Data parts only (no footer); used for progress display.
     pub total_parts: u32,
     pub completed_etags: Vec<(u32, String)>,
     pub done_parts: HashSet<u32>,
+    /// Data + optional footer part; drives `remaining_parts`.
     pub remaining_parts: Vec<u32>,
     pub committed_bytes: u64,
 }
@@ -109,7 +113,7 @@ pub fn register_started_upload(
     file_key
 }
 
-pub fn prepare_upload(file_key: &str, total_bytes: u64) -> Result<PreparedUpload, String> {
+pub fn prepare_upload(file_key: &str, total_bytes: u64, ciphertext_overhead: u64) -> Result<PreparedUpload, String> {
     let entry = {
         let sess = session::session();
         sess.files
@@ -121,22 +125,39 @@ pub fn prepare_upload(file_key: &str, total_bytes: u64) -> Result<PreparedUpload
     let upload_id = entry
         .upload_id
         .ok_or_else(|| format!("Missing upload_id for {}", file_key))?;
-    let part_size = entry
+    let server_part_size = entry
         .part_size
         .ok_or_else(|| format!("Missing part_size for {}", file_key))?;
-    let total_parts = total_parts(total_bytes, part_size);
+
+    // When AEAD is active, each plaintext chunk is smaller by the tag size so
+    // the uploaded ciphertext fits exactly in the presigned-URL slot.
+    let effective_part_size = server_part_size.saturating_sub(ciphertext_overhead);
+    let total_data_parts = total_parts(total_bytes, effective_part_size);
+
     let completed_etags = entry.completed_chunk_etags;
     let done_parts: HashSet<u32> = completed_etags.iter().map(|(p, _)| *p).collect();
-    let remaining_parts = (1..=total_parts)
+
+    // Include footer part (total_data_parts + 1) in remaining_parts when
+    // the encryptor adds overhead. The adapter's read_chunk detects this
+    // special part number and returns compute_footer() bytes instead of
+    // reading from the file.
+    let last_part = if ciphertext_overhead > 0 { total_data_parts + 1 } else { total_data_parts };
+    let remaining_parts = (1..=last_part)
         .filter(|p| !done_parts.contains(p))
         .collect();
-    let committed_bytes = completed_bytes(&done_parts, part_size, total_bytes);
+
+    // Committed bytes: only data parts, not the footer.
+    let committed_bytes = done_parts
+        .iter()
+        .filter(|&&p| p <= total_data_parts)
+        .map(|&p| part_size_for(p, effective_part_size, total_bytes))
+        .sum();
 
     Ok(PreparedUpload {
         transfer_id: entry.transfer_id,
         upload_id,
-        part_size,
-        total_parts,
+        part_size: effective_part_size,
+        total_parts: total_data_parts,
         completed_etags,
         done_parts,
         remaining_parts,
