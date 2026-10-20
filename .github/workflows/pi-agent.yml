@@ -1,0 +1,98 @@
+name: Pi Agent
+
+on:
+  # Trigger when @agent-serviceuser is assigned to an issue or PR
+  issues:
+    types: [assigned]
+  pull_request:
+    types: [assigned, review_requested]
+
+  # Trigger on new comments to issues/PRs
+  issue_comment:
+    types: [created]
+
+  # Trigger on new PR review comments
+  pull_request_review_comment:
+    types: [created]
+
+  # Trigger on PR reviews (for @mention in review body)
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  pi-agent:
+    # Determine if this event should trigger the agent:
+    # 1. Assigned to @agent-serviceuser (issue or PR assignment)
+    # 2. Reviewer @agent-serviceuser added to a PR
+    # 3. Comment on an issue/PR where @agent-serviceuser is assigned
+    # 4. @agent-serviceuser is mentioned in a comment
+    # In all cases: never trigger on @agent-serviceuser's own comments
+    if: |
+      (
+        github.event_name == 'issues' &&
+        github.event.action == 'assigned' &&
+        github.event.assignee.login == 'agent-serviceuser'
+      ) || (
+        github.event_name == 'pull_request' &&
+        github.event.action == 'assigned' &&
+        github.event.assignee.login == 'agent-serviceuser'
+      ) || (
+        github.event_name == 'pull_request' &&
+        github.event.action == 'review_requested' &&
+        github.event.requested_reviewer.login == 'agent-serviceuser'
+      ) || (
+        github.event_name == 'issue_comment' &&
+        github.event.comment.user.login != 'agent-serviceuser' &&
+        (
+          contains(github.event.comment.body, '@agent-serviceuser') ||
+          contains(toJson(github.event.issue.assignees), '"agent-serviceuser"')
+        )
+      ) || (
+        github.event_name == 'pull_request_review_comment' &&
+        github.event.comment.user.login != 'agent-serviceuser' &&
+        (
+          contains(github.event.comment.body, '@agent-serviceuser') ||
+          contains(toJson(github.event.pull_request.assignees), '"agent-serviceuser"')
+        )
+      ) || (
+        github.event_name == 'pull_request_review' &&
+        github.event.review.user.login != 'agent-serviceuser' &&
+        contains(github.event.review.body, '@agent-serviceuser')
+      )
+
+    runs-on: macos-latest
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install remote-pi and print pairing QR
+        run: |
+          pi install npm:remote-pi
+          pi -p "/remote-pi pair" 2>&1 || true
+
+      - name: Run Pi agent
+        uses: shaftoe/pi-coding-agent-action@v2
+        env:
+          REMOTE_PI_DIRECT_CONFIG: '{"agent_name":"checkokay-ci","auto_start_relay":true}'
+          REMOTE_PI_RELAY: ${{ vars.REMOTE_PI_RELAY }}
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          provider: deepseek
+          model: deepseek-flash
+          token: ${{ secrets.DEEPSEEK_API_KEY }}
+          update_comment: true
+          enable_codemode: true
+          enable_tool_search: true
+          extensions: |
+            npm:remote-pi
