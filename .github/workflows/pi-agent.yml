@@ -92,4 +92,4 @@ jobs:
           enable_tool_search: true
       - name: Echo share link
         if: ${{ steps.pi.outputs.share_url }}
-        run: echo "Session: ${{ steps.pi.outputs.share_url }}"
+        run: echo "Session ${{ steps.pi.outputs.share_url }}"
