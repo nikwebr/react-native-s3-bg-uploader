@@ -76,23 +76,20 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install remote-pi and print pairing QR
-        run: |
-          pi install npm:remote-pi
-          pi -p "/remote-pi pair" 2>&1 || true
-
       - name: Run Pi agent
         uses: shaftoe/pi-coding-agent-action@v2
         env:
           REMOTE_PI_DIRECT_CONFIG: '{"agent_name":"checkokay-ci","auto_start_relay":true}'
           REMOTE_PI_RELAY: ${{ vars.REMOTE_PI_RELAY }}
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          share_session: true
+          github_token: ${{ secrets.GH_TOKEN }}
           provider: deepseek
           model: deepseek-flash
           token: ${{ secrets.DEEPSEEK_API_KEY }}
           update_comment: true
           enable_codemode: true
           enable_tool_search: true
-          extensions: |
-            npm:remote-pi
+      - name: Echo share link
+        if: ${{ steps.pi.outputs.share_url }}
+        run: echo "Session: ${{ steps.pi.outputs.share_url }}"
