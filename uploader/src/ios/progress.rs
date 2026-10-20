@@ -95,10 +95,16 @@ impl ProgressReader {
 impl Read for ProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if crate::ios::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "paused"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "paused",
+            ));
         }
         if !crate::core::session::is_current_run(&self.file_key, self.run_version) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stale run"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "stale run",
+            ));
         }
         let n = self.inner.read(buf)?;
         if n > 0 {

@@ -26,10 +26,23 @@ pub trait UploadBackend {
         true
     }
 
-    /// Bytes added per chunk by AEAD tag (0 for plain uploads).
+    /// Bytes added per chunk by the active encryptor (0 for plain uploads).
     /// Used to compute the effective plaintext part size so ciphertext fits
     /// exactly into the presigned-URL slot.
-    fn ciphertext_overhead(&self) -> u64 { 0 }
+    fn ciphertext_overhead(&self) -> u64 {
+        0
+    }
+
+    /// Whether the active encryptor's wire format ends with a synthesised
+    /// descriptor. Defaults to `overhead > 0` (the built-in AEAD layout).
+    fn has_footer(&self) -> bool {
+        self.ciphertext_overhead() > 0
+    }
+
+    /// Bytes the descriptor occupies in the last data part (0 when there is none).
+    fn footer_len(&self) -> u64 {
+        0
+    }
 
     fn total_bytes(&self) -> Result<u64, String>;
 
@@ -82,20 +95,12 @@ pub async fn run_upload<B: UploadBackend>(backend: &B) -> UploadOutcome {
                 runtime::mark_state_persist(&file_key, UploadState::Paused);
                 // Ensure the ProgressManager reflects Paused (clears in-flight bytes) even
                 // when pause_all ran before init_progress created the ProgressManager entry.
-                runtime::set_status(
-                    backend.progress_manager(),
-                    &file_key,
-                    UploadState::Paused,
-                );
+                runtime::set_status(backend.progress_manager(), &file_key, UploadState::Paused);
             }
         }
         UploadOutcome::Failed(e) => {
             runtime::mark_state_persist(&file_key, UploadState::Failed);
-            runtime::set_status(
-                backend.progress_manager(),
-                &file_key,
-                UploadState::Failed,
-            );
+            runtime::set_status(backend.progress_manager(), &file_key, UploadState::Failed);
             log_error(&file_key, e);
         }
     }
@@ -110,7 +115,13 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
         Ok(b) => b,
         Err(e) => return UploadOutcome::Failed(e),
     };
-    let prepared = match upload::prepare_upload(&file_key, total_bytes, backend.ciphertext_overhead()) {
+    let prepared = match upload::prepare_upload(
+        &file_key,
+        total_bytes,
+        backend.ciphertext_overhead(),
+        backend.has_footer(),
+        backend.footer_len(),
+    ) {
         Ok(p) => p,
         Err(e) => return UploadOutcome::Failed(e),
     };
@@ -141,9 +152,7 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
 
     let new_results = match backend.upload_parts(&prepared, total_bytes).await {
         Ok(r) => r,
-        Err(e)
-            if backend.is_paused() || e.contains("paused") || e.contains("stale run") =>
-        {
+        Err(e) if backend.is_paused() || e.contains("paused") || e.contains("stale run") => {
             return UploadOutcome::Paused;
         }
         Err(e) => {
@@ -162,15 +171,15 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
         }
     };
 
-    let all_results =
-        upload::combine_upload_results(prepared.completed_etags.clone(), new_results);
+    let all_results = upload::combine_upload_results(prepared.completed_etags.clone(), new_results);
     if !backend.is_current_run() {
         return UploadOutcome::Paused;
     }
-    match backend.complete_upload(&prepared.upload_id, all_results).await {
-        Ok(_) => {
-            UploadOutcome::Completed
-        }
+    match backend
+        .complete_upload(&prepared.upload_id, all_results)
+        .await
+    {
+        Ok(_) => UploadOutcome::Completed,
         Err(e) if e.contains("stale run") => UploadOutcome::Paused,
         Err(e) => UploadOutcome::Failed(e),
     }

@@ -145,6 +145,17 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     }
 
     // -------------------------------------------------------------------------
+    // Custom encryptor registration
+    // -------------------------------------------------------------------------
+
+    /// Register a host-provided custom encryptor factory.
+    /// Only the vtable is passed here: key material arrives with each upload.
+    func registerCustomEncryptor(vtablePointer: Double) throws {
+        register_custom_encryptor(
+            UnsafePointer<EncryptorVTable>(bitPattern: UInt(vtablePointer))
+        )
+    }
+    // -------------------------------------------------------------------------
     // Progress callback
     // -------------------------------------------------------------------------
 
@@ -237,11 +248,11 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
                 paramsJson = "{}"
             }
 
-            let rawResult: String = filePath.withCString { pathPtr in
-                transferId.withCString { tidPtr in
-                    encryptionKey.withCString { keyPtr in
-                        encryptionNonce.withCString { noncePtr in
-                            paramsJson.withCString { paramsPtr in
+            let rawResult: String = filePath.withCString { pathPtr -> String in
+                transferId.withCString { tidPtr -> String in
+                    encryptionKey.withCString { keyPtr -> String in
+                        encryptionNonce.withCString { noncePtr -> String in
+                            paramsJson.withCString { paramsPtr -> String in
                                 if let ptr = hash_and_pre_register_encrypted(pathPtr, tidPtr, keyPtr, noncePtr, paramsPtr) {
                                     let h = String(cString: ptr); free_string(ptr); return h
                                 }

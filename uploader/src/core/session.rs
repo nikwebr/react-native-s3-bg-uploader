@@ -435,7 +435,8 @@ impl Session {
             entry.encrypted = true;
             entry.encryption_config = Some(config);
         }
-        self.hash_to_key.insert(file_hash.to_string(), file_key.clone());
+        self.hash_to_key
+            .insert(file_hash.to_string(), file_key.clone());
         self.files.insert(file_key.clone(), entry);
         let transfer = self
             .transfers
@@ -759,10 +760,15 @@ impl Session {
             GlobalUploaderState::Running
         } else if entries.iter().any(|e| e.state == UploadState::Failed) {
             GlobalUploaderState::Failed
-        } else if entries
-            .iter()
-            .all(|e| matches!(e.state, UploadState::Paused | UploadState::Completed | UploadState::NotStarted | UploadState::Initialized))
-            && entries.iter().any(|e| e.state == UploadState::Paused)
+        } else if entries.iter().all(|e| {
+            matches!(
+                e.state,
+                UploadState::Paused
+                    | UploadState::Completed
+                    | UploadState::NotStarted
+                    | UploadState::Initialized
+            )
+        }) && entries.iter().any(|e| e.state == UploadState::Paused)
         {
             GlobalUploaderState::Paused
         } else {
@@ -879,7 +885,8 @@ pub fn register_store(store: impl SessionStore + 'static) {
 pub fn session() -> MutexGuard<'static, Session> {
     SESSION
         .get_or_init(|| {
-            let mut initial = STORE.get()
+            let mut initial = STORE
+                .get()
                 .and_then(|s| s.load())
                 .unwrap_or_else(Session::new);
             initial.recompute_needs_provision();

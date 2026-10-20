@@ -32,7 +32,11 @@ pub fn pause_all<N: ProgressNotifier>(manager: &ProgressManager<N>) {
         manager
             .tracked_file_keys()
             .into_iter()
-            .filter(|k| sess.files.get(k).map_or(false, |e| e.state == UploadState::Paused))
+            .filter(|k| {
+                sess.files
+                    .get(k)
+                    .map_or(false, |e| e.state == UploadState::Paused)
+            })
             .collect()
     };
     for file_key in &paused_keys {
@@ -202,7 +206,13 @@ pub fn notify_file_registered<N: ProgressNotifier>(manager: &ProgressManager<N>,
         .map(|e| match e.state.clone() {
             UploadState::Completed => UploadState::Completed,
             // Any non-completed file: show progress if it has some, else INITIALIZED.
-            _ => if committed_bytes > 0 { UploadState::Paused } else { UploadState::Initialized },
+            _ => {
+                if committed_bytes > 0 {
+                    UploadState::Paused
+                } else {
+                    UploadState::Initialized
+                }
+            }
         })
         .unwrap_or(UploadState::Initialized);
     drop(sess);

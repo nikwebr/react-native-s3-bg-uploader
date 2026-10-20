@@ -8,10 +8,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, Once};
 use std::thread;
 
-use crate::core::{session, upload as core_upload};
 use crate::core::encryption::ArcEncryptor;
 use crate::core::session::UploadState;
 use crate::core::upload::StartResult;
+use crate::core::{session, upload as core_upload};
 use crate::native::{BlockingNetwork, NativeApiClient};
 
 pub(crate) static INIT: Once = Once::new();
@@ -21,13 +21,12 @@ pub(crate) struct UploadQueue {
     pub pending_keys: HashSet<String>,
 }
 
-pub(crate) static QUEUE: std::sync::LazyLock<Mutex<UploadQueue>> =
-    std::sync::LazyLock::new(|| {
-        Mutex::new(UploadQueue {
-            pending: std::collections::VecDeque::new(),
-            pending_keys: HashSet::new(),
-        })
-    });
+pub(crate) static QUEUE: std::sync::LazyLock<Mutex<UploadQueue>> = std::sync::LazyLock::new(|| {
+    Mutex::new(UploadQueue {
+        pending: std::collections::VecDeque::new(),
+        pending_keys: HashSet::new(),
+    })
+});
 pub(crate) static QUEUE_SIGNAL: Condvar = Condvar::new();
 static WORKER_STARTED: Once = Once::new();
 pub(crate) static PAUSE_FLAG: AtomicBool = AtomicBool::new(false);
@@ -48,10 +47,16 @@ pub(super) fn hash_and_pre_register(
                 return Ok(file_hash);
             }
             if !entry.is_resumable() {
-                return Err(format!("DUPLICATE_FILE: file with hash {} is already active in this session", file_hash));
+                return Err(format!(
+                    "DUPLICATE_FILE: file with hash {} is already active in this session",
+                    file_hash
+                ));
             }
         } else if sess.pending_files.contains_key(&file_hash) {
-            return Err(format!("DUPLICATE_FILE: file with hash {} is already pending in this session", file_hash));
+            return Err(format!(
+                "DUPLICATE_FILE: file with hash {} is already pending in this session",
+                file_hash
+            ));
         }
     }
     let file_name = std::path::Path::new(file_path)
@@ -76,10 +81,7 @@ pub(super) fn hash_and_pre_register(
 
 /// Phase 2: call start_api for a pre-registered file, then enqueue it for upload.
 /// Returns the file key on success.
-pub(super) fn initialize_and_enqueue(
-    file_hash: &str,
-    transfer_id: &str,
-) -> Result<String, String> {
+pub(super) fn initialize_and_enqueue(file_hash: &str, transfer_id: &str) -> Result<String, String> {
     init_nyquest();
     let pending = session::session()
         .pending_files
@@ -91,7 +93,9 @@ pub(super) fn initialize_and_enqueue(
         .request_timeout(std::time::Duration::from_secs(30))
         .build_blocking()
         .map_err(|e| format!("Failed to create client: {:?}", e))?;
-    let api = NativeApiClient { network: IosNetwork { client } };
+    let api = NativeApiClient {
+        network: IosNetwork { client },
+    };
     let result = pollster::block_on(core_upload::start_and_register(
         file_hash.to_string(),
         transfer_id,
@@ -111,11 +115,15 @@ pub(super) fn initialize_and_enqueue(
         return Err("cancelled".to_string());
     }
     if result.should_upload() {
+        // Carry the caller's encryptor over for EVERY upload path, not only a resume:
+        // a fresh upload is registered by start_and_register with encryption_config = None,
+        // so leaving this inside the Resumed arm silently uploads the file as plaintext
+        // even though the caller asked for encryption.
+        if let Some(config) = pending.encryption_config.clone() {
+            session::session().update_encryption_config(result.file_key(), config);
+        }
         if let StartResult::Resumed(ref file_key) = result {
             session::session().update_file_path(file_key, pending.file_path.clone());
-            if let Some(config) = pending.encryption_config {
-                session::session().update_encryption_config(file_key, config);
-            }
         }
         enqueue_key(result.file_key().to_string());
     }
@@ -183,6 +191,20 @@ impl BlockingNetwork for IosNetwork {
         let body = nyquest::Body::bytes(body_json.into_bytes(), "application/json");
         let request = nyquest::Request::post(url.to_string()).with_body(body);
         let response = self.client.request(request)?;
-        response.text().map_err(|e| e.into())
+        // A non-2xx answer is a failure, not a result. The backend reports a rejected
+        // S3 completion (e.g. EntityTooSmall) as an HTTP error; reading the body as if
+        // it were success is how an upload "finishes" with an empty bucket and no log.
+        let status = response.status();
+        let text = response.text()?;
+        if !status.is_successful() {
+            return Err(format!(
+                "HTTP {} from {}: {}",
+                status.code(),
+                url,
+                text.chars().take(300).collect::<String>()
+            )
+            .into());
+        }
+        Ok(text)
     }
 }

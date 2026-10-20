@@ -28,7 +28,14 @@ pub struct UploadProgress {
 }
 
 impl UploadProgress {
-    pub fn new(file_key: String, file_name: String, file_hash: String, transfer_id: String, total_bytes: u64, total_parts: u32) -> Self {
+    pub fn new(
+        file_key: String,
+        file_name: String,
+        file_hash: String,
+        transfer_id: String,
+        total_bytes: u64,
+        total_parts: u32,
+    ) -> Self {
         Self {
             file_key,
             file_name,
@@ -176,7 +183,14 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         session_agg: AggregateProgress,
         transfer_agg: AggregateProgress,
     ) {
-        let mut p = UploadProgress::new(file_key.clone(), file_name, file_hash, transfer_id, total_bytes, total_parts);
+        let mut p = UploadProgress::new(
+            file_key.clone(),
+            file_name,
+            file_hash,
+            transfer_id,
+            total_bytes,
+            total_parts,
+        );
         p.completed_bytes = already_completed_bytes;
         p.completed_parts = already_completed_parts;
         let fp = p.to_file_progress();
@@ -286,7 +300,14 @@ impl<N: ProgressNotifier> ProgressManager<N> {
             self.notifier.notify(&fp, &session_agg, &transfer_agg);
             return;
         }
-        let mut p = UploadProgress::new(file_key.clone(), file_name, file_hash, transfer_id, total_bytes, 0);
+        let mut p = UploadProgress::new(
+            file_key.clone(),
+            file_name,
+            file_hash,
+            transfer_id,
+            total_bytes,
+            0,
+        );
         p.status = state;
         p.completed_bytes = committed_bytes;
         p.completed_parts = committed_parts;

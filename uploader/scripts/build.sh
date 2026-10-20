@@ -145,13 +145,14 @@ if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
         echo "  cargo install cbindgen"
     fi
 
-    echo -e "${BLUE}🔧 Fixing dylib install names...${NC}"
-    install_name_tool -id "@rpath/libuploader.framework/libuploader" \
-        $TARGET_DIR/aarch64-apple-ios/release/libuploader.dylib
-    install_name_tool -id "@rpath/libuploader.framework/libuploader" \
-        $TARGET_DIR/aarch64-apple-ios-sim/release/libuploader.dylib
-    install_name_tool -id "@rpath/libuploader.framework/libuploader" \
-        $TARGET_DIR/x86_64-apple-ios/release/libuploader.dylib
+    # The install name is set at link time (see .cargo/config.toml): running
+    # install_name_tool here would misalign __LINKEDIT and Xcode 26's ld would
+    # reject the framework when an app links it for a device build.
+    echo -e "${BLUE}🔧 Checking dylib install names (set at link time)...${NC}"
+    for T in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
+        otool -l "$TARGET_DIR/$T/release/libuploader.dylib" | grep -A2 LC_ID_DYLIB | grep -q "@rpath/libuploader.framework/libuploader" \
+            || { echo -e "${RED}✗ $T has the wrong install name${NC}"; exit 1; }
+    done
 
     echo -e "${BLUE}🔗 Creating universal simulator fat dylib (lipo)...${NC}"
     mkdir -p $TARGET_DIR/universal-ios-sim/release
@@ -160,6 +161,12 @@ if [[ "$1" == "ios" ]] || [[ "$1" == "all" ]]; then
         $TARGET_DIR/x86_64-apple-ios/release/libuploader.dylib \
         -output $TARGET_DIR/universal-ios-sim/release/libuploader.dylib
 
+    # Deliberately NOT signed here: the framework keeps its Info.plist bundle id
+    # (com.rust.libuploader) only while unsigned, and the host app's "Embed & Sign"
+    # phase signs it with the app identity. An ad-hoc signature made here gets a
+    # derived identifier (libuploader-<hash>) that Xcode then does not replace, and
+    # installd rejects the app: "Code signing identifier ... does not match bundle
+    # identifier".
     echo -e "${BLUE}🏗️  Creating .framework bundles...${NC}"
 
     make_framework() {

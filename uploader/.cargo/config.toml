@@ -1,3 +1,35 @@
+# iOS dylib link flags:
+#  - install_name at link time (install_name_tool would rewrite __LINKEDIT in place)
+#  - chained fixups: Xcode 26's ld rejects the classic LC_DYLD_INFO layout of a
+#    Rust dylib with "mis-aligned LINKEDIT string pool" (stroff was mod 8 = 4).
+#    With chained fixups the string pool is 8-aligned and device links succeed.
+#  - platform_version: emit LC_BUILD_VERSION (ios, minos=15.1, sdk=27.0) instead
+#    of the legacy LC_VERSION_MIN_IPHONEOS. dyld on iOS 26+ traps at launch when
+#    it encounters the old load command in a framework.
+[target.aarch64-apple-ios]
+rustflags = [
+    "-C", "link-arg=-install_name",
+    "-C", "link-arg=@rpath/libuploader.framework/libuploader",
+    "-C", "link-arg=-Wl,-fixup_chains",
+    "-C", "link-arg=-Wl,-platform_version,ios,15.1.0,27.0.0",
+]
+
+[target.aarch64-apple-ios-sim]
+rustflags = [
+    "-C", "link-arg=-install_name",
+    "-C", "link-arg=@rpath/libuploader.framework/libuploader",
+    "-C", "link-arg=-Wl,-fixup_chains",
+    "-C", "link-arg=-Wl,-platform_version,ios-simulator,15.1.0,27.0.0",
+]
+
+[target.x86_64-apple-ios]
+rustflags = [
+    "-C", "link-arg=-install_name",
+    "-C", "link-arg=@rpath/libuploader.framework/libuploader",
+    "-C", "link-arg=-Wl,-fixup_chains",
+    "-C", "link-arg=-Wl,-platform_version,ios-simulator,15.1.0,27.0.0",
+]
+
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android-clang"
 

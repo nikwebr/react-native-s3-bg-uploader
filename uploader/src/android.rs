@@ -10,10 +10,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, Once};
 use std::thread;
 
-use crate::core::{session, upload as core_upload};
 use crate::core::encryption::ArcEncryptor;
 use crate::core::session::{PendingFileEntry, UploadState};
 use crate::core::upload::StartResult;
+use crate::core::{session, upload as core_upload};
 
 struct DescriptorForFileKey {
     file_key: String,
@@ -40,7 +40,10 @@ pub(super) fn hash_and_pre_register(
     encryption_config: Option<ArcEncryptor>,
 ) -> Result<String, String> {
     init_logging();
-    let file_hash = hash::hash_fd(raw_fd, transfer_id)?;
+    let file_hash = hash::hash_fd(raw_fd, transfer_id).map_err(|e| {
+        log::error!("pre_register: hashing failed for transfer {}: {}", transfer_id, e);
+        e
+    })?;
     {
         let sess = session::session();
         if let Some(entry) = sess.find_by_hash(&file_hash) {
@@ -48,15 +51,31 @@ pub(super) fn hash_and_pre_register(
                 return Ok(file_hash);
             }
             if !entry.is_resumable() {
-                return Err(format!("DUPLICATE_FILE: file with hash {} is already active in this session", file_hash));
+                let msg = format!(
+                    "DUPLICATE_FILE: file with hash {} is already active in this session (state {:?})",
+                    file_hash, entry.state
+                );
+                log::error!("pre_register rejected: {}", msg);
+                return Err(msg);
             }
+            log::info!("pre_register: resumable existing entry for {} ({:?})", file_hash, entry.state);
         } else if sess.pending_files.contains_key(&file_hash) {
-            return Err(format!("DUPLICATE_FILE: file with hash {} is already pending in this session", file_hash));
+            let msg = format!(
+                "DUPLICATE_FILE: file with hash {} is already pending in this session",
+                file_hash
+            );
+            log::error!("pre_register rejected: {}", msg);
+            return Err(msg);
         }
     }
     let dup_for_size = unsafe { libc::dup(raw_fd) };
     let file_size = if dup_for_size != -1 {
-        unsafe { File::from_raw_fd(dup_for_size).metadata().map(|m| m.len()).unwrap_or(0) }
+        unsafe {
+            File::from_raw_fd(dup_for_size)
+                .metadata()
+                .map(|m| m.len())
+                .unwrap_or(0)
+        }
     } else {
         0
     };
@@ -82,16 +101,33 @@ pub(super) fn initialize_and_enqueue(
         .pending_files
         .get(file_hash)
         .cloned()
-        .ok_or_else(|| format!("no pending entry for hash {}", file_hash))?;
+        .ok_or_else(|| {
+            let msg = format!(
+                "no pending entry for hash {} (pending now: {:?})",
+                file_hash,
+                session::session().pending_files.keys().collect::<Vec<_>>()
+            );
+            log::error!("initialize_and_enqueue: {}", msg);
+            msg
+        })?;
 
     let dup_for_size = unsafe { libc::dup(raw_fd) };
     let file_size = if dup_for_size != -1 {
-        unsafe { File::from_raw_fd(dup_for_size).metadata().map(|m| m.len()).unwrap_or(0) }
+        unsafe {
+            File::from_raw_fd(dup_for_size)
+                .metadata()
+                .map(|m| m.len())
+                .unwrap_or(0)
+        }
     } else {
         pending.file_size
     };
 
-    let api = NativeApiClient { network: AndroidNetwork { client: build_client() } };
+    let api = NativeApiClient {
+        network: AndroidNetwork {
+            client: build_client(),
+        },
+    };
     let result = pollster::block_on(core_upload::start_and_register(
         file_hash.to_string(),
         transfer_id,
@@ -100,7 +136,13 @@ pub(super) fn initialize_and_enqueue(
         file_size,
         pending.user_params.clone(),
         &api,
-    ))?;
+    ))
+    .map_err(|e| {
+        // eprintln! never reaches logcat on Android; log at error level so a failed
+        // start is diagnosable from `adb logcat`.
+        log::error!("start_and_register failed for {}: {}", file_hash, e);
+        e
+    })?;
     // Check if cancel_all fired while we were blocked on the network call.
     let still_active = session::session().pending_files.contains_key(file_hash);
     session::session().pending_files.remove(file_hash);
@@ -109,10 +151,15 @@ pub(super) fn initialize_and_enqueue(
         return Err("cancelled".to_string());
     }
     if result.should_upload() {
+        // Carry the caller's encryptor over for EVERY upload path, not only a resume:
+        // a fresh upload is registered by start_and_register with encryption_config = None,
+        // so leaving this inside the Resumed arm silently uploads the file as plaintext
+        // even though the caller asked for encryption.
+        if let Some(config) = pending.encryption_config.clone() {
+            session::session().update_encryption_config(result.file_key(), config);
+        }
         if let StartResult::Resumed(ref file_key) = result {
-            if let Some(config) = pending.encryption_config {
-                session::session().update_encryption_config(file_key, config);
-            }
+            session::session().update_file_path(file_key, pending.file_path.clone());
         }
         let dup = dup_fd(raw_fd).map_err(|e| e.to_string())?;
         enqueue(result.file_key().to_string(), dup);
@@ -202,7 +249,15 @@ impl BlockingNetwork for AndroidNetwork {
             .header("Content-Type", "application/json")
             .body(body_json)
             .send()?;
-        response.text().map_err(|e| e.into())
+        // See the iOS twin: a non-2xx answer must fail the call instead of being
+        // handed back as if it were the response body.
+        let status = response.status();
+        let text = response.text().map_err(|e| format!("response body: {e}"))?;
+        if !status.is_success() {
+            let body: String = text.chars().take(300).collect();
+            return Err(format!("HTTP {} from {}: {}", status.as_u16(), url, body).into());
+        }
+        Ok(text)
     }
 }
 

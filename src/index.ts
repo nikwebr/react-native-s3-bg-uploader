@@ -5,10 +5,21 @@ import type {
   ProgressCallback,
   S3BgUploaderAPI,
   UploadProgress,
+  WebEncryptorOptions,
 } from './specs/s3-bg-uploader.types'
 import { S3BgUploaderResumeError, S3BgUploaderDuplicateFileError } from './specs/s3-bg-uploader.types'
 
 const Native = NitroModules.createHybridObject<S3BgUploaderSpec>('S3BgUploader')
+
+/** Progress + configuration types, so consumers need no deep import path. */
+export type {
+  AggregateProgress,
+  GlobalUploaderState,
+  ProgressCallback,
+  UploadProgress,
+  UploadState,
+} from './specs/s3-bg-uploader.types'
+
 
 export const S3BgUploader: S3BgUploaderAPI = {
   setConfig(startUploadApi, getUploadUrlsApi, completeApi) {
@@ -25,6 +36,18 @@ export const S3BgUploader: S3BgUploaderAPI = {
 
   setTaskSubtitle(subtitle: string) {
     Native.setTaskSubtitle(subtitle)
+  },
+
+  registerCustomEncryptor(vtablePointer: number) {
+    Native.registerCustomEncryptor(vtablePointer)
+  },
+
+  registerWebEncryptor(_options: WebEncryptorOptions): Promise<void> {
+    return Promise.reject(
+      new Error(
+        'S3BgUploader: registerWebEncryptor is web-only. On native platforms register a compiled encryptor with registerCustomEncryptor().',
+      ),
+    )
   },
 
   async uploadFile(file: string | File, transferId: string, userParams?: Record<string, string>): Promise<string> {

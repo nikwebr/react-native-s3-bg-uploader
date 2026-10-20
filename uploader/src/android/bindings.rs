@@ -1,18 +1,21 @@
 use std::collections::HashMap;
+use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use jni::objects::{GlobalRef, JClass, JString, JValue};
-use jni::sys::{jint, jstring};
-use jni::{JavaVM, JNIEnv};
+use jni::sys::{jint, jlong, jstring};
+use jni::{JNIEnv, JavaVM};
 
 use crate::android::progress as androidProgress;
 use crate::android::{enqueue_front, PAUSE_FLAG, QUEUE_SIGNAL};
-use crate::core::encryption::XChaCha20Poly1305Encryptor;
-use crate::native::NativeSessionStore;
+use crate::core::encryption::{self, XChaCha20Poly1305Encryptor};
 use crate::core::runtime;
-use crate::core::session::{self, register_store, format_template, GlobalUploaderState, UploadState};
+use crate::core::session::{
+    self, format_template, register_store, GlobalUploaderState, UploadState,
+};
+use crate::native::NativeSessionStore;
 
 static JVM: std::sync::OnceLock<Arc<JavaVM>> = std::sync::OnceLock::new();
 // Cached from the JNI-thread that has the app class loader. Background threads
@@ -43,64 +46,88 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeInitProgre
             let _ = CLASS_HYBRID.set(global);
         }
     }
-    androidProgress::set_progress_callback(Some(Box::new(move |
-        file_key, file_name, file_hash, transfer_id,
-        total_bytes, uploaded_bytes, completed_parts, total_parts, percentage, state,
-        transfer_pct, transfer_total_size, transfer_uploaded_size,
-        transfer_total_files, transfer_completed_files, transfer_state,
-        session_pct, session_total_size, session_uploaded_size,
-        session_total_transfers, session_completed_transfers,
-        session_total_files, session_completed_files, session_state,
-    | {
-        let mut file_obj = serde_json::json!({
-            "fileName": file_name,
-            "fileHash": file_hash,
-            "transferId": transfer_id,
-            "totalBytes": total_bytes,
-            "uploadedBytes": uploaded_bytes,
-            "completedParts": completed_parts,
-            "totalParts": total_parts,
-            "percentage": percentage,
-            "state": state,
-        });
-        if !file_key.is_empty() {
-            file_obj["fileKey"] = serde_json::Value::String(file_key.to_string());
-        }
-        let json = serde_json::json!({
-            "file": file_obj,
-            "sessionAgg": {
-                "percentage": session_pct,
-                "totalSize": session_total_size,
-                "uploadedSize": session_uploaded_size,
-                "totalTransfers": session_total_transfers,
-                "completedTransfers": session_completed_transfers,
-                "totalFiles": session_total_files,
-                "completedFiles": session_completed_files,
-                "state": session_state,
-            },
-            "transferAgg": {
-                "percentage": transfer_pct,
-                "totalSize": transfer_total_size,
-                "uploadedSize": transfer_uploaded_size,
-                "totalFiles": transfer_total_files,
-                "completedFiles": transfer_completed_files,
-                "state": transfer_state,
-            },
-        }).to_string();
-        let Ok(mut env) = vm.attach_current_thread_as_daemon() else { return };
-        let Ok(json_jstr) = env.new_string(&json) else { return };
-        let Some(class_ref) = CLASS_HYBRID.get() else { return };
-        // Safety: class_ref is a GlobalRef to HybridS3BgUploader.class, stored
-        // when called from the JNI thread that has the correct app class loader.
-        let class_jclass: JClass<'_> = unsafe { JClass::from_raw(class_ref.as_raw()) };
-        let _ = env.call_static_method(
-            class_jclass,
-            "onNativeProgress",
-            "(Ljava/lang/String;)V",
-            &[JValue::Object(&*json_jstr)],
-        );
-        let _ = env.exception_clear();
-    })));
+    androidProgress::set_progress_callback(Some(Box::new(
+        move |file_key,
+              file_name,
+              file_hash,
+              transfer_id,
+              total_bytes,
+              uploaded_bytes,
+              completed_parts,
+              total_parts,
+              percentage,
+              state,
+              transfer_pct,
+              transfer_total_size,
+              transfer_uploaded_size,
+              transfer_total_files,
+              transfer_completed_files,
+              transfer_state,
+              session_pct,
+              session_total_size,
+              session_uploaded_size,
+              session_total_transfers,
+              session_completed_transfers,
+              session_total_files,
+              session_completed_files,
+              session_state| {
+            let mut file_obj = serde_json::json!({
+                "fileName": file_name,
+                "fileHash": file_hash,
+                "transferId": transfer_id,
+                "totalBytes": total_bytes,
+                "uploadedBytes": uploaded_bytes,
+                "completedParts": completed_parts,
+                "totalParts": total_parts,
+                "percentage": percentage,
+                "state": state,
+            });
+            if !file_key.is_empty() {
+                file_obj["fileKey"] = serde_json::Value::String(file_key.to_string());
+            }
+            let json = serde_json::json!({
+                "file": file_obj,
+                "sessionAgg": {
+                    "percentage": session_pct,
+                    "totalSize": session_total_size,
+                    "uploadedSize": session_uploaded_size,
+                    "totalTransfers": session_total_transfers,
+                    "completedTransfers": session_completed_transfers,
+                    "totalFiles": session_total_files,
+                    "completedFiles": session_completed_files,
+                    "state": session_state,
+                },
+                "transferAgg": {
+                    "percentage": transfer_pct,
+                    "totalSize": transfer_total_size,
+                    "uploadedSize": transfer_uploaded_size,
+                    "totalFiles": transfer_total_files,
+                    "completedFiles": transfer_completed_files,
+                    "state": transfer_state,
+                },
+            })
+            .to_string();
+            let Ok(mut env) = vm.attach_current_thread_as_daemon() else {
+                return;
+            };
+            let Ok(json_jstr) = env.new_string(&json) else {
+                return;
+            };
+            let Some(class_ref) = CLASS_HYBRID.get() else {
+                return;
+            };
+            // Safety: class_ref is a GlobalRef to HybridS3BgUploader.class, stored
+            // when called from the JNI thread that has the correct app class loader.
+            let class_jclass: JClass<'_> = unsafe { JClass::from_raw(class_ref.as_raw()) };
+            let _ = env.call_static_method(
+                class_jclass,
+                "onNativeProgress",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&*json_jstr)],
+            );
+            let _ = env.exception_clear();
+        },
+    )));
 }
 
 #[no_mangle]
@@ -187,16 +214,14 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPre
         serde_json::from_str(&params_str).unwrap_or_default();
 
     match super::hash_and_pre_register(fd as RawFd, name, &tid, user_params, None) {
-        Ok(file_hash) => {
-            env.new_string(&file_hash)
-                .map(|s| s.into_raw())
-                .unwrap_or(empty_jstring(&mut env))
-        }
-        Err(e) => {
-            env.new_string(format!("ERROR:{}", e))
-                .map(|s| s.into_raw())
-                .unwrap_or(empty_jstring(&mut env))
-        }
+        Ok(file_hash) => env
+            .new_string(&file_hash)
+            .map(|s| s.into_raw())
+            .unwrap_or(empty_jstring(&mut env)),
+        Err(e) => env
+            .new_string(format!("ERROR:{}", e))
+            .map(|s| s.into_raw())
+            .unwrap_or(empty_jstring(&mut env)),
     }
 }
 
@@ -213,25 +238,48 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPre
     nonce_hex: JString,
     user_params_json: JString,
 ) -> jstring {
-    let name: String = env.get_string(&file_name).map(|s| s.into()).unwrap_or_else(|_| "file".to_string());
-    let tid: String = env.get_string(&transfer_id).map(|s| s.into()).unwrap_or_default();
-    let key: String = env.get_string(&key_hex).map(|s| s.into()).unwrap_or_default();
-    let nonce: String = env.get_string(&nonce_hex).map(|s| s.into()).unwrap_or_default();
-    let params_str: String = env.get_string(&user_params_json).map(|s| s.into()).unwrap_or_else(|_| "{}".to_string());
-    let user_params: HashMap<String, String> = serde_json::from_str(&params_str).unwrap_or_default();
+    let name: String = env
+        .get_string(&file_name)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| "file".to_string());
+    let tid: String = env
+        .get_string(&transfer_id)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let key: String = env
+        .get_string(&key_hex)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let nonce: String = env
+        .get_string(&nonce_hex)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let params_str: String = env
+        .get_string(&user_params_json)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| "{}".to_string());
+    let user_params: HashMap<String, String> =
+        serde_json::from_str(&params_str).unwrap_or_default();
 
-    let encryptor = match XChaCha20Poly1305Encryptor::from_hex(&key, &nonce) {
-        Ok(e) => Arc::new(e),
+    let encryptor = match crate::core::encryption::build_encryptor(&key, &nonce) {
+        Ok(e) => e,
         Err(e) => {
-            return env.new_string(format!("ERROR:{}", e))
+            return env
+                .new_string(format!("ERROR:{}", e))
                 .map(|s| s.into_raw())
                 .unwrap_or(empty_jstring(&mut env));
         }
     };
 
     match super::hash_and_pre_register(fd as RawFd, name, &tid, user_params, Some(encryptor)) {
-        Ok(file_hash) => env.new_string(&file_hash).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env)),
-        Err(e) => env.new_string(format!("ERROR:{}", e)).map(|s| s.into_raw()).unwrap_or(empty_jstring(&mut env)),
+        Ok(file_hash) => env
+            .new_string(&file_hash)
+            .map(|s| s.into_raw())
+            .unwrap_or(empty_jstring(&mut env)),
+        Err(e) => env
+            .new_string(format!("ERROR:{}", e))
+            .map(|s| s.into_raw())
+            .unwrap_or(empty_jstring(&mut env)),
     }
 }
 
@@ -330,11 +378,23 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelFile
     let (file_key, file_name, transfer_id, total_bytes, uploaded_bytes) = {
         let sess = session::session();
         if let Some(p) = sess.pending_files.get(&hash) {
-            (String::new(), p.file_name.clone(), p.transfer_id.clone(), 0u64, 0u64)
+            (
+                String::new(),
+                p.file_name.clone(),
+                p.transfer_id.clone(),
+                0u64,
+                0u64,
+            )
         } else if let Some(key) = sess.hash_to_key.get(&hash) {
             let key = key.clone();
             if let Some(e) = sess.files.get(&key) {
-                (key, e.file_name.clone(), e.transfer_id.clone(), e.total_bytes, e.uploaded_bytes)
+                (
+                    key,
+                    e.file_name.clone(),
+                    e.transfer_id.clone(),
+                    e.total_bytes,
+                    e.uploaded_bytes,
+                )
             } else {
                 (key, String::new(), String::new(), 0, 0)
             }
@@ -401,7 +461,12 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelAll(
     androidProgress::progress_manager().clear();
     session::clear_session();
     // Close all saved failed fds so they are not re-enqueued on resume.
-    let fds: Vec<RawFd> = crate::android::FAILED_FDS.lock().unwrap().drain().map(|(_, fd)| fd).collect();
+    let fds: Vec<RawFd> = crate::android::FAILED_FDS
+        .lock()
+        .unwrap()
+        .drain()
+        .map(|(_, fd)| fd)
+        .collect();
     for fd in fds {
         unsafe { libc::close(fd) };
     }
@@ -594,4 +659,40 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeGetAggrega
     env.new_string(&s)
         .map(|s| s.into_raw())
         .unwrap_or(empty_jstring(&mut env))
+}
+
+// ===========================================================================
+//  Custom encryptor registration (JNI export)
+// ===========================================================================
+
+/// Register a host-provided encryptor from the JNI side.
+/// The host app's Kotlin code calls this to register a custom
+/// encryptor implemented in their own Rust crate.
+///
+/// The host passes pointers as `jlong` (64-bit).  The Rust FFI function
+/// `register_custom_encryptor` is called directly from the host's native
+/// library at load time; this JNI function is a thin wrapper for
+/// applications that must register from the Kotlin side.
+#[no_mangle]
+pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeRegisterCustomEncryptor(
+    _env: JNIEnv,
+    _class: JClass,
+    // Matches the Kotlin declaration: nativeRegisterCustomEncryptor(vtablePointer)
+    vtable_ptr: jlong,
+) -> jint {
+    if vtable_ptr == 0 {
+        log::error!("nativeRegisterCustomEncryptor: null vtable pointer");
+        return 0;
+    }
+    // Forward to the same registry the upload path reads, so a Kotlin-side
+    // registration takes effect exactly like the iOS/Swift one. Key material is
+    // not part of this call — each upload's key/nonce is handed to the vtable's
+    // `create` callback.
+    unsafe {
+        crate::core::encryption::register_custom_encryptor(
+            vtable_ptr as *const crate::core::encryption::EncryptorVTable,
+        );
+    }
+    // 1 = a factory is registered and the upload path will use it.
+    if crate::core::encryption::custom_factory_registered() { 1 } else { 0 }
 }

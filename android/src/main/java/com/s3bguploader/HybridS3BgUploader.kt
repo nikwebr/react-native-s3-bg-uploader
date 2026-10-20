@@ -47,6 +47,17 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
     }
 
     // -------------------------------------------------------------------------
+    // Custom encryptor registration
+    // -------------------------------------------------------------------------
+
+    /// Register a host-provided custom encryptor factory.
+    /// The host provides only the vtable: key material arrives per upload.
+    override fun registerCustomEncryptor(vtablePointer: Double): Unit {
+        nativeRegisterCustomEncryptor(vtablePointer.toLong())
+    }
+
+
+    // -------------------------------------------------------------------------
     // Progress callback
     // -------------------------------------------------------------------------
 
@@ -268,7 +279,42 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
 
     companion object {
         init {
+            // Nitro loads its own glue (libS3BgUploader.so), but every JNI entry point
+            // used below lives in the Rust library. Load it explicitly: nothing else
+            // does, and without it every native call throws UnsatisfiedLinkError.
             System.loadLibrary("uploader")
+        }
+
+        // JNI entry point from libcustom_encryptor.so
+        private external fun nativeGetVtablePointer(): Long
+
+        /**
+         * Register the custom encryptor. Called from MainApplication.onCreate()
+         * after libS3BgUploader.so is loaded, so libuploader.so symbols are available.
+         */
+        @JvmStatic
+        fun registerCustomEncryptorIfAvailable() {
+            try {
+                System.loadLibrary("custom_encryptor")
+                val vtablePtr = nativeGetVtablePointer()
+                if (vtablePtr != 0L) {
+                    val registered = nativeRegisterCustomEncryptor(vtablePtr)
+                    if (registered == 1) {
+                        android.util.Log.i(
+                            "S3BgUploader",
+                            "custom encryptor factory registered — per-upload keys will be used"
+                        )
+                    } else {
+                        android.util.Log.e("S3BgUploader", "custom encryptor registration was rejected")
+                    }
+                } else {
+                    android.util.Log.e("S3BgUploader", "nativeGetVtablePointer returned 0")
+                }
+            } catch (e: UnsatisfiedLinkError) {
+                android.util.Log.e("S3BgUploader", "libcustom_encryptor.so not found", e)
+            } catch (e: Exception) {
+                android.util.Log.e("S3BgUploader", "Failed to register custom encryptor", e)
+            }
         }
 
         @Volatile var progressCallback: ((UploadProgress, AggregateProgress, AggregateProgress) -> Unit)? = null
@@ -371,6 +417,9 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         @JvmStatic external fun nativeGetFormattedTitle(): String
         @JvmStatic external fun nativeGetFormattedSubtitle(): String
         @JvmStatic external fun nativeInitProgressCallback()
+
+        /** Register a host-provided custom encryptor factory (vtable pointer only). */
+        @JvmStatic external fun nativeRegisterCustomEncryptor(vtablePointer: Long): Int
     }
 }
 

@@ -5,6 +5,7 @@
     "allowUnusedLabels": false,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
+    "ignoreDeprecations": "6.0",
     "jsx": "react",
     "lib": ["esnext"],
     "module": "esnext",

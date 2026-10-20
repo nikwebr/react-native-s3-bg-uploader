@@ -10,16 +10,16 @@ use crate::android::AndroidNetwork;
 use crate::android::{build_client, dup_fd, enqueue, enqueue_front, PAUSE_FLAG};
 use crate::core::api::ApiClient;
 use crate::core::chunk::ChunkInfo;
-use crate::core::encryption::ArcEncryptor;
-use crate::core::session::{self, UploadState};
-use crate::native::NativeApiClient;
+use crate::core::encryption::{ArcEncryptor, ChunkEncryptor};
 use crate::core::runtime;
+use crate::core::session::{self, UploadState};
 use crate::core::upload::PreparedUpload;
+use crate::core::upload_orchestrator::{self, UploadBackend, UploadOutcome};
+use crate::core::{clean_etag, MAX_RETRIES};
 use crate::native::upload_engine::{
     self, BlockingEngineConfig, BlockingPlatformAdapter, BlockingPrefetch, BlockingWorker,
 };
-use crate::core::upload_orchestrator::{self, UploadBackend, UploadOutcome};
-use crate::core::{clean_etag, MAX_RETRIES};
+use crate::native::NativeApiClient;
 
 pub(super) fn run_upload(file_key: &str, raw_fd: RawFd) {
     use crate::core::session;
@@ -50,7 +50,12 @@ pub(super) fn run_upload(file_key: &str, raw_fd: RawFd) {
             let should_reenqueue = session::session()
                 .files
                 .get(file_key)
-                .map(|e| matches!(e.state, UploadState::Paused | UploadState::NotStarted | UploadState::Initialized))
+                .map(|e| {
+                    matches!(
+                        e.state,
+                        UploadState::Paused | UploadState::NotStarted | UploadState::Initialized
+                    )
+                })
                 .unwrap_or(false);
             if should_reenqueue {
                 // Re-enqueue at the front so this partially-uploaded file resumes before
@@ -60,7 +65,9 @@ pub(super) fn run_upload(file_key: &str, raw_fd: RawFd) {
                 unsafe { libc::close(raw_fd) };
             }
         }
-        UploadOutcome::Failed(_) => {
+        UploadOutcome::Failed(ref e) => {
+            // The reason is otherwise dropped here, which makes Android failures invisible.
+            log::error!("upload failed for {}: {}", file_key, e);
             // Keep the fd alive so nativeResumeAll can re-enqueue this file for retry.
             crate::android::FAILED_FDS
                 .lock()
@@ -102,7 +109,22 @@ impl UploadBackend for AndroidUploadBackend {
     }
 
     fn ciphertext_overhead(&self) -> u64 {
-        self.encryption_config.as_ref().map(|e| e.ciphertext_overhead() as u64).unwrap_or(0)
+        active_encryptor(self.encryption_config.as_ref())
+            .map(|e| e.ciphertext_overhead() as u64)
+            .unwrap_or(0)
+    }
+
+    fn has_footer(&self) -> bool {
+        active_encryptor(self.encryption_config.as_ref())
+            .map(|e| e.has_footer())
+            .unwrap_or(false)
+    }
+
+    /// Bytes the descriptor occupies in the last data part (0 when there is none).
+    fn footer_len(&self) -> u64 {
+        active_encryptor(self.encryption_config.as_ref())
+            .map(|e| e.footer_len() as u64)
+            .unwrap_or(0)
     }
 
     fn total_bytes(&self) -> Result<u64, String> {
@@ -123,6 +145,7 @@ impl UploadBackend for AndroidUploadBackend {
             encryption_config: self.encryption_config.clone(),
             total_data_parts: prepared.total_parts,
             effective_part_size: prepared.part_size,
+            has_footer: self.has_footer(),
             network: self.api.network.clone(),
         });
         upload_engine::run_blocking_upload(
@@ -157,6 +180,7 @@ struct AndroidAdapter {
     encryption_config: Option<ArcEncryptor>,
     total_data_parts: u32,
     effective_part_size: u64,
+    has_footer: bool,
     network: AndroidNetwork,
 }
 
@@ -171,8 +195,10 @@ impl BlockingPlatformAdapter for AndroidAdapter {
 
     fn fetch_urls(&self, parts: &[u32]) -> Result<std::collections::HashMap<u32, String>, String> {
         pollster::block_on(
-            NativeApiClient { network: self.network.clone() }
-                .fetch_upload_urls_batch(&self.file_key, &self.upload_id, parts),
+            NativeApiClient {
+                network: self.network.clone(),
+            }
+            .fetch_upload_urls_batch(&self.file_key, &self.upload_id, parts),
         )
     }
 
@@ -184,6 +210,7 @@ impl BlockingPlatformAdapter for AndroidAdapter {
             encryption_config: self.encryption_config.clone(),
             total_data_parts: self.total_data_parts,
             effective_part_size: self.effective_part_size,
+            has_footer: self.has_footer,
         }))
     }
 
@@ -207,41 +234,69 @@ struct AndroidWorker {
     encryption_config: Option<ArcEncryptor>,
     total_data_parts: u32,
     effective_part_size: u64,
+    /// Whether the active encryptor's format ends with a descriptor (appended to the
+    /// final data part — never an S3 part of its own).
+    has_footer: bool,
+}
+
+/// The encryptor that will actually encrypt chunks: a host-registered custom
+/// encryptor takes precedence over the per-file built-in config.
+fn active_encryptor<'a>(config: Option<&'a ArcEncryptor>) -> Option<&'a (dyn ChunkEncryptor + 'a)> {
+    // Only files the app marked as encrypted are encrypted at all; for those, a
+    // registered custom encryptor replaces the built-in one. Keeping the per-file
+    // config as the gate means a plain `uploadFile` stays plaintext instead of
+    // being silently encrypted by a globally registered encryptor.
+    // The per-file config is authoritative: it already holds either the host
+    // encryptor built from this upload's key or the built-in one.
+    config.map(|c| c.as_ref() as &'a dyn ChunkEncryptor)
+}
+
+/// Read a single chunk from the file using `pread` (so concurrent workers
+/// don't corrupt each other's file position). Returns the raw plaintext bytes.
+fn read_chunk_from_fd(fd: RawFd, chunk: &ChunkInfo) -> Result<Vec<u8>, String> {
+    let mut buffer = vec![0u8; chunk.chunk_size as usize];
+    let mut total_read: usize = 0;
+    while total_read < chunk.chunk_size as usize {
+        let remaining = chunk.chunk_size as usize - total_read;
+        let offset = (chunk.start_pos + total_read as u64) as libc::off_t;
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buffer[total_read..].as_mut_ptr() as *mut libc::c_void,
+                remaining,
+                offset,
+            )
+        };
+        match n {
+            -1 => return Err(std::io::Error::last_os_error().to_string()),
+            0 => break,
+            n => total_read += n as usize,
+        }
+    }
+    buffer.truncate(total_read);
+    Ok(buffer)
 }
 
 impl BlockingWorker for AndroidWorker {
     fn read_chunk(&self, chunk: &ChunkInfo) -> Result<Vec<u8>, String> {
-        if let Some(enc) = &self.encryption_config {
-            if chunk.part_number == self.total_data_parts + 1 {
-                return Ok(enc.compute_footer(self.total_data_parts, self.effective_part_size).unwrap_or_default());
-            }
-        }
-        // Use pread so concurrent workers don't corrupt each other's file position.
-        let mut buffer = vec![0u8; chunk.chunk_size as usize];
-        let mut total_read: usize = 0;
-        while total_read < chunk.chunk_size as usize {
-            let remaining = chunk.chunk_size as usize - total_read;
-            let offset = (chunk.start_pos + total_read as u64) as libc::off_t;
-            let n = unsafe {
-                libc::pread(
-                    self.raw_fd,
-                    buffer[total_read..].as_mut_ptr() as *mut libc::c_void,
-                    remaining,
-                    offset,
-                )
-            };
-            match n {
-                -1 => return Err(std::io::Error::last_os_error().to_string()),
-                0 => break,
-                n => total_read += n as usize,
-            }
-        }
-        buffer.truncate(total_read);
-        if let Some(enc) = &self.encryption_config {
-            Ok(enc.encrypt_chunk(&buffer, chunk.part_number))
-        } else {
-            Ok(buffer)
-        }
+        // A host-registered custom encryptor wins over the per-file built-in config.
+        let enc = match active_encryptor(self.encryption_config.as_ref()) {
+            Some(enc) => enc,
+            // No encryption configured: upload raw plaintext.
+            None => return read_chunk_from_fd(self.raw_fd, chunk),
+        };
+        let mut out = enc.encrypt_chunk(&read_chunk_from_fd(self.raw_fd, chunk)?, chunk.part_number);
+        // The descriptor rides inside the final data part — a trailing part of its
+        // own would demote this one below S3's 5 MiB minimum (see append_descriptor).
+        crate::core::upload::append_descriptor(
+            &mut out,
+            enc,
+            chunk.part_number,
+            self.total_data_parts,
+            self.effective_part_size,
+            self.has_footer,
+        );
+        Ok(out)
     }
 
     fn upload_chunk(
@@ -251,8 +306,15 @@ impl BlockingWorker for AndroidWorker {
         part_number: u32,
         file_key: &str,
     ) -> Result<String, String> {
-        upload_chunk_with_retry(&self.client, url, data, part_number, file_key, self.run_version)
-            .map_err(|e| e.to_string())
+        upload_chunk_with_retry(
+            &self.client,
+            url,
+            data,
+            part_number,
+            file_key,
+            self.run_version,
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -285,7 +347,8 @@ fn upload_chunk_with_retry(
                 0,
             );
 
-            let progress_reader = ProgressReader::new(data.to_vec(), file_key.clone(), run_version, part_number);
+            let progress_reader =
+                ProgressReader::new(data.to_vec(), file_key.clone(), run_version, part_number);
             let response = match client
                 .put(url)
                 .header("Content-Length", chunk_size.to_string())
