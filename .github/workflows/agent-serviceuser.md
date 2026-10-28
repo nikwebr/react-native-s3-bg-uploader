@@ -71,8 +71,10 @@ safe-outputs:
   create-pull-request:
     title-prefix: "[agent] "
     draft: false
+    github-token: ${{ secrets.GH_TOKEN }}
   push-to-pull-request-branch:
     target: triggering
+    github-token: ${{ secrets.GH_TOKEN }}
   submit-pull-request-review:
     allowed-events: [COMMENT, REQUEST_CHANGES]
   create-pull-request-review-comment:
