@@ -125,6 +125,9 @@ repo-wide knowledge in cache-memory. Never store secrets or raw logs.
 ## Rules
 
 - Stay inside the scope of the triggering request; do not reopen old discussions.
+- Do not update the external documentation repository. A separate post-merge
+  workflow checks documentation and its version; keep this agent's work in the
+  package repository.
 - Read the repository's `AGENTS.md`/README conventions and run relevant
   tests/builds before proposing code. Report exactly what you ran and the
   results; never claim a check passed that you did not run.
