@@ -1,0 +1,43 @@
+# Resolve react_native_pods.rb with node to allow for hoisting
+require Pod::Executable.execute_command('node', ['-p',
+  'require.resolve(
+    "react-native/scripts/react_native_pods.rb",
+    {paths: [process.argv[1]]},
+  )', __dir__]).strip
+
+platform :ios, '26.0'
+prepare_react_native_project!
+
+target 'CustomEncryptionExample' do
+  pod 'CustomEncryptor', :path => './CustomEncryptor.podspec'
+  config = use_native_modules!
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    # An absolute path to your application root.
+    :app_path => "#{Pod::Config.instance.installation_root}/.."
+  )
+
+  post_install do |installer|
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => false,
+      # :ccache_enabled => true
+    )
+
+    # Fix non-modular-include-in-framework-module errors
+    # React Native's -Werror flags override OTHER_CFLAGS because they come first
+    # Solution: Modify the generated xcconfig files directly
+    pods_dir = File.expand_path('Pods', __dir__)
+    # Find all .xcconfig files in the Pods project
+    Dir.glob(File.join(pods_dir, '**', '*.xcconfig')).each do |xcconfig_path|
+      next unless File.file?(xcconfig_path)
+      content = File.read(xcconfig_path)
+      unless content.include?('-Wno-non-modular-include-in-framework-module')
+        File.write(xcconfig_path, content + "\nOTHER_CFLAGS = $(inherited) -Wno-non-modular-include-in-framework-module\nOTHER_CPLUSPLUSFLAGS = $(inherited) -Wno-non-modular-include-in-framework-module\n")
+        Pod::UI.puts "Fixed xcconfig: #{xcconfig_path}"
+      end
+    end
+  end
+end
