@@ -38,6 +38,47 @@ ensure_deps() {
     echo ""
 }
 
+# The wasm-bindgen CLI has to match the wasm-bindgen crate the module was
+# compiled against: the bindgen format is versioned and a mismatch aborts the
+# post-processing step with
+#   rust Wasm file schema version: X
+#      this binary schema version: Y
+# Cargo.lock is the source of truth, so read the pinned version from there.
+locked_wasm_bindgen_version() {
+    sed -n '/^name = "wasm-bindgen"$/{n;s/^version = "\(.*\)"$/\1/p;q;}' "$SCRIPT_DIR/../Cargo.lock"
+}
+
+ensure_wasm_bindgen_cli() {
+    local version installed
+
+    version="$(locked_wasm_bindgen_version)"
+    if [ -z "$version" ]; then
+        echo -e "${RED}✗ Could not read the wasm-bindgen version from Cargo.lock${NC}"
+        exit 1
+    fi
+
+    if command -v wasm-bindgen &> /dev/null; then
+        installed="$(wasm-bindgen --version | awk '{print $2}')"
+        if [ "$installed" == "$version" ]; then
+            echo -e "${GREEN}✓ wasm-bindgen $installed (matches Cargo.lock)${NC}"
+            return 0
+        fi
+        echo -e "${BLUE}  wasm-bindgen $installed does not match Cargo.lock ($version) – updating...${NC}"
+    else
+        echo -e "${BLUE}  wasm-bindgen not found – installing $version...${NC}"
+    fi
+
+    cargo install wasm-bindgen-cli --version "$version" --locked --force || \
+        cargo install wasm-bindgen-cli --version "$version" --force
+
+    installed="$(wasm-bindgen --version | awk '{print $2}')"
+    if [ "$installed" != "$version" ]; then
+        echo -e "${RED}✗ wasm-bindgen $installed still does not match Cargo.lock ($version)${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ wasm-bindgen $installed installed${NC}"
+}
+
 ensure_ios_deps() {
     # iOS Rust targets
     local ios_targets=(
@@ -261,41 +302,33 @@ fi
 # WASM Build
 if [[ "$1" == "wasm" ]] || [[ "$1" == "all" ]]; then
     echo -e "${BLUE}🌐 Building for WASM...${NC}"
-    cargo build --features wasm --target wasm32-unknown-unknown --release
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ WASM build successful${NC}"
-
-        # wasm-bindgen prüfen
-        if command -v wasm-bindgen &> /dev/null; then
-            echo -e "${BLUE}🔗 Running wasm-bindgen...${NC}"
-            wasm-bindgen \
-                --out-dir $TARGET_DIR/wasm \
-                --target no-modules \
-                $TARGET_DIR/wasm32-unknown-unknown/release/uploader.wasm
-
-            if [ $? -eq 0 ]; then
-                echo -e "${GREEN}✓ wasm-bindgen successful${NC}"
-                echo "Output: target/wasm/"
-                echo "  - uploader.js"
-                echo "  - uploader_bg.wasm"
-                echo "  - uploader.d.ts"
-
-                echo -e "${BLUE}📦 Embedding WASM into library source...${NC}"
-                node "$SCRIPT_DIR/embed-wasm.js"
-                echo -e "${GREEN}✓ WASM embedded into src/web/wasm-assets.ts${NC}"
-            else
-                echo -e "${RED}✗ wasm-bindgen failed${NC}"
-                exit 1
-            fi
-        else
-            echo -e "${RED}⚠ wasm-bindgen not found. Install with:${NC}"
-            echo "  cargo install wasm-bindgen-cli"
-        fi
-    else
+    if ! cargo build --features wasm --target wasm32-unknown-unknown --release; then
         echo -e "${RED}✗ WASM build failed${NC}"
         exit 1
     fi
+
+    echo -e "${GREEN}✓ WASM build successful${NC}"
+
+    ensure_wasm_bindgen_cli
+
+    echo -e "${BLUE}🔗 Running wasm-bindgen...${NC}"
+    if ! wasm-bindgen \
+        --out-dir $TARGET_DIR/wasm \
+        --target no-modules \
+        $TARGET_DIR/wasm32-unknown-unknown/release/uploader.wasm; then
+        echo -e "${RED}✗ wasm-bindgen failed${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✓ wasm-bindgen successful${NC}"
+    echo "Output: target/wasm/"
+    echo "  - uploader.js"
+    echo "  - uploader_bg.wasm"
+    echo "  - uploader.d.ts"
+
+    echo -e "${BLUE}📦 Embedding WASM into library source...${NC}"
+    node "$SCRIPT_DIR/embed-wasm.js"
+    echo -e "${GREEN}✓ WASM embedded into src/web/wasm-assets.ts${NC}"
     echo ""
 fi
 

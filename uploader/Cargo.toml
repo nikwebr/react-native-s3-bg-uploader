@@ -26,8 +26,10 @@ redb = { version = "2", optional = false }
 
 # https://github.com/rustwasm/wasm-bindgen
 console_error_panic_hook = { version = "0.1", optional = true }
-# Pinned: the wasm-bindgen CLI that post-processes the module is 0.2.129, and a
-# lockfile that drifts to another patch version makes `build:wasm` fail.
+# Pinned: the wasm-bindgen bindgen format is versioned, so the crate and the
+# wasm-bindgen CLI that post-processes the module must agree exactly.
+# `scripts/build.sh wasm` installs the CLI version locked here, so bump both
+# together (Cargo.lock is what the script reads).
 wasm-bindgen = { version = "=0.2.129", optional = true }
 
 # https://github.com/Badel2/wasm-bindgen-file-reader
