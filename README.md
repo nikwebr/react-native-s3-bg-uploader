@@ -120,3 +120,51 @@ Bootstrapped with [create-nitro-module](https://github.com/patrickkabwe/create-n
 ## Contributing
 
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+
+### GitHub agent
+
+The gh-aw workflow in `.github/workflows/agent-serviceuser.md` uses Pi with
+DeepSeek, matching the ysendit agent setup. Repository writers can assign an
+issue or pull request to `agent-serviceuser`, request its review, or mention
+`@agent-serviceuser`. It also responds to new comments and reviews on assigned
+threads. Reviews can comment or request changes, but cannot approve.
+
+Set the repository Actions secret `DEEPSEEK_API_KEY` and enable **Allow GitHub
+Actions to create and approve pull requests** in Settings > Actions > General
+so the interactive agent can open package PRs. It does not update the external
+documentation repository.
+
+A separate workflow, `.github/workflows/post-merge-docs.md`, runs when a PR is
+**merged into `master`**, not when opened or closed without merging. It uses Pi
+with DeepSeek to check whether the merged changes require documentation updates
+in [`nikwebr/react-native-s3-bg-uploader-docs`](https://github.com/nikwebr/react-native-s3-bg-uploader-docs).
+It uses `pull_request_target` so merged fork contributions can trigger it with
+the required secrets, with checkout restricted to the two trusted repositories'
+`master` branches, never the PR head.
+It also checks that the exported version in the docs site's `lib/version.ts`
+matches the latest published stable GitHub Release, never a predicted version.
+The existing release-time API-types/version sync remains unchanged; the
+post-merge agent checks for missing updates without racing an unpublished bump.
+
+The post-merge workflow opens at most one docs PR against `master`, restricted
+to `content/**` and `lib/version.ts`, or does nothing when no changes are needed.
+It cannot approve or merge PRs. Set the repository Actions secret `GH_TOKEN` to
+a PAT with **Contents: read/write** and **Pull requests: read/write** access to
+the docs repository. The PAT is used by trusted checkout and publishing steps,
+not the agent's execution environment or GitHub tools. Credentials are not
+persisted in the agent checkout.
+
+Both agents use read-only GitHub tools and apply changes through gh-aw safe
+outputs. No Copilot token is required. AI threat detection remains disabled,
+matching ysendit.
+
+After editing the Markdown workflow, regenerate and commit its compiled workflow:
+
+```bash
+gh extension install github/gh-aw # Once; use v0.93.5 for this workflow
+gh aw compile agent-serviceuser post-merge-docs
+```
+
+Commit both generated `.github/workflows/*.lock.yml` files and any changes to
+`.github/aw/actions-lock.json` alongside the source. The previous Pi action is
+archived in `old_github_workflows/pi-agent.yml` and no longer runs.
