@@ -92,6 +92,10 @@ struct AndroidUploadBackend {
 impl UploadBackend for AndroidUploadBackend {
     type Notifier = AndroidProgressNotifier;
 
+    fn encryption_config(&self) -> Option<&ArcEncryptor> {
+        self.encryption_config.as_ref()
+    }
+
     fn progress_manager(&self) -> &crate::core::progress::ProgressManager<Self::Notifier> {
         androidProgress::progress_manager()
     }

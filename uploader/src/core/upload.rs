@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::core::api::{ApiClient, StartUploadResponse};
+use crate::core::encryption::ArcEncryptor;
 use crate::core::session::{self, UploadState};
 use crate::core::ChunkUploadResult;
 
@@ -128,6 +129,7 @@ pub fn prepare_upload(
     ciphertext_overhead: u64,
     has_footer: bool,
     footer_len: u64,
+    encryption_config: Option<&ArcEncryptor>,
 ) -> Result<PreparedUpload, String> {
     let entry = {
         let sess = session::session();
@@ -136,6 +138,8 @@ pub fn prepare_upload(
             .cloned()
             .ok_or_else(|| format!("File entry not found for {}", file_key))?
     };
+
+    entry.require_encryption_config(encryption_config)?;
 
     let upload_id = entry
         .upload_id
@@ -248,6 +252,46 @@ mod tests {
 
     fn encryptor() -> XChaCha20Poly1305Encryptor {
         XChaCha20Poly1305Encryptor::from_hex(&"ab".repeat(32), &"cd".repeat(24)).unwrap()
+    }
+
+    #[test]
+    fn provisioned_encrypted_and_plain_uploads_keep_their_resume_layout() {
+        for encrypted in [false, true] {
+            let key = format!("resume-layout-{encrypted}");
+            let config = encrypted.then(|| -> ArcEncryptor { std::sync::Arc::new(encryptor()) });
+            let mut entry = session::FileEntry::new(
+                key.clone(),
+                key.clone(),
+                key.clone(),
+                "file".into(),
+                "file".into(),
+                1500,
+                HashMap::new(),
+            );
+            entry.encrypted = encrypted;
+            entry.encryption_config = config.clone();
+            entry.upload_id = Some("upload-id".into());
+            entry.part_size = Some(1024);
+            entry.completed_chunk_etags = vec![(1, "etag".into())];
+            session::session().files.insert(key.clone(), entry);
+
+            let prepared = prepare_upload(
+                &key,
+                1500,
+                if encrypted { 16 } else { 0 },
+                encrypted,
+                if encrypted { 28 } else { 0 },
+                config.as_ref(),
+            )
+            .unwrap();
+            assert_eq!(prepared.upload_id, "upload-id");
+            assert_eq!(prepared.part_size, if encrypted { 980 } else { 1024 });
+            assert_eq!(prepared.total_parts, 2);
+            assert_eq!(prepared.remaining_parts, vec![2]);
+            assert_eq!(prepared.completed_etags, vec![(1, "etag".into())]);
+            assert_eq!(prepared.committed_bytes, prepared.part_size);
+            session::session().files.remove(&key);
+        }
     }
 
     /// The layout that broke real uploads against S3: a 36.6 MB file at the server's

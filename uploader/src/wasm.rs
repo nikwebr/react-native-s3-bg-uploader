@@ -76,6 +76,36 @@ async fn start_and_enqueue_inner(
 ) -> Result<String, String> {
     let file_hash = hash::hash_web_file(&file, &transfer_id)?;
 
+    // Reject duplicates before invoking a factory that could replace an active instance.
+    let existing_state = {
+        let sess = session::session();
+        match sess.find_by_hash(&file_hash) {
+            Some(entry) => {
+                if entry.state != UploadState::Completed && encryption.is_none() {
+                    entry.require_encryption_config(None)?;
+                }
+                Some((entry.state.clone(), entry.is_resumable()))
+            }
+            None => None,
+        }
+    };
+    match existing_state {
+        Some((UploadState::Completed, _)) => return Ok(file_hash),
+        Some((_, false)) => {
+            return Err(format!(
+                "DUPLICATE_FILE: file with hash {} is already active in this session",
+                file_hash
+            ));
+        }
+        _ => {}
+    }
+    if session::session().pending_files.contains_key(&file_hash) {
+        return Err(format!(
+            "DUPLICATE_FILE: file with hash {} is already pending in this session",
+            file_hash
+        ));
+    }
+
     // Build this file's encryptor from its key material. A registered JS factory
     // gets the bytes and keeps one instance per file; the config below is then
     // only the built-in fallback (never used while that instance exists).
@@ -83,18 +113,19 @@ async fn start_and_enqueue_inner(
         Some((key_hex, nonce_hex)) => {
             let key = crate::core::encryption::hex_decode(key_hex, "encryption key")?;
             let nonce = crate::core::encryption::hex_decode(nonce_hex, "encryption nonce")?;
+            let config = crate::core::encryption::build_encryptor(key_hex, nonce_hex)?;
             crate::wasm::js_encryptor::create_instance(&file_hash, &key, &nonce)
                 .map_err(|e| format!("registerWebEncryptor: {e}"))?;
-            Some(crate::core::encryption::build_encryptor(key_hex, nonce_hex)?)
+            Some(config)
         }
-        None => None,
+        None => {
+            crate::wasm::js_encryptor::forget_instance(&file_hash);
+            None
+        }
     };
 
     // If this hash already exists in session (resumable or completed) don't create a
     // duplicate UI entry — just re-associate the File object.
-    let existing_state = session::session()
-        .find_by_hash(&file_hash)
-        .map(|e| (e.state.clone(), e.is_resumable()));
     match existing_state {
         Some((UploadState::Completed, _)) => {
             return Ok(file_hash);
@@ -118,13 +149,6 @@ async fn start_and_enqueue_inner(
         None => {}
     }
 
-    if session::session().pending_files.contains_key(&file_hash) {
-        return Err(format!(
-            "DUPLICATE_FILE: file with hash {} is already pending in this session",
-            file_hash
-        ));
-    }
-
     session::session().pre_register_file(
         file_hash.clone(),
         transfer_id.clone(),
@@ -133,7 +157,7 @@ async fn start_and_enqueue_inner(
         file.size() as u64,
         user_params,
         encryption_config.clone(),
-    );
+    )?;
 
     PENDING_WASM_FILES.with(|m| m.borrow_mut().insert(file_hash.clone(), file));
     if let Some(config) = encryption_config {

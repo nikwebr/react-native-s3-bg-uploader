@@ -22,25 +22,47 @@ pub(super) async fn run_upload(file_key: &str, file: web_sys::File) -> UploadOut
         .files
         .get(file_key)
         .and_then(|e| e.encryption_config.clone());
+    let js_encryptor = active_js_encryptor(file_key);
+    let file_hash = crate::core::session::session()
+        .files
+        .get(file_key)
+        .map(|e| e.file_hash.clone());
     let backend = WasmUploadBackend {
         file_key: file_key.to_string(),
         file: std::sync::Arc::new(file),
         encryption_config,
+        js_encryptor,
         api: WasmApiClient,
     };
-    upload_orchestrator::run_upload(&backend).await
+    let outcome = upload_orchestrator::run_upload(&backend).await;
+    if matches!(outcome, UploadOutcome::Completed) {
+        if let (Some(hash), Some(instance)) = (file_hash, backend.js_encryptor.as_ref()) {
+            // A cancelled run must not remove a newer upload's instance.
+            if crate::wasm::js_encryptor::instance(&hash)
+                .is_some_and(|current| std::rc::Rc::ptr_eq(&current, instance))
+            {
+                crate::wasm::js_encryptor::forget_instance(&hash);
+            }
+        }
+    }
+    outcome
 }
 
 struct WasmUploadBackend {
     file_key: String,
     file: std::sync::Arc<web_sys::File>,
     encryption_config: Option<ArcEncryptor>,
+    js_encryptor: Option<std::rc::Rc<crate::wasm::js_encryptor::JsEncryptor>>,
     api: WasmApiClient,
 }
 
 #[async_trait(?Send)]
 impl UploadBackend for WasmUploadBackend {
     type Notifier = WasmProgressNotifier;
+
+    fn encryption_config(&self) -> Option<&ArcEncryptor> {
+        self.encryption_config.as_ref()
+    }
 
     fn progress_manager(&self) -> &crate::core::progress::ProgressManager<Self::Notifier> {
         wasmProgress::progress_manager()
@@ -55,7 +77,7 @@ impl UploadBackend for WasmUploadBackend {
     }
 
     fn ciphertext_overhead(&self) -> u64 {
-        if let Some(js) = active_js_encryptor(&self.file_key) {
+        if let Some(js) = self.js_encryptor.as_ref() {
             return js.overhead as u64;
         }
         active_encryptor(self.encryption_config.as_ref())
@@ -64,7 +86,7 @@ impl UploadBackend for WasmUploadBackend {
     }
 
     fn has_footer(&self) -> bool {
-        if let Some(js) = active_js_encryptor(&self.file_key) {
+        if let Some(js) = self.js_encryptor.as_ref() {
             return js.has_footer;
         }
         active_encryptor(self.encryption_config.as_ref())
@@ -74,7 +96,7 @@ impl UploadBackend for WasmUploadBackend {
 
     /// Bytes the descriptor occupies in the last data part (0 when there is none).
     fn footer_len(&self) -> u64 {
-        if let Some(js) = active_js_encryptor(&self.file_key) {
+        if let Some(js) = self.js_encryptor.as_ref() {
             return js.footer_len as u64;
         }
         active_encryptor(self.encryption_config.as_ref())
@@ -99,6 +121,7 @@ impl UploadBackend for WasmUploadBackend {
             file_key: self.file_key.clone(),
             upload_id: prepared.upload_id.clone(),
             encryption_config: self.encryption_config.clone(),
+            js_encryptor: self.js_encryptor.clone(),
             total_data_parts: prepared.total_parts,
             effective_part_size: prepared.part_size,
             has_footer: self.has_footer(),
@@ -130,6 +153,7 @@ struct WasmAdapter {
     file_key: String,
     upload_id: String,
     encryption_config: Option<ArcEncryptor>,
+    js_encryptor: Option<std::rc::Rc<crate::wasm::js_encryptor::JsEncryptor>>,
     total_data_parts: u32,
     effective_part_size: u64,
     /// Whether the active encryptor's format ends with a descriptor (appended to the
@@ -140,8 +164,6 @@ struct WasmAdapter {
 /// The web-registered JS encryptor, but only for files the app marked as
 /// encrypted — the same gate `active_encryptor` uses, so a globally registered
 /// encryptor never silently encrypts a plain `uploadFile`.
-/// The JS instance created for this upload, if the registered factory made one.
-/// Keyed by the file key, so concurrent uploads keep their own keys.
 fn active_js_encryptor(file_key: &str) -> Option<std::rc::Rc<crate::wasm::js_encryptor::JsEncryptor>> {
     // Instances are created at pre-register time, when only the content hash is
     // known; `file_key` here is the object key returned by startUpload. Map back
@@ -149,8 +171,8 @@ fn active_js_encryptor(file_key: &str) -> Option<std::rc::Rc<crate::wasm::js_enc
     let hash = crate::core::session::session()
         .files
         .get(file_key)
-        .map(|e| e.file_hash.clone())
-        .unwrap_or_else(|| file_key.to_string());
+        .filter(|e| e.encrypted && e.encryption_config.is_some())
+        .map(|e| e.file_hash.clone())?;
     crate::wasm::js_encryptor::instance(&hash)
 }
 
@@ -215,7 +237,7 @@ impl AsyncPlatformAdapter for WasmAdapter {
         file: &web_sys::File,
         chunk: &ChunkInfo,
     ) -> futures::future::LocalBoxFuture<'static, Result<Vec<u8>, String>> {
-        let Some(js) = active_js_encryptor(&self.file_key) else {
+        let Some(js) = self.js_encryptor.clone() else {
             let data = self.read_chunk(file, chunk);
             return async move { data }.boxed_local();
         };

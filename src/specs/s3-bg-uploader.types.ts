@@ -153,31 +153,6 @@ interface BaseUploaderAPI {
 }
 
 /**
- * A customer encryptor implemented in JavaScript — web build only.
- *
- * Mirrors the native `EncryptorVTable`: the two declared values plus the two
- * callbacks that actually transform bytes.
- */
-export interface WebEncryptorImpl {
-  /** Bytes your scheme adds to every part (tag/IV/…). */
-  overhead: number;
-  /** True when your format ends with a descriptor appended to the last data part. */
-  hasFooter: boolean;
-  /** Bytes that descriptor occupies inside the last data part (0 when `hasFooter` is false). */
-  footerLen?: number;
-  /** Ciphertext for one part. `partNumber` is 1-based and stable across resumes. */
-  encryptChunk(
-    input: Uint8Array,
-    partNumber: number,
-  ): Uint8Array | ArrayBuffer | Promise<Uint8Array | ArrayBuffer>;
-  /** Descriptor appended to the final data part (only when `hasFooter` is true). */
-  computeFooter?(
-    nDataParts: number,
-    effectivePartSize: number,
-  ): Uint8Array | ArrayBuffer | Promise<Uint8Array | ArrayBuffer>;
-}
-
-/**
  * Web-only custom encryptor registration. Kept out of `BaseUploaderAPI` because the
  * Nitro spec extends that interface: a non-primitive parameter there is turned into
  * a C++ struct by codegen and cannot be generated.

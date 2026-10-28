@@ -8,7 +8,7 @@ use crate::core::chunk::ChunkInfo;
 use crate::core::upload;
 use crate::core::{ChunkUploadResult, MAX_CONCURRENT_UPLOADS};
 
-pub trait AsyncPlatformAdapter: Send + Sync + 'static {
+pub trait AsyncPlatformAdapter: 'static {
     fn is_paused(&self) -> bool;
 
     fn fetch_urls(

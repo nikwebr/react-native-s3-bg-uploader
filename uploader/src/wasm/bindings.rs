@@ -211,6 +211,7 @@ pub fn wasm_cancel_file(file_hash: String) {
     }
     PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
     PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().remove(&file_hash));
+    crate::wasm::js_encryptor::forget_instance(&file_hash);
     session::cancel_file_by_hash(&file_hash);
 
     if !transfer_id.is_empty() {
@@ -228,15 +229,23 @@ pub fn wasm_cancel_file(file_hash: String) {
 
 #[wasm_bindgen]
 pub fn wasm_cancel_transfer(transfer_id: String) {
-    FILE_QUEUE.with(|q| {
-        let mut q = q.borrow_mut();
+    let hashes: Vec<String> = {
         let sess = session::session();
-        q.retain(|e| {
-            sess.files
-                .get(&e.file_key)
-                .map_or(true, |f| f.transfer_id != transfer_id)
-        });
-    });
+        sess.files
+            .values()
+            .filter(|e| e.transfer_id == transfer_id)
+            .map(|e| e.file_hash.clone())
+            .chain(
+                sess.pending_files
+                    .values()
+                    .filter(|e| e.transfer_id == transfer_id)
+                    .map(|e| e.file_hash.clone()),
+            )
+            .collect()
+    };
+    for hash in hashes {
+        wasm_cancel_file(hash);
+    }
     session::cancel_transfer(&transfer_id);
 }
 
@@ -245,6 +254,7 @@ pub fn wasm_cancel_all() {
     FILE_QUEUE.with(|q| q.borrow_mut().clear());
     PENDING_WASM_FILES.with(|m| m.borrow_mut().clear());
     PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().clear());
+    crate::wasm::js_encryptor::forget_all_instances();
     PAUSE_REQUESTED.with(|p| *p.borrow_mut() = false);
     QUEUE_RUNNING.with(|r| *r.borrow_mut() = false);
     session::clear_session();

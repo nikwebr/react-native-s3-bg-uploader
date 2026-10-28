@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use crate::core::encryption::ArcEncryptor;
 use crate::core::progress::{ProgressManager, ProgressNotifier};
 use crate::core::runtime;
 use crate::core::session::{self, GlobalUploaderState, UploadState};
@@ -24,6 +25,10 @@ pub trait UploadBackend {
 
     fn is_current_run(&self) -> bool {
         true
+    }
+
+    fn encryption_config(&self) -> Option<&ArcEncryptor> {
+        None
     }
 
     /// Bytes added per chunk by the active encryptor (0 for plain uploads).
@@ -121,6 +126,7 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
         backend.ciphertext_overhead(),
         backend.has_footer(),
         backend.footer_len(),
+        backend.encryption_config(),
     ) {
         Ok(p) => p,
         Err(e) => return UploadOutcome::Failed(e),
@@ -192,3 +198,96 @@ fn log_error(file_key: &str, e: &str) {
 
 #[cfg(target_arch = "wasm32")]
 fn log_error(_file_key: &str, _e: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::encryption::XChaCha20Poly1305Encryptor;
+    use crate::core::progress::NoOpNotifier;
+    use crate::core::session::FileEntry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct MissingEncryptionBackend {
+        key: String,
+        progress: ProgressManager<NoOpNotifier>,
+    }
+
+    #[async_trait(?Send)]
+    impl UploadBackend for MissingEncryptionBackend {
+        type Notifier = NoOpNotifier;
+
+        fn progress_manager(&self) -> &ProgressManager<NoOpNotifier> {
+            &self.progress
+        }
+
+        fn file_key(&self) -> &str {
+            &self.key
+        }
+
+        fn is_paused(&self) -> bool {
+            false
+        }
+
+        fn total_bytes(&self) -> Result<u64, String> {
+            Ok(2048)
+        }
+
+        async fn upload_parts(
+            &self,
+            _: &PreparedUpload,
+            _: u64,
+        ) -> Result<Vec<ChunkUploadResult>, String> {
+            panic!("must not upload plaintext when the worker has no encryption config")
+        }
+
+        async fn complete_upload(&self, _: &str, _: Vec<ChunkUploadResult>) -> Result<(), String> {
+            panic!("must not complete an upload without its encryption config")
+        }
+    }
+
+    #[test]
+    fn background_resume_rejects_missing_and_stale_encryption_snapshots() {
+        for (case, completed_parts, current_config) in [
+            ("new", 0, false),
+            ("partial", 1, false),
+            ("all-parts", 2, false),
+            ("stale-worker", 1, true),
+        ] {
+            let key = format!("encryption-guard-{case}");
+            let mut entry = FileEntry::new(
+                key.clone(),
+                key.clone(),
+                key.clone(),
+                "file".into(),
+                "file".into(),
+                2048,
+                HashMap::new(),
+            );
+            entry.encrypted = true;
+            entry.upload_id = Some("upload".into());
+            entry.part_size = Some(1024);
+            entry.completed_chunk_etags = (1..=completed_parts)
+                .map(|part| (part, format!("etag-{part}")))
+                .collect();
+            if current_config {
+                entry.encryption_config = Some(Arc::new(
+                    XChaCha20Poly1305Encryptor::from_hex(&"ab".repeat(32), &"cd".repeat(24))
+                        .unwrap(),
+                ));
+            }
+            session::session().files.insert(key.clone(), entry);
+            let backend = MissingEncryptionBackend {
+                key: key.clone(),
+                progress: ProgressManager::new(NoOpNotifier),
+            };
+            let outcome = pollster::block_on(run_upload(&backend));
+            assert!(
+                matches!(outcome, UploadOutcome::Failed(ref e) if e.contains("encryptAndUploadFile"))
+            );
+            let entry = session::session().files.remove(&key).unwrap();
+            assert_eq!(entry.state, UploadState::Failed);
+            assert_eq!(entry.completed_chunk_etags.len(), completed_parts as usize);
+        }
+    }
+}

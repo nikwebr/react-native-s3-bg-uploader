@@ -87,7 +87,7 @@ pub(super) fn hash_and_pre_register(
         file_size,
         user_params,
         encryption_config,
-    );
+    )?;
     Ok(file_hash)
 }
 

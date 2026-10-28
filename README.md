@@ -154,7 +154,10 @@ per file. That means:
 
 - two uploads in flight at the same time may use different keys (no global key state);
 - the instance is stored with that file's session entry, so pause/resume re-encrypts with the
-  same key without the host persisting anything extra;
+  same key while the process remains alive. Keys and encryptor instances are not persisted:
+  after a restart, re-provide encrypted files with `encryptAndUploadFile()` and the original
+  key/nonce. Plain `uploadFile()` reprovisioning and background uploads without the required
+  encryption configuration fail instead of sending plaintext;
 - a scheme that keeps its key on the device (Keychain / Keystore) may ignore the bytes and
   return a context anyway. Returning `NULL` instead makes the uploader use its built-in
   XChaCha20-Poly1305 for that upload.

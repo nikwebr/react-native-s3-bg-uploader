@@ -103,6 +103,10 @@ struct IosUploadBackend {
 impl UploadBackend for IosUploadBackend {
     type Notifier = IosProgressNotifier;
 
+    fn encryption_config(&self) -> Option<&ArcEncryptor> {
+        self.encryption_config.as_ref()
+    }
+
     fn progress_manager(&self) -> &crate::core::progress::ProgressManager<Self::Notifier> {
         iosProgress::progress_manager()
     }

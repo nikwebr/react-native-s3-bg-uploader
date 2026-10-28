@@ -93,6 +93,10 @@ pub fn forget_instance(file_key: &str) {
     });
 }
 
+pub fn forget_all_instances() {
+    INSTANCES.with(|m| m.borrow_mut().clear());
+}
+
 /// Ask the factory for the instance of one upload.
 ///
 /// `Ok(true)` = a JS instance now handles this file; `Ok(false)` = the factory
@@ -100,7 +104,10 @@ pub fn forget_instance(file_key: &str) {
 pub fn create_instance(file_key: &str, key: &[u8], nonce: &[u8]) -> Result<bool, String> {
     let factory = match FACTORY.with(|c| c.borrow().clone()) {
         Some(f) => f,
-        None => return Ok(false),
+        None => {
+            forget_instance(file_key);
+            return Ok(false);
+        }
     };
 
     let args = Array::new();
@@ -112,6 +119,7 @@ pub fn create_instance(file_key: &str, key: &[u8], nonce: &[u8]) -> Result<bool,
         .map_err(|e| format!("encryptor factory threw: {}", describe(&e)))?;
 
     if value.is_null() || value.is_undefined() {
+        forget_instance(file_key);
         return Ok(false);
     }
     let obj: Object = value
