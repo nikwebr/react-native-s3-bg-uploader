@@ -120,3 +120,29 @@ Bootstrapped with [create-nitro-module](https://github.com/patrickkabwe/create-n
 ## Contributing
 
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+
+### GitHub agent
+
+The gh-aw workflow in `.github/workflows/agent-serviceuser.md` uses Pi with
+DeepSeek, matching the ysendit agent setup. Repository writers can assign an
+issue or pull request to `agent-serviceuser`, request its review, or mention
+`@agent-serviceuser`. It also responds to new comments and reviews on assigned
+threads. Reviews can comment or request changes, but cannot approve.
+
+Set the repository Actions secret `DEEPSEEK_API_KEY` and enable **Allow GitHub
+Actions to create and approve pull requests** in Settings > Actions > General
+so the agent can open PRs. No Copilot token is required. AI threat detection is
+disabled, matching ysendit; the agent has read-only GitHub access and applies
+changes through gh-aw safe outputs using the default `GITHUB_TOKEN`, not the
+`agent-serviceuser` account's credentials.
+
+After editing the Markdown workflow, regenerate and commit its compiled workflow:
+
+```bash
+gh extension install github/gh-aw # Once; use v0.93.5 for this workflow
+gh aw compile agent-serviceuser
+```
+
+Commit `.github/workflows/agent-serviceuser.lock.yml` and any changes to
+`.github/aw/actions-lock.json` alongside the source. The previous Pi action is
+archived in `old_github_workflows/pi-agent.yml` and no longer runs.
