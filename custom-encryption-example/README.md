@@ -1,32 +1,20 @@
 # Custom AES-256-GCM Encryption Example for react-native-s3-bg-uploader
 
-This project demonstrates how to integrate a custom AES-256-GCM encryption library with [react-native-s3-bg-uploader](https://github.com/Naturalclar/react-native-s3-bg-uploader) for secure multipart S3 uploads in React Native.
+This project demonstrates how to integrate a custom AES-256-GCM encryption library with [react-native-s3-bg-uploader](https://github.com/nikwebr/react-native-s3-bg-uploader) for multipart S3 uploads on iOS, Android, and web.
+
+The example is a **bare React Native app**, not an Expo app. It uses the uploader from this
+repository through the `file:../..` dependency in `example-app/package.json`.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  React Native App (Example App)                                │
-│  - CustomEncryptor.swift (Swift bridge)                        │
-│  - CustomEncryptor.podspec (CocoaPods)                         │
-└──────────────────────┬────────────────────────────────────────┘
-                       │ FFI calls
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  custom-encryptor (Rust)                                       │
-│  - lib.rs: AES-256-GCM chunk encryption, part numbering        │
-│  - iOS/CustomEncryptor.swift: Swift FFI bridge                 │
-│  - custom_encryptor_register(): VTable registration            │
-└──────────────────────┬────────────────────────────────────────┘
-                       │ calls into
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  uploader (Rust) - from s3-bg-uploader                         │
-│  - core/encryption.rs: EncryptorVTable definition              │
-│  - core/chunked.rs: Multipart upload logic                     │
-│  - ios/bindings.rs: register_custom_encryptor()                │
-└─────────────────────────────────────────────────────────────────┘
-```
+The uploader and the custom encryptor are built separately. At startup, the app registers
+an encryptor factory; each encrypted upload then supplies its own key and nonce.
+
+| Platform | Custom encryptor build | Registration |
+|---|---|---|
+| iOS | Static libraries packaged as an XCFramework | `AppDelegate` calls `CustomEncryptor.register()` |
+| Android | `libcustom_encryptor.so` for each ABI | `MainApplication` calls `HybridS3BgUploader.registerCustomEncryptorIfAvailable()` |
+| Web | Separate WASM module embedded in `web-encryptor.ts` | `App.tsx` calls `registerWebEncryptor()` inside the uploader's worker |
 
 ## Project Structure
 
@@ -39,11 +27,8 @@ custom-encryption-example/
 │   ├── ios/
 │   │   ├── CustomEncryptor.swift   # Swift FFI bridge
 │   │   └── CustomEncryptor.podspec # CocoaPods spec
-│   └── target/                     # Built libraries
-│       ├── aarch64-apple-ios/      # Device static lib
-│       ├── aarch64-apple-ios-sim/  # Simulator (arm64)
-│       ├── x86_64-apple-ios/       # Simulator (x86_64)
-│       └── universal-ios-sim/      # Fat simulator lib
+│   ├── scripts/embed-wasm.js      # Generates the browser encryptor
+│   └── target/                    # Generated native libraries and WASM
 ├── example-app/                    # React Native example app
 │   ├── ios/
 │   │   ├── CustomEncryptionExample.xcodeproj/
@@ -51,75 +36,202 @@ custom-encryption-example/
 │   │   ├── CustomEncryptor.podspec
 │   │   ├── Podfile
 │   │   └── Libraries/
-│   │       └── libcustom_encryptor.a  # Copied static lib
-│   └── App.tsx                     # React Native UI
+│   │       └── libcustom_encryptor.xcframework/  # Generated
+│   ├── android/app/src/main/jniLibs/ # Generated custom .so files per ABI
+│   ├── web-encryptor.ts            # Embedded custom WASM
+│   └── App.tsx                     # Shared native/web UI
+├── build-rust-lib.sh               # Builds the custom iOS XCFramework
+├── tools/decrypt/                  # Independent object verifier
 └── README.md
 ```
 
-## Building the Custom Encryptor
+## Build and run
 
-### Prerequisites
-- Rust toolchain with `cargo`
-- iOS targets installed: `rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios`
+### Common setup
 
-### Build Commands
+Install Node.js **22.11.0 or newer**, npm, and Rust with `cargo` and `rustup`.
+Native builds additionally need the platform tools described below.
 
-```bash
-cd custom-encryptor-rust
-
-# Build for all iOS targets (device + simulator)
-cargo build --release --target aarch64-apple-ios
-cargo build --release --target aarch64-apple-ios-sim
-cargo build --release --target x86_64-apple-ios
-
-# Create universal simulator library
-mkdir -p target/universal-ios-sim/release
-lipo -create \
-    target/aarch64-apple-ios-sim/release/libcustom_encryptor.a \
-    target/x86_64-apple-ios/release/libcustom_encryptor.a \
-    -output target/universal-ios-sim/release/libcustom_encryptor.a
-
-# Copy to example app
-cp target/universal-ios-sim/release/libcustom_encryptor.a \
-   ../example-app/ios/Libraries/
-```
-
-### For Device Builds
+Start in the **repository root**, not in `custom-encryption-example/`:
 
 ```bash
-# Use the device-specific library
-cp target/aarch64-apple-ios/release/libcustom_encryptor.a \
-   ../example-app/ios/Libraries/
+npm ci
+npm ci --prefix custom-encryption-example/example-app
 ```
 
-## Building the Example App
+The root install provides the uploader's build/code-generation tools; the second install
+provides this example app's dependencies. Build both the uploader and the custom encryptor
+for the platform you want to run.
 
-### 1. Install Dependencies
+Before running the example app, review `START_UPLOAD_API`, `GET_UPLOAD_URLS_API`, and `COMPLETE_API` in
+`example-app/App.tsx`. Replace them with your backend endpoints if needed.
+
+> **Demo only:** the app includes demo key/nonce values and points to a demo backend.
+> Do not upload confidential files. In production, generate and retain your own key material,
+> use a unique nonce for each new upload under a key, and reuse the original key/nonce only
+> when retrying or resuming that upload.
+
+### iOS
+
+Requires macOS, Xcode with an iOS 26-or-newer SDK, Xcode Command Line Tools, and CocoaPods.
+The example's `Podfile` targets **iOS 26.0**. Use an iOS 26-or-newer simulator or device;
+background continued-processing uploads require a **physical device**.
+
+From the repository root:
 
 ```bash
-cd example-app
-npm install
-cd ios
-pod install
+npm run build:ios
+bash custom-encryption-example/build-rust-lib.sh
+(cd custom-encryption-example/example-app/ios && pod install)
 ```
 
-### 2. Build with Xcode
+The first command builds the uploader and runs native code generation. The second builds
+the custom encryptor for device and simulator and creates
+`example-app/ios/Libraries/libcustom_encryptor.xcframework`, which the podspec consumes.
+There is no need to swap `.a` files manually when switching between simulator and device.
+
+For a **Debug simulator run**, start Metro in one terminal:
 
 ```bash
-cd example-app/ios
-
-# Debug (simulator) - uses universal simulator library
-xcodebuild -scheme CustomEncryptionExample \
-    -workspace CustomEncryptionExample.xcworkspace \
-    -destination 'platform=iOS Simulator,name=iPhone 17' \
-    -configuration Debug build
-
-# Release (device) - uses device library
-xcodebuild -scheme CustomEncryptionExample \
-    -workspace CustomEncryptionExample.xcworkspace \
-    -destination 'platform=iOS,name=iPhone 17' \
-    -configuration Release build
+cd custom-encryption-example/example-app
+npm start
 ```
+
+In another terminal, starting from the repository root:
+
+```bash
+xcrun simctl list devices available
+cd custom-encryption-example/example-app
+# Replace the simulator name with one installed on your machine.
+npm run ios -- --scheme CustomEncryptionExample --simulator "iPhone 17" --no-packager
+```
+
+For a **physical device**, connect and trust the iPhone, enable Developer Mode, then open
+the workspace from the repository root:
+
+```bash
+open custom-encryption-example/example-app/ios/CustomEncryptionExample.xcworkspace
+```
+
+Select the `CustomEncryptionExample` scheme, set your development team under
+**Signing & Capabilities**, select the connected device, and choose **Run**.
+Debug builds need Metro reachable from the device.
+
+Alternatively, after configuring signing, build, install, and launch a **Release** build:
+
+```bash
+cd custom-encryption-example/example-app
+npm run ios -- --scheme CustomEncryptionExample --device "Your iPhone" --mode Release --no-packager
+```
+
+Replace `Your iPhone` with the connected device's name. Release bundles JavaScript and
+does not require Metro.
+
+### Android
+
+Requires Android Studio/SDK, a compatible JDK configured through `JAVA_HOME`, SDK Platform
+**36**, Build Tools **36.0.0**, and NDK **27.1.12297006**. The app supports Android API **24+**.
+Install these through Android Studio's SDK Manager and enable USB debugging on a device,
+or start an emulator.
+
+```bash
+# Uploader .so files for all four configured ABIs, plus native code generation.
+npm run build:android
+
+# Custom encryptor .so files for those same ABIs.
+cargo ndk --platform 24 \
+  -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 \
+  -o custom-encryption-example/example-app/android/app/src/main/jniLibs \
+  build --release \
+  --manifest-path custom-encryption-example/custom-encryptor-rust/Cargo.toml
+```
+
+The uploader libraries go into the repository's `android/src/main/jniLibs/`; the custom
+libraries go into the example app's `jniLibs/`. Both are required. The app already contains
+the native registration call; no extra Kotlin file or CMake linking changes are needed.
+
+For a **Debug run**, start Metro in one terminal:
+
+```bash
+cd custom-encryption-example/example-app
+npm start
+```
+
+In another terminal, starting from the repository root, connect one device or emulator:
+
+```bash
+adb devices
+adb reverse tcp:8081 tcp:8081
+cd custom-encryption-example/example-app
+npm run android -- --no-packager
+```
+
+For a **Release run without Metro**, start from the repository root:
+
+```bash
+cd custom-encryption-example/example-app/android
+./gradlew :app:assembleRelease --no-daemon
+adb install -r app/build/outputs/apk/release/app-release.apk
+adb shell am start -n com.customencryptionexample/.MainActivity
+```
+
+The example signs Release with its debug keystore for local use. Configure production
+signing separately before distributing an app.
+
+### Web
+
+Web needs neither Xcode/Android tooling nor Metro. It needs two WASM builds: the uploader
+and the custom AES encryptor.
+
+From the repository root:
+
+```bash
+npm run build:wasm
+
+cd custom-encryption-example/custom-encryptor-rust
+cargo build --locked --features wasm --target wasm32-unknown-unknown --release
+wasm-bindgen --out-dir target/wasm --target no-modules \
+  target/wasm32-unknown-unknown/release/custom_encryptor.wasm
+node scripts/embed-wasm.js
+
+cd ../example-app
+npm run web
+```
+
+Open **http://localhost:8082**. The uploader build regenerates the repository's
+`src/web/wasm-assets.ts`; the custom build regenerates `example-app/web-encryptor.ts`.
+The app registers the custom factory automatically. Wait for the
+`web: custom AES-256-GCM encryptor registered (WASM)` log before starting an encrypted upload.
+
+`npm run build:wasm` installs a `wasm-bindgen-cli` version matching the uploader's lockfile.
+The custom encryptor's CLI must also match its own `Cargo.lock` (currently **0.2.129**,
+the same as the uploader). If those versions diverge, install the matching CLI before
+processing the custom module, for example:
+
+```bash
+cargo install wasm-bindgen-cli --version 0.2.129 --locked --force
+```
+
+Your API and S3 bucket must allow browser requests from `http://localhost:8082` through
+CORS, including the upload methods/headers and access to the response's `ETag` header.
+Keep localhost for local development, or use HTTPS when hosting the app.
+
+For a production web bundle, run this from `custom-encryption-example/example-app`:
+
+```bash
+npx webpack --config webpack.config.js --mode production
+```
+
+Serve the resulting `web-build/` directory over HTTP(S); do not open its HTML through
+`file://`.
+
+### Using the running app
+
+Enable custom encryption, set the key and nonce, choose files, and start/resume the upload.
+`encryptAndUploadFile()` requires a **64-hex-character key** and a
+**48-hex-character base nonce** in this example. Native registration and web factory
+registration do not contain the key; it is supplied with each upload.
+Use the verifier below to authenticate and decrypt a downloaded object.
 
 ## Key Implementation Details
 
@@ -128,7 +240,7 @@ xcodebuild -scheme CustomEncryptionExample \
 AES-256-GCM chunk encryption, deterministic per part so a paused upload can be resumed
 and a part re-encrypted to exactly the same ciphertext:
 
-- **Key/nonce**: 32-byte key + 24-byte base nonce, passed as hex at registration.
+- **Key/nonce**: 32-byte key + 24-byte base nonce, passed as hex with each encrypted upload.
 - **Per-part nonce**: `base_nonce[..12] XOR part_number` (u32 little-endian) — no random
   IVs, which is what makes resume/retry reproducible.
 - **Overhead**: 16 bytes (the GCM tag), declared as `ciphertext_overhead = 16`.
@@ -154,6 +266,7 @@ and a part re-encrypted to exactly the same ciphertext:
 
 | field | meaning |
 |---|---|
+| `create(key, key_len, nonce, nonce_len)` | builds one context from an upload's key material |
 | `encrypt_chunk(ctx, input, len, part_number)` | encrypt one S3 part |
 | `free(ctx, data, len, capacity)` | release a result the uploader copied out |
 | `destroy(ctx)` | release the context |
@@ -242,7 +355,7 @@ How to read the result:
 - It also tells you *which* implementation produced the object: with `--scheme auto` (the
   default), a report of `xchacha (built-in)` means the upload fell back to the built-in
   encryptor — i.e. registration never happened.
-- `--key` / `--nonce` default to the demo values from `AppDelegate`. The layout — part size
+- `--key` / `--nonce` default to the demo values from `example-app/App.tsx`. The layout — part size
   *and* part count — is read out of the descriptor, so `--part-size` is only needed to force a
   specific split while debugging: the engine's real part size is `server_part_size - 44`, which
   is not a round number.
@@ -308,6 +421,6 @@ cargo run --release -- /tmp/cfv/adapter-object.bin --expect /tmp/cfv/adapter-pla
 
 ## Dependencies
 
-- **Rust**: `aes-gcm`, `sha2`, `hkdf`, `rand`, `generic-array`
+- **Rust**: `aes-gcm`, `getrandom`; `wasm-bindgen` and `js-sys` for web
 - **React Native**: 0.85.3+ with Nitro modules
-- **iOS**: iOS 15.0+ (arm64 device + arm64/x86_64 simulator)
+- **iOS example app**: iOS 26.0+ (arm64 device + arm64/x86_64 simulator)
