@@ -68,15 +68,22 @@ tools:
 safe-outputs:
   add-comment:
     hide-older-comments: true
+    github-token: ${{ secrets.GH_TOKEN }}
   create-pull-request:
     title-prefix: "[agent] "
     draft: false
+    github-token: ${{ secrets.GH_TOKEN }}
+    signed-commits: true
   push-to-pull-request-branch:
     target: triggering
+    github-token: ${{ secrets.GH_TOKEN }}
+    signed-commits: true
   submit-pull-request-review:
     allowed-events: [COMMENT, REQUEST_CHANGES]
+    github-token: ${{ secrets.GH_TOKEN }}
   create-pull-request-review-comment:
     max: 20
+    github-token: ${{ secrets.GH_TOKEN }}
   add-labels:
   threat-detection:
     engine: false
