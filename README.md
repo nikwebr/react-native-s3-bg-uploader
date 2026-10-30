@@ -131,7 +131,10 @@ threads. Reviews can comment or request changes, but cannot approve.
 
 Set the repository Actions secrets `DEEPSEEK_API_KEY` and `GH_TOKEN`. The
 interactive agent uses `GH_TOKEN` for creating package PRs and pushing updates
-to PR branches, so their CI checks can start automatically. Using the default
+to PR branches, so their CI checks can start automatically. Reviews and inline
+review comments also use the PAT account; reviews still cannot approve PRs.
+GitHub does not allow that account to review its own PRs, so such requests must
+be reported as blocked rather than retried under another identity. Using the default
 `GITHUB_TOKEN` for these operations instead makes GitHub require approval before
 running the resulting PR workflows. The agent does not update the external
 documentation repository.
@@ -154,8 +157,12 @@ It cannot approve or merge PRs. `GH_TOKEN` must be a PAT with **Contents:
 read/write** and **Pull requests: read/write** access to both the package and
 docs repositories. The PAT is used by trusted checkout and publishing steps,
 not either agent's execution environment or GitHub tools. Credentials are not
-persisted in the agent checkout. New PRs are authored by the PAT account;
-commit attribution is configured separately.
+persisted in the agent checkout. New PRs are authored by the PAT account.
+Both workflows explicitly publish signed commits through GitHub's
+`createCommitOnBranch` API, which attributes published commits to the PAT owner.
+Temporary sandbox commits may still use the local `github-actions[bot]` identity;
+their local author metadata is not the published signed-commit identity.
+Ordinary issue/PR conversation comments also use the PAT account.
 
 Both agents use read-only GitHub tools and apply changes through gh-aw safe
 outputs. No Copilot token is required. AI threat detection remains disabled,
