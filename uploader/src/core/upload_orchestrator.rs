@@ -45,8 +45,14 @@ pub trait UploadBackend {
     }
 
     /// Bytes the descriptor occupies in the last data part (0 when there is none).
+    /// Defaults to 12 bytes of metadata plus the encryptor's overhead, matching
+    /// `ChunkEncryptor::footer_len()`.
     fn footer_len(&self) -> u64 {
-        0
+        if self.has_footer() {
+            12 + self.ciphertext_overhead()
+        } else {
+            0
+        }
     }
 
     fn total_bytes(&self) -> Result<u64, String>;

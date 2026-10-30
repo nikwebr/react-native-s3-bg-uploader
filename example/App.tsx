@@ -61,7 +61,7 @@ interface QueuedFile {
   isLoading?: boolean;
   /** True if loaded from a persisted session but not yet re-provided via uploadFile(). */
   isMissing?: boolean;
-  /** True if this file is uploaded with AES-256-CTR chunk encryption. */
+  /** True if this file uses encrypted upload (XChaCha20-Poly1305 AEAD by default). */
   encrypted?: boolean;
 }
 

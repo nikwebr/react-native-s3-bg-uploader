@@ -127,12 +127,12 @@ interface BaseUploaderAPI {
    * that implements the stable FFI interface defined by this package.
    * 
    * @param vtablePointer  Pointer to the custom encryptor's vtable (provided by the host's native library)
-   * @param contextPointer  Opaque context pointer owned by the host (provided by the host's native library)
    * 
    * @example
    * ```typescript
    * // In your native code (Swift / Kotlin / Rust adapter):
    * //   const vtable = new EncryptorVTable();
+   * //   vtable.create = myCreate;             // creates a context from each upload's key/nonce
    * //   vtable.encrypt_chunk = myEncryptChunk;
    * //   vtable.free = myFree;
    * //   vtable.destroy = myDestroy;
@@ -142,10 +142,7 @@ interface BaseUploaderAPI {
    * //   vtable.compute_footer = myDescriptor;
    * 
    * // In TypeScript at app startup:
-   * await S3BgUploader.registerCustomEncryptor(
-   *   vtablePointer,
-   *   contextPointer,
-   * );
+   * S3BgUploader.registerCustomEncryptor(vtablePointer);
    * ```
    */
   registerCustomEncryptor(vtablePointer: number): void;
@@ -246,11 +243,12 @@ export interface S3BgUploaderAPI extends BaseUploaderAPI, WebEncryptorRegistrati
   ): Promise<string>
 
   /**
-   * Enqueue a file for encrypted upload. Each chunk is encrypted with AES-256-CTR before uploading.
+   * Enqueue a file for encrypted upload. Each chunk uses XChaCha20-Poly1305 AEAD
+   * by default, or a registered custom encryptor.
    * The encryption is resumable: the same key and nonce must be re-provided after a restart.
    *
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
-   * @param encryptionKey 64 hex characters (32 bytes) AES-256 key
+   * @param encryptionKey 64 hex characters (32 bytes) encryption key for the built-in cipher
    * @param encryptionNonce 48 hex characters (24 bytes) base nonce; per-part nonce is derived deterministically
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
@@ -294,11 +292,12 @@ export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
   ): Promise<string>
 
   /**
-   * Enqueue a file for encrypted upload. Each chunk is encrypted with AES-256-CTR before uploading.
+   * Enqueue a file for encrypted upload. Each chunk uses XChaCha20-Poly1305 AEAD
+   * by default, or a registered custom encryptor.
    * The encryption is resumable: the same key and nonce must be re-provided after a restart.
    *
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
-   * @param encryptionKey 64 hex characters (32 bytes) AES-256 key
+   * @param encryptionKey 64 hex characters (32 bytes) encryption key for the built-in cipher
    * @param encryptionNonce 48 hex characters (24 bytes) base nonce; per-part nonce is derived deterministically
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
@@ -342,11 +341,12 @@ export interface WebS3BgUploaderAPI extends BaseUploaderAPI, WebEncryptorRegistr
   ): Promise<string>
 
   /**
-   * Enqueue a file for encrypted upload. Each chunk is encrypted with AES-256-CTR before uploading.
+   * Enqueue a file for encrypted upload. Each chunk uses XChaCha20-Poly1305 AEAD
+   * by default, or a registered custom encryptor.
    * The encryption is resumable: the same key and nonce must be re-provided after a restart.
    *
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
-   * @param encryptionKey 64 hex characters (32 bytes) AES-256 key
+   * @param encryptionKey 64 hex characters (32 bytes) encryption key for the built-in cipher
    * @param encryptionNonce 48 hex characters (24 bytes) base nonce; per-part nonce is derived deterministically
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting

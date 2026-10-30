@@ -21,7 +21,7 @@ pub trait ChunkEncryptor: Send + Sync + std::fmt::Debug {
         0
     }
 
-    /// If `Some`, the orchestrator appends a footer as the final S3 part.
+    /// If `Some`, the footer is appended to the final data part.
     /// The footer encrypts `n_data_parts || effective_part_size` (12 bytes) so
     /// a decoder has everything it needs without external metadata.
     /// Default: `None` (no footer).
@@ -385,7 +385,7 @@ pub fn custom_factory_registered() -> bool {
 /// stored in that file's session entry, so a resume re-uses the same instance
 /// only if the key material is identical.
 pub fn build_encryptor(key_hex: &str, nonce_hex: &str) -> Result<ArcEncryptor, String> {
-    log::error!(
+    log::debug!(
         "build_encryptor: factory_registered={} key_hex_len={} nonce_hex_len={}",
         CUSTOM_VTABLE.get().is_some(),
         key_hex.len(),
@@ -394,19 +394,19 @@ pub fn build_encryptor(key_hex: &str, nonce_hex: &str) -> Result<ArcEncryptor, S
     if let Some(vtable) = CUSTOM_VTABLE.get() {
         let key = hex_decode(key_hex, "encryption key")?;
         let nonce = hex_decode(nonce_hex, "encryption nonce")?;
-        log::error!(
+        log::debug!(
             "build_encryptor: calling create(key_len={}, nonce_len={})",
             key.len(),
             nonce.len()
         );
         let ctx = unsafe { (vtable.create)(key.as_ptr(), key.len(), nonce.as_ptr(), nonce.len()) };
         if !ctx.is_null() {
-            log::error!("build_encryptor: custom instance created (ctx={:?})", ctx);
+            log::info!("build_encryptor: custom instance created");
             return Ok(Arc::new(unsafe {
                 CustomEncryptor::from_vtable(ctx, vtable)
             }));
         }
-        log::error!(
+        log::info!(
             "build_encryptor: custom create() returned null -> built-in cipher for this upload"
         );
     }

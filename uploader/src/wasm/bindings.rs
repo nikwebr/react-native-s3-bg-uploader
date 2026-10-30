@@ -71,7 +71,8 @@ pub fn add(one: f64, two: f64) -> f64 {
 ///     free: my_free,
 ///     destroy: my_destroy,
 ///     ciphertext_overhead: 16,  // bytes your scheme adds per chunk (tag/IV/…)
-///     has_footer: false,        // true => compute_footer builds a descriptor part
+///     has_footer: false,        // true => append a descriptor to the last data part
+///     footer_len: 0,            // descriptor bytes; non-zero when has_footer is true
 ///     compute_footer: my_descriptor,
 /// };
 ///
