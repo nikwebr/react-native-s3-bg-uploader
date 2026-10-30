@@ -439,6 +439,28 @@ pub(crate) fn hex_decode(hex: &str, label: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hex_decode_accepts_ascii_hex_and_rejects_malformed_input() {
+        assert_eq!(hex_decode("00aAfF", "key").unwrap(), vec![0, 170, 255]);
+        assert_eq!(hex_decode("", "key").unwrap(), Vec::<u8>::new());
+        for input in ["0", "abc", "0g", "zz"] {
+            assert!(hex_decode(input, "key").unwrap_err().contains("Invalid key"));
+        }
+    }
+
+    #[test]
+    fn hex_decode_rejects_non_ascii_without_panicking() {
+        for (input, label) in [
+            ("a\u{e9}a".to_string(), "key"),
+            (format!("a\u{e9}{}", "a".repeat(61)), "key"),
+            (format!("a\u{e9}{}", "a".repeat(45)), "nonce"),
+        ] {
+            let error = hex_decode(&input, label).unwrap_err();
+            assert!(error.contains(label));
+            assert!(error.contains("ASCII"));
+        }
+    }
+
     /// The vtable is the ABI boundary, and hosts mirror this struct in their own
     /// crate (they deliberately do not depend on this one), so its layout is
     /// pinned here. If a field is added or reordered, update the mirrors — and the

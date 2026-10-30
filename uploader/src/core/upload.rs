@@ -267,6 +267,150 @@ mod tests {
         XChaCha20Poly1305Encryptor::from_hex(&"ab".repeat(32), &"cd".repeat(24)).unwrap()
     }
 
+    #[derive(Debug)]
+    struct CustomLayout {
+        has_footer: bool,
+    }
+
+    impl ChunkEncryptor for CustomLayout {
+        fn encrypt_chunk(&self, data: &[u8], _: u32) -> Vec<u8> {
+            let mut out = data.to_vec();
+            out.resize(data.len() + self.ciphertext_overhead(), 0);
+            out
+        }
+
+        fn ciphertext_overhead(&self) -> usize {
+            8
+        }
+
+        fn has_footer(&self) -> bool {
+            self.has_footer
+        }
+
+        fn footer_len(&self) -> usize {
+            if self.has_footer {
+                20
+            } else {
+                0
+            }
+        }
+
+        fn compute_footer(&self, _: u32, _: u64) -> Option<Vec<u8>> {
+            self.has_footer.then(|| vec![0; self.footer_len()])
+        }
+    }
+
+    #[test]
+    fn prepare_upload_uses_custom_overhead_and_optional_footer() {
+        for has_footer in [false, true] {
+            let key = format!("custom-layout-{has_footer}");
+            let config: ArcEncryptor = std::sync::Arc::new(CustomLayout { has_footer });
+            register_started_upload(
+                key.clone(),
+                &key,
+                "file".into(),
+                "file".into(),
+                2500,
+                HashMap::new(),
+                Some(config.clone()),
+                StartUploadResponse {
+                    key: key.clone(),
+                    upload_id: "upload-id".into(),
+                    part_size: 1024,
+                },
+            );
+            session::session()
+                .files.get_mut(&key).unwrap()
+                .completed_chunk_etags = vec![(1, "etag".into())];
+            let prepared = prepare_upload(
+                &key,
+                2500,
+                config.ciphertext_overhead() as u64,
+                config.has_footer(),
+                config.footer_len() as u64,
+                Some(&config),
+            )
+            .unwrap();
+            session::session().cancel_file(&key);
+
+            let expected_part_size = if has_footer { 996 } else { 1016 };
+            assert_eq!(prepared.part_size, expected_part_size);
+            assert_eq!(prepared.total_parts, 3);
+            assert_eq!(prepared.remaining_parts, vec![2, 3]);
+            assert_eq!(prepared.completed_etags, vec![(1, "etag".into())]);
+            assert_eq!(prepared.committed_bytes, expected_part_size);
+
+            for part in 1..=prepared.total_parts {
+                let plain_len = part_size_for(part, prepared.part_size, 2500) as usize;
+                let mut out = config.encrypt_chunk(&vec![0; plain_len], part);
+                append_descriptor(
+                    &mut out,
+                    config.as_ref(),
+                    part,
+                    prepared.total_parts,
+                    prepared.part_size,
+                    has_footer,
+                );
+                let footer_len = if has_footer && part == prepared.total_parts {
+                    20
+                } else {
+                    0
+                };
+                assert_eq!(out.len(), plain_len + 8 + footer_len);
+                assert!(out.len() <= 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn registration_publishes_encryption_before_the_first_session_snapshot() {
+        for encrypted in [false, true] {
+            let key = format!("atomic-encryption-registration-{encrypted}");
+            let config = encrypted.then(|| -> ArcEncryptor { std::sync::Arc::new(encryptor()) });
+            register_started_upload(
+                key.clone(),
+                &key,
+                "file".into(),
+                "file".into(),
+                2500,
+                HashMap::new(),
+                config.clone(),
+                StartUploadResponse {
+                    key: key.clone(),
+                    upload_id: "upload-id".into(),
+                    part_size: 1024,
+                },
+            );
+            let (entry, snapshot) = {
+                let sess = session::session();
+                (sess.files[&key].clone(), sess.to_json().unwrap())
+            };
+            session::session().cancel_file(&key);
+
+            assert_eq!(entry.encrypted, encrypted);
+            assert_eq!(entry.upload_id.as_deref(), Some("upload-id"));
+            assert_eq!(entry.part_size, Some(1024));
+            match (entry.encryption_config.as_ref(), config.as_ref()) {
+                (Some(actual), Some(expected)) => assert!(std::sync::Arc::ptr_eq(actual, expected)),
+                (None, None) => {}
+                _ => panic!("registration lost the upload's encryption configuration"),
+            }
+
+            let restored = session::Session::from_json(&snapshot).unwrap();
+            let entry = &restored.files[&key];
+            assert_eq!(entry.encrypted, encrypted);
+            assert!(entry.encryption_config.is_none());
+            if encrypted {
+                assert!(entry
+                    .require_encryption_config(None)
+                    .unwrap_err()
+                    .contains("encryptAndUploadFile"));
+            } else {
+                assert!(entry.require_encryption_config(None).is_ok());
+            }
+        }
+    }
+
     #[test]
     fn provisioned_encrypted_and_plain_uploads_keep_their_resume_layout() {
         for encrypted in [false, true] {
