@@ -132,9 +132,6 @@ repo-wide knowledge in cache-memory. Never store secrets or raw logs.
 ## Rules
 
 - Stay inside the scope of the triggering request; do not reopen old discussions.
-- Reviews and inline review comments are published as the `GH_TOKEN` account.
-  If GitHub rejects a review because that account authored the PR, report the
-  blocker; do not retry under another identity or attempt to approve the PR.
 - Do not update the external documentation repository. A separate post-merge
   workflow checks documentation and its version; keep this agent's work in the
   package repository.

@@ -133,8 +133,7 @@ Set the repository Actions secrets `DEEPSEEK_API_KEY` and `GH_TOKEN`. The
 interactive agent uses `GH_TOKEN` for creating package PRs and pushing updates
 to PR branches, so their CI checks can start automatically. Reviews and inline
 review comments also use the PAT account; reviews still cannot approve PRs.
-GitHub does not allow that account to review its own PRs, so such requests must
-be reported as blocked rather than retried under another identity. Using the default
+GitHub does not allow that account to review its own PRs. Using the default
 `GITHUB_TOKEN` for these operations instead makes GitHub require approval before
 running the resulting PR workflows. The agent does not update the external
 documentation repository.
