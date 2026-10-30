@@ -67,11 +67,17 @@ pub async fn start_and_register<A: ApiClient>(
     file_name: String,
     file_size: u64,
     user_params: HashMap<String, String>,
+    encryption_config: Option<ArcEncryptor>,
     api: &A,
 ) -> Result<StartResult, String> {
     match start_decision(&file_hash) {
         StartDecision::Completed { file_key } => Ok(StartResult::AlreadyCompleted(file_key)),
-        StartDecision::Resume { file_key } => Ok(StartResult::Resumed(file_key)),
+        StartDecision::Resume { file_key } => {
+            if let Some(config) = encryption_config {
+                session::session().update_encryption_config(&file_key, config);
+            }
+            Ok(StartResult::Resumed(file_key))
+        }
         StartDecision::StartNew => {
             let start_resp = api
                 .start_upload(&file_name, &file_hash, file_size, &user_params)
@@ -84,6 +90,7 @@ pub async fn start_and_register<A: ApiClient>(
                 file_name,
                 file_size,
                 user_params,
+                encryption_config,
                 start_resp,
             );
             session::persist_session();
@@ -99,12 +106,15 @@ pub fn register_started_upload(
     file_name: String,
     file_size: u64,
     user_params: HashMap<String, String>,
+    encryption_config: Option<ArcEncryptor>,
     start_resp: StartUploadResponse,
 ) -> String {
     let file_key = start_resp.key.clone();
     let total_parts = total_parts(file_size, start_resp.part_size);
 
-    session::session().register_file(
+    // Publish the entry, upload metadata and encryption state under one lock.
+    let mut sess = session::session();
+    sess.register_file(
         file_key.clone(),
         file_hash,
         transfer_id.to_string(),
@@ -113,12 +123,15 @@ pub fn register_started_upload(
         file_size,
         user_params,
     );
-    session::session().set_upload_info(
+    sess.set_upload_info(
         &file_key,
         start_resp.upload_id,
         start_resp.part_size,
         total_parts,
     );
+    if let Some(config) = encryption_config {
+        sess.update_encryption_config(&file_key, config);
+    }
 
     file_key
 }

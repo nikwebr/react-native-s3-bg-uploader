@@ -417,6 +417,9 @@ pub fn build_encryptor(key_hex: &str, nonce_hex: &str) -> Result<ArcEncryptor, S
 
 /// Decode hex into raw bytes — key material handed to a host factory.
 pub(crate) fn hex_decode(hex: &str, label: &str) -> Result<Vec<u8>, String> {
+    if !hex.is_ascii() {
+        return Err(format!("Invalid {label}: expected ASCII hex characters"));
+    }
     if hex.len() % 2 != 0 {
         return Err(format!(
             "Invalid {label}: expected an even number of hex characters, got {}",

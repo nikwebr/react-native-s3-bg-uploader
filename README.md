@@ -153,6 +153,8 @@ The uploader decodes those hex strings and calls `create`, which builds one encr
 per file. That means:
 
 - two uploads in flight at the same time may use different keys (no global key state);
+- new uploads are marked encrypted before they become schedulable or are first persisted,
+  so they cannot temporarily run as plaintext during initialization;
 - the instance is stored with that file's session entry, so pause/resume re-encrypts with the
   same key while the process remains alive. Keys and encryptor instances are not persisted:
   after a restart, re-provide encrypted files with `encryptAndUploadFile()` and the original

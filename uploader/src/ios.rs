@@ -103,6 +103,7 @@ pub(super) fn initialize_and_enqueue(file_hash: &str, transfer_id: &str) -> Resu
         pending.file_name.clone(),
         pending.file_size,
         pending.user_params.clone(),
+        pending.encryption_config.clone(),
         &api,
     ))?;
     // Check if cancel_all fired while we were blocked on the network call.
@@ -115,13 +116,6 @@ pub(super) fn initialize_and_enqueue(file_hash: &str, transfer_id: &str) -> Resu
         return Err("cancelled".to_string());
     }
     if result.should_upload() {
-        // Carry the caller's encryptor over for EVERY upload path, not only a resume:
-        // a fresh upload is registered by start_and_register with encryption_config = None,
-        // so leaving this inside the Resumed arm silently uploads the file as plaintext
-        // even though the caller asked for encryption.
-        if let Some(config) = pending.encryption_config.clone() {
-            session::session().update_encryption_config(result.file_key(), config);
-        }
         if let StartResult::Resumed(ref file_key) = result {
             session::session().update_file_path(file_key, pending.file_path.clone());
         }

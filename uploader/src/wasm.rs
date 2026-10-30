@@ -200,6 +200,7 @@ pub(crate) fn process_pending_files() {
                 file_name,
                 file_size,
                 user_params,
+                enc_opt,
                 &WasmApiClient,
             )
             .await;
@@ -216,9 +217,6 @@ pub(crate) fn process_pending_files() {
                         // Undo the session.files insertion made by start_and_register.
                         session::session().cancel_file(&file_key);
                         return;
-                    }
-                    if let Some(config) = enc_opt {
-                        session::session().update_encryption_config(&file_key, config);
                     }
                     runtime::notify_file_registered(wasmProgress::progress_manager(), &file_key);
                     if result.should_upload() {
