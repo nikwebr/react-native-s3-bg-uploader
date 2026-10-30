@@ -65,6 +65,7 @@ safe-outputs:
     auto-close-issue: false
     allowed-files: [content/**, lib/version.ts]
     github-token: ${{ secrets.GH_TOKEN }}
+    signed-commits: true
   threat-detection:
     engine: false
 ---
