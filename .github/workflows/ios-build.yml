@@ -111,8 +111,15 @@ jobs:
           bash custom-encryption-example/build-rust-lib.sh
           cargo build --release --locked --manifest-path custom-encryption-example/tools/decrypt/Cargo.toml
       - name: Install custom example Pods
-        working-directory: example
-        run: bundle exec pod install --project-directory=../custom-encryption-example/example-app/ios
+        # React Native's autolinking CLI resolves the project from the process
+        # working directory, not from CocoaPods' --project-directory. Installing
+        # from example/ therefore resolved reactNativePath against the wrong
+        # node_modules. Run from the app's own iOS directory and point Bundler
+        # at the shared Gemfile instead.
+        working-directory: custom-encryption-example/example-app/ios
+        env:
+          BUNDLE_GEMFILE: ${{ github.workspace }}/example/Gemfile
+        run: bundle exec pod install
       - name: Build custom example simulator app
         working-directory: custom-encryption-example/example-app/ios
         run: |
