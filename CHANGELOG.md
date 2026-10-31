@@ -1,3 +1,17 @@
+## [1.2.0](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.1.3...v1.2.0) (2026-10-31)
+
+### ✨ Features
+
+* add custom encryption example for iOS Android and web ([1b683f7](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/1b683f71332445bc4f070726c0494515889d82b0))
+
+### 🐛 Bug Fixes
+
+* **ci:** make CodeQL simulator build device-independent ([cb06b3f](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/cb06b3fdc6806657252b1dd1781686678b98bc3a))
+* **encryption:** correct documentation logging and footer defaults ([32660ac](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/32660ac0f677348d1532ed7707254bd8828420a7))
+* **encryption:** guard resumed uploads and clean up web encryptors ([0f9ed4e](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/0f9ed4ee4e91213a8ec80167b794b73c5328d3e1))
+* **encryption:** register encryption atomically and reject non-ASCII hex ([c036605](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/c0366059f3db5a16b2c3fc62c8afe8cc331e2407))
+* **wasm:** install wasm-bindgen CLI version matching Cargo.lock ([4441cea](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/4441cea1304bc53aef87d9f0fef1f728a24d3ffc))
+
 ## [1.1.3](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.1.2...v1.1.3) (2026-05-12)
 
 ### 🐛 Bug Fixes
