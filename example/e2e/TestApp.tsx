@@ -20,7 +20,9 @@ async function api(path: string, body: unknown): Promise<void> {
   }
 }
 
-export default function TestApp(): React.JSX.Element {
+export default function TestApp({ initializeEncryptor }: {
+  initializeEncryptor?: () => Promise<void>;
+}): React.JSX.Element {
   const [fixturePath, setFixturePath] = useState('');
   const [status, setStatus] = useState('Ready');
   const [error, setError] = useState('');
@@ -50,6 +52,7 @@ export default function TestApp(): React.JSX.Element {
   };
 
   const prepare = async (mode: 'plain' | 'encrypted') => {
+    await initializeEncryptor?.();
     S3BgUploader.cancel();
     // A query also fences the worker's asynchronous cancel() on web.
     await S3BgUploader.getProgress();

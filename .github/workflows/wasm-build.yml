@@ -41,10 +41,6 @@ jobs:
           python -m venv e2e/.venv
           e2e/.venv/bin/pip install -r e2e/requirements.txt
           bash e2e/install-maestro.sh
-      - name: Test download/decryption oracle
-        working-directory: .
-        run: e2e/.venv/bin/python -m unittest discover -s e2e -p 'test_*.py'
-
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -67,6 +63,23 @@ jobs:
       - name: Build WASM library
         run: ./scripts/build.sh wasm
 
+      - name: Build independent custom encryption verifier
+        working-directory: .
+        run: cargo build --release --locked --manifest-path custom-encryption-example/tools/decrypt/Cargo.toml
+      - name: Test download/decryption oracle for both encryptors
+        working-directory: .
+        run: e2e/.venv/bin/python -m unittest discover -s e2e -p 'test_*.py'
+      - name: Install custom example dependencies
+        working-directory: .
+        run: npm ci --prefix custom-encryption-example/example-app
+      - name: Build custom AES-GCM WASM encryptor
+        working-directory: custom-encryption-example/custom-encryptor-rust
+        run: |
+          cargo build --locked --features wasm --target wasm32-unknown-unknown --release
+          wasm-bindgen --out-dir target/wasm --target no-modules \
+            target/wasm32-unknown-unknown/release/custom_encryptor.wasm
+          node scripts/embed-wasm.js
+
       - name: Build example web app
         working-directory: example
         run: npx webpack --config webpack.config.js --mode production
@@ -77,9 +90,17 @@ jobs:
       - name: Maestro upload, pause/resume and download tests
         working-directory: .
         run: bash e2e/run.sh web
+      - name: Build custom E2E web app
+        working-directory: custom-encryption-example/example-app
+        run: E2E=1 npx webpack --config webpack.config.js --mode production
+      - name: Maestro custom encryption upload and download tests
+        working-directory: .
+        run: bash e2e/run.sh web custom
       - name: Upload E2E evidence
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: maestro-web
-          path: e2e/artifacts/web
+          path: |
+            e2e/artifacts/web
+            e2e/artifacts/custom/web

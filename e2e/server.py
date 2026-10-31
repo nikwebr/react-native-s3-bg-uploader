@@ -46,7 +46,9 @@ class Upload:
 
 class Backend:
     def __init__(self, artifacts, endpoint="http://127.0.0.1:8765",
-                 storage_endpoint="http://127.0.0.1:9000"):
+                 storage_endpoint="http://127.0.0.1:9000", scheme="xchacha"):
+        require(scheme in ("xchacha", "aesgcm"), "Unknown verification scheme")
+        self.scheme = scheme
         self.artifacts = Path(artifacts)
         self.artifacts.mkdir(parents=True, exist_ok=True)
         (self.artifacts / "fixture.bin").write_bytes(FIXTURE)
@@ -132,6 +134,20 @@ class Backend:
             raise ValueError(f"Unknown control endpoint {path}")
         return {}
 
+    def decrypt_command(self, key, input_path, output_path):
+        if self.scheme == "aesgcm":
+            return [
+                str(ROOT / "custom-encryption-example/tools/decrypt/target/release/decrypt-verify"),
+                "--scheme", "aesgcm", "--key", key, "--nonce", NONCE,
+                "--part-size", str(PART_SIZE - 28),
+                "--out", str(output_path), str(input_path),
+            ]
+        return [
+            sys.executable, str(ROOT / "scripts/decrypt.py"),
+            "--nonce", NONCE, "--max-parts", "10", "--key", key,
+            str(input_path), str(output_path),
+        ]
+
     def verify(self, mode):
         upload = self.upload(mode)
         require(upload.completed, "Cannot download an incomplete object")
@@ -141,14 +157,10 @@ class Backend:
             downloaded = stream.read()
         input_path = self.artifacts / f"{mode}.download"
         input_path.write_bytes(downloaded)
-        command = [
-            sys.executable, str(ROOT / "scripts/decrypt.py"),
-            "--nonce", NONCE, "--max-parts", "10",
-        ]
         if mode == "plain":
             require(downloaded == FIXTURE, "Unencrypted download differs from original bytes")
-            result = subprocess.run(command + ["--key", KEY, str(input_path),
-                                    str(self.artifacts / "plain.decrypted")], capture_output=True)
+            result = subprocess.run(self.decrypt_command(
+                KEY, input_path, self.artifacts / "plain.decrypted"), capture_output=True)
             require(result.returncode != 0, "Plaintext unexpectedly authenticated as encrypted")
         else:
             require(downloaded != FIXTURE, "Encrypted upload is plaintext")
@@ -158,13 +170,15 @@ class Backend:
             require(len(downloaded) == len(FIXTURE) + part_count * 16 + 28,
                     "Wrong ciphertext wire size")
             output_path = self.artifacts / "encrypted.decrypted"
-            result = subprocess.run(command + ["--key", KEY, str(input_path), str(output_path)],
+            result = subprocess.run(self.decrypt_command(KEY, input_path, output_path),
                                     capture_output=True, text=True)
+            (self.artifacts / "correct-key.log").write_text(result.stdout + result.stderr)
             require(result.returncode == 0, f"Correct-key decryption failed: {result.stderr}")
             require(output_path.read_bytes() == FIXTURE, "Decrypted bytes differ from original")
             wrong_output = self.artifacts / "wrong-key.decrypted"
-            result = subprocess.run(command + ["--key", "00" * 32,
-                                    str(input_path), str(wrong_output)], capture_output=True)
+            result = subprocess.run(self.decrypt_command("00" * 32, input_path, wrong_output),
+                                    capture_output=True, text=True)
+            (self.artifacts / "wrong-key.log").write_text(result.stdout + result.stderr)
             require(result.returncode != 0 and not wrong_output.exists(),
                     "Wrong key was accepted")
         upload.verified = True
@@ -172,6 +186,7 @@ class Backend:
 
     def report(self, final=False):
         report = {mode: {
+            "scheme": self.scheme if mode == "encrypted" else "plain",
             "paused": upload.paused, "resumed": upload.resumed,
             "completed": upload.completed, "verified": upload.verified,
             "partUrlRequests": dict(upload.requested),
@@ -186,6 +201,8 @@ class Backend:
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         print(fmt % args, flush=True)
 
@@ -197,6 +214,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Expose-Headers", "ETag")
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
+        self.close_connection = True
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -265,11 +284,12 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifacts", default="e2e/artifacts")
+    parser.add_argument("--scheme", choices=("xchacha", "aesgcm"), default="xchacha")
     args = parser.parse_args()
     moto = ThreadedMotoServer(ip_address="127.0.0.1", port=9000, verbose=False)
     moto.start()
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
-    server.backend = Backend(args.artifacts)
+    server.backend = Backend(args.artifacts, scheme=args.scheme)
     try:
         server.serve_forever()
     finally:

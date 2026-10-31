@@ -97,9 +97,34 @@ jobs:
           xcrun simctl bootstatus "$device" -b
       - name: Maestro upload, pause/resume and download tests
         run: bash e2e/run.sh ios
+      - name: Install custom example dependencies
+        run: npm ci --prefix custom-encryption-example/example-app
+      - name: Build custom encryptor and independent verifier
+        run: |
+          bash custom-encryption-example/build-rust-lib.sh
+          cargo build --release --locked --manifest-path custom-encryption-example/tools/decrypt/Cargo.toml
+      - name: Install custom example Pods
+        working-directory: example
+        run: bundle exec pod install --project-directory=../custom-encryption-example/example-app/ios
+      - name: Build custom example simulator app
+        working-directory: custom-encryption-example/example-app/ios
+        run: |
+          set -o pipefail && xcodebuild \
+            CC=clang CPLUSPLUS=clang++ LD=clang LDPLUSPLUS=clang++ \
+            -derivedDataPath build -UseModernBuildSystem=YES \
+            -workspace CustomEncryptionExample.xcworkspace \
+            -scheme CustomEncryptionExample \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 17' \
+            build CODE_SIGNING_ALLOWED=NO | xcpretty
+      - name: Maestro custom encryption upload and download tests
+        run: bash e2e/run.sh ios custom
       - name: Upload E2E evidence
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: maestro-ios
-          path: e2e/artifacts/ios
+          path: |
+            e2e/artifacts/ios
+            e2e/artifacts/custom/ios

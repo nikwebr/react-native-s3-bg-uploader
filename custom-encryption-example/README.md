@@ -347,6 +347,54 @@ cargo run --release -- /tmp/cfv/adapter-object.bin --expect /tmp/cfv/adapter-pla
 5. **Complete**: the parts are committed; the object is self-describing (key + nonce suffice
    to decode).
 
+## End-to-end tests
+
+The repository's iOS, Android, and web build workflows also run this example with
+Maestro. A test-only entry reuses the main example's upload screen and flows, but
+keeps this app's native registration and registers its real AES-256-GCM WASM
+factory on web. The normal demo entry and backend are unchanged.
+
+Each platform uploads both an unencrypted and a custom-encrypted 31 MiB fixture.
+Both uploads pause after a completed part, remain stable while paused, and resume
+the same multipart upload without re-uploading the completed first part. The local
+S3-compatible backend downloads the stored objects over HTTP. Plaintext must
+match the original bytes; ciphertext must decrypt byte-for-byte with the right
+key and reject the wrong key.
+
+Custom ciphertext is checked by `tools/decrypt` with **`--scheme aesgcm`**, never
+auto-detection: falling back to the built-in XChaCha encryptor fails the test.
+The verifier contract suite also explicitly tests that rejection.
+
+Follow the root README's E2E tool setup, then build the uploader, custom encryptor,
+and this example for your platform using the commands above. Build the independent
+verifier once from the repository root:
+
+```bash
+cargo build --release --locked --manifest-path custom-encryption-example/tools/decrypt/Cargo.toml
+```
+
+For web, build the test-only entry after building both WASM modules:
+
+```bash
+(cd custom-encryption-example/example-app && E2E=1 npx webpack --config webpack.config.js --mode production)
+bash e2e/run.sh web custom
+```
+
+For native, build the **Debug** app (use `-derivedDataPath build` for Xcode), boot
+your test device, then run from the repository root:
+
+```bash
+bash e2e/run.sh android custom
+bash e2e/run.sh ios custom
+```
+
+`E2E_DEVICE` selects a serial/UDID; `E2E_APP` overrides the APK/`.app` path.
+The runner resets only the dedicated Android example app's data. It uses ports
+8080, 8765, and 9000, and does not replace a development Metro server on 8081.
+iOS simulator coverage is foreground-only, not a physical-device background-task
+test. Screenshots, downloaded/decrypted files, JUnit, and correct/wrong-key logs
+are retained in `e2e/artifacts/custom/<platform>/` and uploaded by the workflows.
+
 ## Troubleshooting
 
 ### Android: a problem occurred starting process `node`

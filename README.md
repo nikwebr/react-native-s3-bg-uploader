@@ -306,11 +306,19 @@ server on 8080 (an iOS launch argument and Android ADB reverse with an explicit
 app-local debug host), leaving any development server on the host's port 8081
 untouched.
 
+The same workflows also test `custom-encryption-example` with both plaintext and
+custom AES-256-GCM uploads. Add `custom` as the runner's second argument
+(`bash e2e/run.sh web custom`, `android custom`, or `ios custom`).
+Its independent verifier requires AES-GCM explicitly, so a built-in-encryptor
+fallback cannot pass. See the [custom example's E2E setup](custom-encryption-example/README.md#end-to-end-tests)
+for its additional encryptor/app builds and separate artifacts.
+
 Screenshots, JUnit results, backend logs, downloaded files, and decryption
 evidence are retained in `e2e/artifacts/<platform>/` and uploaded as pipeline
-artifacts even on failure. Run the oracle's positive and negative contract
-tests separately with:
+artifacts even on failure. Build the independent Rust verifier, then run the
+oracle's positive and negative contract tests for both encryption schemes:
 
 ```bash
+cargo build --release --locked --manifest-path custom-encryption-example/tools/decrypt/Cargo.toml
 e2e/.venv/bin/python -m unittest discover -s e2e -p 'test_*.py'
 ```
