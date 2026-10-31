@@ -366,8 +366,9 @@ auto-detection: falling back to the built-in XChaCha encryptor fails the test.
 The verifier contract suite also explicitly tests that rejection.
 
 Follow the root README's E2E tool setup, then build the uploader, custom encryptor,
-and this example for your platform using the commands above. Build the independent
-verifier once from the repository root:
+and this example for your platform using the commands above. The custom encryptor's
+`Cargo.lock` is versioned so CI's `--locked` native and WASM builds use reproducible
+dependency versions. Build the independent verifier once from the repository root:
 
 ```bash
 cargo build --release --locked --manifest-path custom-encryption-example/tools/decrypt/Cargo.toml
