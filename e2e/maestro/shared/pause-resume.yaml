@@ -14,3 +14,4 @@ appId: ${APP_ID}
     visible: Upload completed
     timeout: 120000
 - assertNotVisible: "E2E error:.*"
+- assertVisible: Completion within 20 seconds verified

@@ -159,6 +159,8 @@ impl InputStream {
                 ControlFlow::Continue(Ok(0)) => {
                     ivars.eof.store(true, Ordering::SeqCst);
                     if pos == 0 {
+                        // The delegate can query streamStatus as soon as the EOF event runs.
+                        drop(stream_buffer);
                         self.notify_stream_state(NSStreamEvent::EndEncountered);
                         return Ok(());
                     }
@@ -296,6 +298,12 @@ impl InputStream {
                     cursor.get_mut().set_len(STREAM_BUFFER_SIZE);
                 }
                 cursor.set_position(cursor.position() - read_len as u64);
+                // EOF can be detected before the final buffered bytes are consumed.
+                let at_end = cursor.position() == 0 && ivars.eof.load(Ordering::SeqCst);
+                drop(stream_buffer);
+                if at_end {
+                    self.notify_stream_state(NSStreamEvent::EndEncountered);
+                }
                 read_len as NSInteger
             }
             Err(_) => -1,
@@ -313,3 +321,125 @@ impl InputStream {
 // Safety: ivars are protected by ArcSwapAny Retained and Mutex
 unsafe impl Send for InputStream {}
 unsafe impl Sync for InputStream {}
+
+#[cfg(all(test, feature = "blocking"))]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
+
+    use objc2_core_foundation::{
+        kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext,
+    };
+    use objc2_foundation::{NSDefaultRunLoopMode, NSObject, NSStream};
+
+    use crate::blocking::waker::BlockingWaker;
+
+    define_class!(
+        #[unsafe(super = NSObject)]
+        #[name = "Nyquest_TestEndDelegate"]
+        #[ivars = mpsc::Sender<NSStreamStatus>]
+        struct EndDelegate;
+
+        unsafe impl NSObjectProtocol for EndDelegate {}
+
+        unsafe impl NSStreamDelegate for EndDelegate {
+            #[unsafe(method(stream:handleEvent:))]
+            fn handle_event(&self, stream: &NSStream, event: NSStreamEvent) {
+                if event == NSStreamEvent::EndEncountered {
+                    self.ivars().send(stream.streamStatus()).unwrap();
+                }
+            }
+        }
+    );
+
+    impl EndDelegate {
+        fn new(sender: mpsc::Sender<NSStreamStatus>) -> Retained<Self> {
+            let this = Self::alloc().set_ivars(sender);
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    unsafe extern "C-unwind" fn idle_source(_: *mut c_void) {}
+
+    #[test]
+    fn eof_events_expose_end_status_on_active_run_loop() {
+        let (stream_tx, stream_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = running.clone();
+        let worker = thread::spawn(move || {
+            let run_loop = NSRunLoop::currentRunLoop();
+            let cf_loop = run_loop.getCFRunLoop();
+            let mut context = CFRunLoopSourceContext {
+                version: 0,
+                info: null_mut(),
+                retain: None,
+                release: None,
+                copyDescription: None,
+                equal: None,
+                hash: None,
+                schedule: None,
+                cancel: None,
+                perform: Some(idle_source),
+            };
+            // Keep the loop alive while polling its queued stream events.
+            let source = unsafe { CFRunLoopSource::new(None, 0, &mut context) }.unwrap();
+            let mode = unsafe { kCFRunLoopDefaultMode };
+            cf_loop.add_source(Some(&source), mode);
+            let delegate = EndDelegate::new(event_tx);
+            let stream = InputStream::new(GenericWaker::Blocking(Arc::new(
+                BlockingWaker::new_from_current_thread(),
+            )));
+            stream.callback_setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            stream.callback_scheduleInRunLoop_forMode(&run_loop, unsafe { NSDefaultRunLoopMode });
+            stream.callback_open();
+            stream_tx.send(stream).unwrap();
+            while worker_running.load(Ordering::SeqCst) {
+                CFRunLoop::run_in_mode(mode, 0.0, false);
+            }
+            cf_loop.remove_source(Some(&source), mode);
+        });
+        let stream = stream_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let run_loop = stream.ivars().run_loop.load_full().unwrap();
+        let cf_loop = run_loop.getCFRunLoop();
+        let mut event = Ok(NSStreamStatus::AtEnd);
+        for _ in 0..1024 {
+            stream.ivars().eof.store(false, Ordering::SeqCst);
+            stream
+                .update_buffer(|_| ControlFlow::Continue(Ok(0)))
+                .unwrap();
+            event = event_rx.recv_timeout(Duration::from_secs(2));
+            if event != Ok(NSStreamStatus::AtEnd) {
+                break;
+            }
+        }
+        let mut tail = [0; 3];
+        let mut tail_read = 0;
+        let mut buffered_event = Ok(NSStreamStatus::AtEnd);
+        if event == Ok(NSStreamStatus::AtEnd) {
+            stream.ivars().eof.store(false, Ordering::SeqCst);
+            stream
+                .update_buffer(|buffer| {
+                    buffer[..3].copy_from_slice(b"end");
+                    ControlFlow::Continue(Ok(3))
+                })
+                .unwrap();
+            stream
+                .update_buffer(|_| ControlFlow::Continue(Ok(0)))
+                .unwrap();
+            tail_read = stream.callback_read_maxLength(NonNull::from(&mut tail[0]), tail.len());
+            buffered_event = event_rx.recv_timeout(Duration::from_secs(2));
+        }
+        running.store(false, Ordering::SeqCst);
+        cf_loop.stop();
+        cf_loop.wake_up();
+        worker.join().unwrap();
+        assert_eq!(event.unwrap(), NSStreamStatus::AtEnd);
+        assert_eq!(tail_read, 3);
+        assert_eq!(&tail, b"end");
+        assert_eq!(buffered_event.unwrap(), NSStreamStatus::AtEnd);
+    }
+}

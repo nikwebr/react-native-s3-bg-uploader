@@ -11,6 +11,9 @@
   ],
   "compilerOptions": {
     "strict": true,
+    "paths": {
+      "react-native-s3-bg-uploader": ["../../src"]
+    },
     "lib": [
       "es2019",
       "es2020.bigint",

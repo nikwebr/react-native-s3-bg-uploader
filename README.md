@@ -265,6 +265,10 @@ first chunk, and downloads both
 objects. The independent Python oracle checks exact plaintext bytes, ciphertext
 size and absence of plaintext, correct-key decryption back to the original
 bytes, and rejection of a wrong key.
+Both upload modes must report `COMPLETED` within **20 seconds of the first
+100% progress callback**. The shared test uses a monotonic clock and a watchdog;
+later progress drops do not reset the deadline. The elapsed time is saved as
+`completedAfter100PercentMs` in the verification artifacts.
 
 Tests use a local Moto S3-compatible HTTP server and synthetic 31 MiB fixtures;
 no AWS credentials, external demo bucket, or Maestro Cloud subscription are
@@ -305,12 +309,40 @@ The native tests route React Native's default Metro port to the isolated test
 server on 8080 (an iOS launch argument and Android ADB reverse with an explicit
 app-local debug host), leaving any development server on the host's port 8081
 untouched.
+The iOS workflow allows up to ten minutes for Maestro's XCTest driver to start
+on a cold hosted simulator (`MAESTRO_DRIVER_STARTUP_TIMEOUT=600000`, in
+milliseconds). This does not increase flow or upload assertion timeouts.
+Before launching either iOS example, the runner requests its test bundle from
+Metro with a separate ten-minute preparation limit. This keeps cold JavaScript
+bundling outside the screen-readiness wait; failures stop the run explicitly.
+Preparation timing is retained in `metro-warmup.log`.
+The iOS workflow also runs a native regression that pauses or replaces an upload
+while its old network worker is blocked. The upload queue must return promptly
+and allow a resumed run to finish without waiting for that old request.
+It also checks that native end-of-stream events expose `AtEnd` to their delegate,
+not the `Open` fallback produced when the stream buffer is still locked, and
+that EOF is delivered after the last buffered bytes are consumed.
+The test screen also reads current progress after obtaining the upload key, so a
+fast first-part callback emitted before the start call resolves is not lost.
+The pause check waits for progress to stop changing instead of sleeping a fixed
+time, because parts already in flight may finish after a pause and a slow runner
+would otherwise report those permitted completions as progress made while
+paused. Set `E2E_RELEASE_STAGGER_MS=1000` to make the backend answer those
+in-flight parts seconds apart and reproduce that timing locally.
+
+The same workflows also test `custom-encryption-example` with both plaintext and
+custom AES-256-GCM uploads. Add `custom` as the runner's second argument
+(`bash e2e/run.sh web custom`, `android custom`, or `ios custom`).
+Its independent verifier requires AES-GCM explicitly, so a built-in-encryptor
+fallback cannot pass. See the [custom example's E2E setup](custom-encryption-example/README.md#end-to-end-tests)
+for its additional encryptor/app builds and separate artifacts.
 
 Screenshots, JUnit results, backend logs, downloaded files, and decryption
 evidence are retained in `e2e/artifacts/<platform>/` and uploaded as pipeline
-artifacts even on failure. Run the oracle's positive and negative contract
-tests separately with:
+artifacts even on failure. Build the independent Rust verifier, then run the
+oracle's positive and negative contract tests for both encryption schemes:
 
 ```bash
+cargo build --release --locked --manifest-path custom-encryption-example/tools/decrypt/Cargo.toml
 e2e/.venv/bin/python -m unittest discover -s e2e -p 'test_*.py'
 ```

@@ -1,3 +1,4 @@
 boto3==1.40.61
 moto[server]==5.1.16
 PyNaCl==1.6.0
+cryptography==50.0.2

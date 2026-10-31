@@ -6,10 +6,12 @@ from dataclasses import dataclass, field
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from urllib.parse import parse_qs, urlsplit
 
 import boto3
@@ -31,6 +33,12 @@ def require(condition, message):
         raise AssertionError(message)
 
 
+# Stress hook: reply to the gated parts with a stagger so their completions land
+# seconds apart, as they do on a slow runner. Zero (the default) replies at once.
+# Run with E2E_RELEASE_STAGGER_MS=1000 to reproduce the pause-settling race.
+RELEASE_STAGGER_MS = int(os.environ.get("E2E_RELEASE_STAGGER_MS", "0"))
+
+
 @dataclass
 class Upload:
     key: str
@@ -42,11 +50,14 @@ class Upload:
     resumed: bool = False
     completed: bool = False
     verified: bool = False
+    completed_after_ms: float | None = None
 
 
 class Backend:
     def __init__(self, artifacts, endpoint="http://127.0.0.1:8765",
-                 storage_endpoint="http://127.0.0.1:9000"):
+                 storage_endpoint="http://127.0.0.1:9000", scheme="xchacha"):
+        require(scheme in ("xchacha", "aesgcm"), "Unknown verification scheme")
+        self.scheme = scheme
         self.artifacts = Path(artifacts)
         self.artifacts.mkdir(parents=True, exist_ok=True)
         (self.artifacts / "fixture.bin").write_bytes(FIXTURE)
@@ -128,9 +139,29 @@ class Backend:
             upload.resumed = True
         elif path == "/verify":
             self.verify(body["mode"])
+        elif path == "/completion-timing":
+            elapsed = body.get("completedAfterMs")
+            require(upload.completed, "Timing evidence requires a completed upload")
+            require(type(elapsed) in (int, float) and 0 <= elapsed <= 20000,
+                    "Missing or invalid completion timing: must be within 20 seconds of 100%")
+            upload.completed_after_ms = elapsed
         else:
             raise ValueError(f"Unknown control endpoint {path}")
         return {}
+
+    def decrypt_command(self, key, input_path, output_path):
+        if self.scheme == "aesgcm":
+            return [
+                str(ROOT / "custom-encryption-example/tools/decrypt/target/release/decrypt-verify"),
+                "--scheme", "aesgcm", "--key", key, "--nonce", NONCE,
+                "--part-size", str(PART_SIZE - 28),
+                "--out", str(output_path), str(input_path),
+            ]
+        return [
+            sys.executable, str(ROOT / "scripts/decrypt.py"),
+            "--nonce", NONCE, "--max-parts", "10", "--key", key,
+            str(input_path), str(output_path),
+        ]
 
     def verify(self, mode):
         upload = self.upload(mode)
@@ -141,14 +172,10 @@ class Backend:
             downloaded = stream.read()
         input_path = self.artifacts / f"{mode}.download"
         input_path.write_bytes(downloaded)
-        command = [
-            sys.executable, str(ROOT / "scripts/decrypt.py"),
-            "--nonce", NONCE, "--max-parts", "10",
-        ]
         if mode == "plain":
             require(downloaded == FIXTURE, "Unencrypted download differs from original bytes")
-            result = subprocess.run(command + ["--key", KEY, str(input_path),
-                                    str(self.artifacts / "plain.decrypted")], capture_output=True)
+            result = subprocess.run(self.decrypt_command(
+                KEY, input_path, self.artifacts / "plain.decrypted"), capture_output=True)
             require(result.returncode != 0, "Plaintext unexpectedly authenticated as encrypted")
         else:
             require(downloaded != FIXTURE, "Encrypted upload is plaintext")
@@ -158,13 +185,15 @@ class Backend:
             require(len(downloaded) == len(FIXTURE) + part_count * 16 + 28,
                     "Wrong ciphertext wire size")
             output_path = self.artifacts / "encrypted.decrypted"
-            result = subprocess.run(command + ["--key", KEY, str(input_path), str(output_path)],
+            result = subprocess.run(self.decrypt_command(KEY, input_path, output_path),
                                     capture_output=True, text=True)
+            (self.artifacts / "correct-key.log").write_text(result.stdout + result.stderr)
             require(result.returncode == 0, f"Correct-key decryption failed: {result.stderr}")
             require(output_path.read_bytes() == FIXTURE, "Decrypted bytes differ from original")
             wrong_output = self.artifacts / "wrong-key.decrypted"
-            result = subprocess.run(command + ["--key", "00" * 32,
-                                    str(input_path), str(wrong_output)], capture_output=True)
+            result = subprocess.run(self.decrypt_command("00" * 32, input_path, wrong_output),
+                                    capture_output=True, text=True)
+            (self.artifacts / "wrong-key.log").write_text(result.stdout + result.stderr)
             require(result.returncode != 0 and not wrong_output.exists(),
                     "Wrong key was accepted")
         upload.verified = True
@@ -172,8 +201,10 @@ class Backend:
 
     def report(self, final=False):
         report = {mode: {
+            "scheme": self.scheme if mode == "encrypted" else "plain",
             "paused": upload.paused, "resumed": upload.resumed,
             "completed": upload.completed, "verified": upload.verified,
+            "completedAfter100PercentMs": upload.completed_after_ms,
             "partUrlRequests": dict(upload.requested),
             "partPutRequests": dict(upload.put_requests),
         } for mode, upload in self.uploads.items()}
@@ -182,10 +213,14 @@ class Backend:
             require(set(report) == {"plain", "encrypted"}, "Both upload modes must run")
             require(all(u["verified"] and u["paused"] and u["resumed"] and u["completed"]
                         for u in report.values()), "Missing upload/download/pause/resume evidence")
+            require(all(u["completedAfter100PercentMs"] is not None for u in report.values()),
+                    "Missing 100%-to-completion timing evidence")
         return report
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         print(fmt % args, flush=True)
 
@@ -197,6 +232,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Expose-Headers", "ETag")
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
+        self.close_connection = True
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -245,9 +282,12 @@ class Handler(BaseHTTPRequestHandler):
             upload.put_requests.update([part])
         data = self.rfile.read(int(self.headers["Content-Length"]))
         # Part one completes normally; all other PUTs wait until the app pauses.
-        if part != 1 and not upload.released.wait(timeout=120):
-            self.reply(504, b'{"error":"Timed out waiting for pause"}')
-            return
+        if part != 1:
+            if not upload.released.wait(timeout=120):
+                self.reply(504, b'{"error":"Timed out waiting for pause"}')
+                return
+            if RELEASE_STAGGER_MS:
+                time.sleep(RELEASE_STAGGER_MS * (part - 2) / 1000)
         storage = self.server.backend.storage
         connection = http.client.HTTPConnection(storage.hostname, storage.port, timeout=30)
         try:
@@ -265,11 +305,12 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifacts", default="e2e/artifacts")
+    parser.add_argument("--scheme", choices=("xchacha", "aesgcm"), default="xchacha")
     args = parser.parse_args()
     moto = ThreadedMotoServer(ip_address="127.0.0.1", port=9000, verbose=False)
     moto.start()
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
-    server.backend = Backend(args.artifacts)
+    server.backend = Backend(args.artifacts, scheme=args.scheme)
     try:
         server.serve_forever()
     finally:

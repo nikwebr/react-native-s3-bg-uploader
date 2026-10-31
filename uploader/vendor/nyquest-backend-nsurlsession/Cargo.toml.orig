@@ -31,6 +31,7 @@ objc2 = { version = "0.6", default-features = false }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "alloc",
     "block2",
+    "objc2-core-foundation",
     "NSError",
     "NSObject",
     "NSCharacterSet",
@@ -54,6 +55,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
     "CFString",
+    "CFRunLoop",
 ] }
 objc2-security = { version = "0.3", default-features = false, features = [
     "objc2",
