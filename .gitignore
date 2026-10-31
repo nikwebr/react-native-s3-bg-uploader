@@ -96,3 +96,10 @@ example/ios/S3BgUploaderExample.xcworkspace/contents.xcworkspacedata
 
 # Misc
 ios/rust/
+
+# Local E2E dependencies, generated builds, and evidence
+e2e/.venv/
+e2e/.tools/
+e2e/artifacts/
+e2e/__pycache__/
+example/web-build/

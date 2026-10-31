@@ -15,6 +15,7 @@ jobs:
   build:
     name: Build WASM lib + Web App
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: uploader
@@ -26,6 +27,23 @@ jobs:
       - name: Install dependencies (bun)
         working-directory: .
         run: bun install
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      - name: Install E2E tools
+        working-directory: .
+        run: |
+          python -m venv e2e/.venv
+          e2e/.venv/bin/pip install -r e2e/requirements.txt
+          bash e2e/install-maestro.sh
+      - name: Test download/decryption oracle
+        working-directory: .
+        run: e2e/.venv/bin/python -m unittest discover -s e2e -p 'test_*.py'
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -52,3 +70,16 @@ jobs:
       - name: Build example web app
         working-directory: example
         run: npx webpack --config webpack.config.js --mode production
+
+      - name: Build E2E web app
+        working-directory: example
+        run: E2E=1 npx webpack --config webpack.config.js --mode production
+      - name: Maestro upload, pause/resume and download tests
+        working-directory: .
+        run: bash e2e/run.sh web
+      - name: Upload E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: maestro-web
+          path: e2e/artifacts/web

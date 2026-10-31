@@ -1,0 +1,12 @@
+appId: com.s3bguploaderexample
+---
+- launchApp:
+    permissions:
+      all: allow
+- extendedWaitUntil:
+    visible: Uploader E2E
+    timeout: 120000
+- tapOn: Fixture path
+- inputText: ${FIXTURE_PATH}
+- hideKeyboard
+- runFlow: shared/uploads.yaml

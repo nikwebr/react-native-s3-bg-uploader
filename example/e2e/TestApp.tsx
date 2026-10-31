@@ -1,0 +1,167 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { Button, Platform, ScrollView, StyleSheet, Text, TextInput } from 'react-native';
+import { S3BgUploader } from 'react-native-s3-bg-uploader';
+import type { UploadProgress } from '../../src/specs/s3-bg-uploader.types';
+
+// Public, deterministic test material only. Never used by the normal example.
+const KEY = '0123456789abcdef'.repeat(4);
+const NONCE = '0123456789abcdef'.repeat(3);
+const BACKEND = 'http://127.0.0.1:8765';
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+async function api(path: string, body: unknown): Promise<void> {
+  const response = await fetch(`${BACKEND}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`${path}: ${response.status} ${await response.text()}`);
+  }
+}
+
+export default function TestApp(): React.JSX.Element {
+  const [fixturePath, setFixturePath] = useState('');
+  const [status, setStatus] = useState('Ready');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<UploadProgress>();
+  const current = useRef<{ hash: string; mode: string } | undefined>(undefined);
+
+  useEffect(() => {
+    S3BgUploader.setConfig(`${BACKEND}/start`, `${BACKEND}/urls`, `${BACKEND}/complete`);
+    S3BgUploader.setProgressCallback(file => {
+      setProgress({ ...file });
+      if (file.state === 'FAILED') setError(`Upload failed: ${file.fileName}`);
+    });
+    return () => S3BgUploader.setProgressCallback(null);
+  }, []);
+
+  const run = async (operation: () => Promise<void>) => {
+    setBusy(true);
+    setError('');
+    try {
+      await operation();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const prepare = async (mode: 'plain' | 'encrypted') => {
+    S3BgUploader.cancel();
+    // A query also fences the worker's asynchronous cancel() on web.
+    await S3BgUploader.getProgress();
+    setProgress(undefined);
+    setStatus('Preparing fixture');
+    let file: File | string = fixturePath;
+    if (Platform.OS === 'web') {
+      const response = await fetch(`${BACKEND}/fixture`);
+      if (!response.ok) throw new Error(`Fixture download: HTTP ${response.status}`);
+      file = new File([await response.blob()], 'fixture.bin');
+    } else if (!fixturePath) {
+      throw new Error('Enter the fixture path provided by the E2E runner');
+    }
+    const hash = mode === 'encrypted'
+      ? await S3BgUploader.encryptAndUploadFile(file, mode, KEY, NONCE, { mode })
+      : await S3BgUploader.uploadFile(file, mode, { mode });
+    current.current = { hash, mode };
+    setStatus(`${mode} queued`);
+    await S3BgUploader.resume();
+    setStatus('Upload started');
+  };
+
+  const snapshot = async (): Promise<UploadProgress> => {
+    if (!current.current) throw new Error('No active test upload');
+    const files = await S3BgUploader.getProgress(current.current.mode, current.current.hash);
+    const file = files[0];
+    if (!file) throw new Error('Upload disappeared from the session');
+    return file;
+  };
+
+  const pause = async () => {
+    S3BgUploader.pause();
+    const deadline = Date.now() + 10000;
+    while ((await S3BgUploader.getAggregateProgress()).state !== 'PAUSED') {
+      if (Date.now() > deadline) throw new Error('Uploader did not enter PAUSED');
+      await sleep(100);
+    }
+    const initial = await snapshot();
+    if (initial.completedParts < 1 || initial.completedParts >= initial.totalParts) {
+      throw new Error('Pause must occur after a completed part and before completion');
+    }
+    // Open the server gate while still paused: a no-op pause cannot pass this check.
+    await api('/release', { mode: current.current?.mode });
+    await sleep(2000);
+    // Already-sent parts may finish; pause must stop scheduling the remaining parts.
+    const before = await snapshot();
+    if (before.completedParts >= before.totalParts) {
+      throw new Error('All parts uploaded while paused');
+    }
+    await sleep(2000);
+    const after = await snapshot();
+    if (after.completedParts !== before.completedParts ||
+        after.uploadedBytes !== before.uploadedBytes ||
+        (await S3BgUploader.getAggregateProgress()).state !== 'PAUSED') {
+      throw new Error('Upload advanced while paused');
+    }
+    await api('/paused', { mode: current.current?.mode, before, after });
+    setStatus('Pause verified');
+  };
+
+  const resume = async () => {
+    await api('/resumed', { mode: current.current?.mode });
+    await S3BgUploader.resume();
+    setStatus('Resume requested');
+  };
+
+  const verify = async () => {
+    // The uploader evicts finished sessions; retain the real completion event.
+    if (progress?.state !== 'COMPLETED' || progress.fileHash !== current.current?.hash) {
+      throw new Error('Upload is not complete');
+    }
+    await api('/verify', { mode: current.current?.mode });
+    setStatus(current.current?.mode === 'encrypted'
+      ? 'Encrypted download verified; correct key decrypts; wrong key rejected'
+      : 'Unencrypted download verified; bytes match fixture');
+  };
+
+  return (
+    <ScrollView
+      contentContainerStyle={styles.screen}
+      keyboardShouldPersistTaps="handled"
+      keyboardDismissMode="on-drag"
+    >
+      <Text style={styles.title}>Uploader E2E</Text>
+      {Platform.OS !== 'web' && (
+        <TextInput
+          accessibilityLabel="Fixture path"
+          placeholder="Fixture path"
+          value={fixturePath}
+          onChangeText={setFixturePath}
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={styles.input}
+        />
+      )}
+      <Button title="Upload unencrypted fixture" disabled={busy} onPress={() => run(() => prepare('plain'))} />
+      <Button title="Upload encrypted fixture" disabled={busy} onPress={() => run(() => prepare('encrypted'))} />
+      <Button title="Pause upload" disabled={busy} onPress={() => run(pause)} />
+      <Button title="Resume upload" disabled={busy} onPress={() => run(resume)} />
+      <Button title="Verify download" disabled={busy} onPress={() => run(verify)} />
+      <Text>{status}</Text>
+      <Text>{progress?.state === 'COMPLETED'
+        ? 'Upload completed'
+        : `Completed parts: ${progress?.completedParts ?? 0}`}</Text>
+      {busy && <Text>Working</Text>}
+      {!!error && <Text accessibilityRole="alert">E2E error: {error}</Text>}
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  screen: { padding: 24, paddingTop: 64, gap: 16 },
+  title: { fontSize: 24 },
+  input: { borderWidth: 1, padding: 8 },
+});

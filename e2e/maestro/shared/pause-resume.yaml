@@ -1,0 +1,16 @@
+appId: ${APP_ID}
+---
+- extendedWaitUntil:
+    visible: "Completed parts: 1"
+    timeout: 60000
+- tapOn: Pause upload
+- extendedWaitUntil:
+    visible: Pause verified
+    timeout: 20000
+- assertNotVisible: Upload completed
+- assertNotVisible: "E2E error:.*"
+- tapOn: Resume upload
+- extendedWaitUntil:
+    visible: Upload completed
+    timeout: 120000
+- assertNotVisible: "E2E error:.*"

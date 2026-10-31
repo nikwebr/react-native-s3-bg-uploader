@@ -18,6 +18,7 @@ jobs:
   build:
     name: Build iOS Example App
     runs-on: macOS-26
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
@@ -28,6 +29,19 @@ jobs:
 
       - name: Install dependencies (bun)
         run: bun install
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      - name: Install E2E tools
+        run: |
+          python -m venv e2e/.venv
+          e2e/.venv/bin/pip install -r e2e/requirements.txt
+          bash e2e/install-maestro.sh
 
       - name: Setup Ruby (bundle)
         uses: ruby/setup-ruby@v1
@@ -68,3 +82,24 @@ jobs:
             -destination 'platform=iOS Simulator,name=iPhone 17' \
             build \
             CODE_SIGNING_ALLOWED=NO | xcpretty
+
+      - name: Boot test simulator
+        run: |
+          device_info=$(xcrun simctl list devices available --json | python -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          device = next(d for group in devices.values() for d in group if d["name"] == "iPhone 17")
+          print(device["udid"], device["state"])
+          ')
+          read -r device state <<< "$device_info"
+          echo "E2E_DEVICE=$device" >> "$GITHUB_ENV"
+          if [[ "$state" != Booted ]]; then xcrun simctl boot "$device"; fi
+          xcrun simctl bootstatus "$device" -b
+      - name: Maestro upload, pause/resume and download tests
+        run: bash e2e/run.sh ios
+      - name: Upload E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: maestro-ios
+          path: e2e/artifacts/ios

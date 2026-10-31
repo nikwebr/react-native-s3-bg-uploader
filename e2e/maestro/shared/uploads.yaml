@@ -1,0 +1,18 @@
+appId: ${APP_ID}
+---
+- tapOn: Upload unencrypted fixture
+- runFlow: pause-resume.yaml
+- tapOn: Verify download
+- extendedWaitUntil:
+    visible: "Unencrypted download verified; bytes match fixture"
+    timeout: 30000
+- assertNotVisible: "E2E error:.*"
+- takeScreenshot: plain-verified
+- tapOn: Upload encrypted fixture
+- runFlow: pause-resume.yaml
+- tapOn: Verify download
+- extendedWaitUntil:
+    visible: "Encrypted download verified; correct key decrypts; wrong key rejected"
+    timeout: 30000
+- assertNotVisible: "E2E error:.*"
+- takeScreenshot: encrypted-verified

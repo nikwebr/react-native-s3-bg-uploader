@@ -253,3 +253,64 @@ Bootstrapped with [create-nitro-module](https://github.com/patrickkabwe/create-n
 ## Contributing
 
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
+
+### End-to-end tests
+
+The iOS, Android, and web build workflows run **Maestro 2.12.0** on every pull
+request and manual workflow run. Each platform uploads a plaintext fixture and
+an XChaCha20-Poly1305-encrypted fixture, pauses after a completed multipart
+chunk, lets already-sent parts settle, checks that progress stays unchanged
+while paused, resumes the same multipart upload without re-requesting the
+first chunk, and downloads both
+objects. The independent Python oracle checks exact plaintext bytes, ciphertext
+size and absence of plaintext, correct-key decryption back to the original
+bytes, and rejection of a wrong key.
+
+Tests use a local Moto S3-compatible HTTP server and synthetic 31 MiB fixtures;
+no AWS credentials, external demo bucket, or Maestro Cloud subscription are
+needed. Encryption and uploading run through the real native/Rust or WASM
+implementation, not a mocked uploader. The server releases its blocked PUTs
+**while the uploader is paused**, so the gate cannot hide a broken pause.
+Downloads and decryption are verified on the host through the S3 HTTP API and
+`scripts/decrypt.py`; the package does not provide a download/decrypt API.
+The iOS simulator covers foreground uploads, not device-only background tasks.
+
+Install Node dependencies and the test tools (Python 3.10+ and Java 17+):
+
+```bash
+npm install
+python3 -m venv e2e/.venv
+e2e/.venv/bin/pip install -r e2e/requirements.txt
+bash e2e/install-maestro.sh
+```
+
+For web:
+
+```bash
+npm run build:wasm
+cd example && E2E=1 npx webpack --mode production && cd ..
+bash e2e/run.sh web
+```
+
+For Android, build the normal debug example after `npm run build:android`, boot
+an emulator, then run `bash e2e/run.sh android`. For iOS, build the Debug simulator
+example after `npm run build:ios` and installing Pods, boot that simulator, then
+run `bash e2e/run.sh ios`. Set `E2E_DEVICE` to a simulator UDID or Android serial
+to select a specific device, and `E2E_APP` to use a non-default `.app`/APK path.
+The runner installs the example app, copies the fixture into its sandbox, starts
+Metro with the test-only entry (`E2E=1`), and cleans up its servers on exit.
+Android runs clear **only the example app's data**; use a dedicated test emulator.
+Ports 8080, 8765, and 9000 must be free.
+The native tests route React Native's default Metro port to the isolated test
+server on 8080 (an iOS launch argument and Android ADB reverse with an explicit
+app-local debug host), leaving any development server on the host's port 8081
+untouched.
+
+Screenshots, JUnit results, backend logs, downloaded files, and decryption
+evidence are retained in `e2e/artifacts/<platform>/` and uploaded as pipeline
+artifacts even on failure. Run the oracle's positive and negative contract
+tests separately with:
+
+```bash
+e2e/.venv/bin/python -m unittest discover -s e2e -p 'test_*.py'
+```

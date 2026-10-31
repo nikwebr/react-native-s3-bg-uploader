@@ -9,7 +9,7 @@ const webEntry = fs.existsSync(localWebEntry)
   : path.resolve(path.dirname(require.resolve('react-native-s3-bg-uploader/package.json')), 'src/index.web.ts');
 
 module.exports = {
-  entry: './index.web.js',
+  entry: process.env.E2E === '1' ? './e2e/index.web.js' : './index.web.js',
   output: {
     path: path.resolve(__dirname, 'web-build'),
     filename: 'bundle.js',

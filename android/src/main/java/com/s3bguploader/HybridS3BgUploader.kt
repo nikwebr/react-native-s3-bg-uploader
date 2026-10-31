@@ -43,6 +43,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         getUploadUrlsApi: String,
         completeApi: String,
     ): Unit {
+        appContext()?.let { StoragePathInit.ensureInit(it) }
         nativeSetConfig(startUploadApi, getUploadUrlsApi, completeApi)
     }
 
