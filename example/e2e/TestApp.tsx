@@ -1,7 +1,8 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Platform, ScrollView, StyleSheet, Text, TextInput } from 'react-native';
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
 import type { UploadProgress } from '../../src/specs/s3-bg-uploader.types';
+import { CompletionTiming, COMPLETION_TIMEOUT_MS } from './completionTiming';
 
 // Public, deterministic test material only. Never used by the normal example.
 const KEY = '0123456789abcdef'.repeat(4);
@@ -20,22 +21,51 @@ async function api(path: string, body: unknown): Promise<void> {
   }
 }
 
-export default function TestApp(): React.JSX.Element {
+export default function TestApp({ initializeEncryptor }: {
+  initializeEncryptor?: () => Promise<void>;
+}): React.JSX.Element {
   const [fixturePath, setFixturePath] = useState('');
   const [status, setStatus] = useState('Ready');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<UploadProgress>();
+  const [completionAfterMs, setCompletionAfterMs] = useState<number>();
   const current = useRef<{ hash: string; mode: string } | undefined>(undefined);
+  const completionTiming = useRef(new CompletionTiming());
+  const completionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  const onProgress = useCallback((file: UploadProgress) => {
+    if (file.fileHash !== current.current?.hash || file.transferId !== current.current?.mode) return;
+    setProgress({ ...file });
+    if (file.state === 'FAILED') setError(`Upload failed: ${file.fileName}`);
+    const timing = completionTiming.current;
+    try {
+      timing.observe(file, performance.now());
+      if (timing.completedAfterMs !== undefined) {
+        clearTimeout(completionTimer.current);
+        setCompletionAfterMs(timing.assertComplete());
+      } else if (timing.reached100At !== undefined && completionTimer.current === undefined) {
+        completionTimer.current = setTimeout(() => {
+          try {
+            timing.assertComplete();
+          } catch (e: unknown) {
+            setError(e instanceof Error ? e.message : String(e));
+          }
+        }, Math.max(0, COMPLETION_TIMEOUT_MS - (performance.now() - timing.reached100At)) + 1);
+      }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
 
   useEffect(() => {
     S3BgUploader.setConfig(`${BACKEND}/start`, `${BACKEND}/urls`, `${BACKEND}/complete`);
-    S3BgUploader.setProgressCallback(file => {
-      setProgress({ ...file });
-      if (file.state === 'FAILED') setError(`Upload failed: ${file.fileName}`);
-    });
-    return () => S3BgUploader.setProgressCallback(null);
-  }, []);
+    S3BgUploader.setProgressCallback(onProgress);
+    return () => {
+      clearTimeout(completionTimer.current);
+      S3BgUploader.setProgressCallback(null);
+    };
+  }, [onProgress]);
 
   const run = async (operation: () => Promise<void>) => {
     setBusy(true);
@@ -50,6 +80,12 @@ export default function TestApp(): React.JSX.Element {
   };
 
   const prepare = async (mode: 'plain' | 'encrypted') => {
+    clearTimeout(completionTimer.current);
+    completionTimer.current = undefined;
+    completionTiming.current = new CompletionTiming();
+    current.current = undefined;
+    setCompletionAfterMs(undefined);
+    await initializeEncryptor?.();
     S3BgUploader.cancel();
     // A query also fences the worker's asynchronous cancel() on web.
     await S3BgUploader.getProgress();
@@ -69,6 +105,10 @@ export default function TestApp(): React.JSX.Element {
     current.current = { hash, mode };
     setStatus(`${mode} queued`);
     await S3BgUploader.resume();
+    // Native uploads can emit progress before uploadFile resolves with their key.
+    for (const fileProgress of await S3BgUploader.getProgress(mode, hash)) {
+      onProgress(fileProgress);
+    }
     setStatus('Upload started');
   };
 
@@ -121,6 +161,10 @@ export default function TestApp(): React.JSX.Element {
     if (progress?.state !== 'COMPLETED' || progress.fileHash !== current.current?.hash) {
       throw new Error('Upload is not complete');
     }
+    await api('/completion-timing', {
+      mode: current.current?.mode,
+      completedAfterMs: completionTiming.current.assertComplete(),
+    });
     await api('/verify', { mode: current.current?.mode });
     setStatus(current.current?.mode === 'encrypted'
       ? 'Encrypted download verified; correct key decrypts; wrong key rejected'
@@ -154,6 +198,9 @@ export default function TestApp(): React.JSX.Element {
       <Text>{progress?.state === 'COMPLETED'
         ? 'Upload completed'
         : `Completed parts: ${progress?.completedParts ?? 0}`}</Text>
+      {completionAfterMs !== undefined && (
+        <Text>Completion within 20 seconds verified</Text>
+      )}
       {busy && <Text>Working</Text>}
       {!!error && <Text accessibilityRole="alert">E2E error: {error}</Text>}
     </ScrollView>

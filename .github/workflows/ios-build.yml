@@ -19,6 +19,9 @@ jobs:
     name: Build iOS Example App
     runs-on: macOS-26
     timeout-minutes: 60
+    env:
+      # Cold hosted simulators can take several minutes to start XCTest.
+      MAESTRO_DRIVER_STARTUP_TIMEOUT: '600000'
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
@@ -64,6 +67,10 @@ jobs:
 
       - name: Build
         run: npm run build:ios
+      - name: Test native upload race regressions
+        run: |
+          cargo test --locked --manifest-path uploader/Cargo.toml native::upload_engine::tests
+          cargo test --locked --manifest-path uploader/Cargo.toml -p nyquest-backend-nsurlsession --lib stream::ns_stream::tests
       - name: Install Pods
         working-directory: example/ios
         run: npm run pod
@@ -97,9 +104,41 @@ jobs:
           xcrun simctl bootstatus "$device" -b
       - name: Maestro upload, pause/resume and download tests
         run: bash e2e/run.sh ios
+      - name: Install custom example dependencies
+        run: npm ci --prefix custom-encryption-example/example-app
+      - name: Build custom encryptor and independent verifier
+        run: |
+          bash custom-encryption-example/build-rust-lib.sh
+          cargo build --release --locked --manifest-path custom-encryption-example/tools/decrypt/Cargo.toml
+      - name: Install custom example Pods
+        # React Native's autolinking CLI resolves the project from the process
+        # working directory, not from CocoaPods' --project-directory. Installing
+        # from example/ therefore resolved reactNativePath against the wrong
+        # node_modules. Run from the app's own iOS directory and point Bundler
+        # at the shared Gemfile instead.
+        working-directory: custom-encryption-example/example-app/ios
+        env:
+          BUNDLE_GEMFILE: ${{ github.workspace }}/example/Gemfile
+        run: bundle exec pod install
+      - name: Build custom example simulator app
+        working-directory: custom-encryption-example/example-app/ios
+        run: |
+          set -o pipefail && xcodebuild \
+            CC=clang CPLUSPLUS=clang++ LD=clang LDPLUSPLUS=clang++ \
+            -derivedDataPath build -UseModernBuildSystem=YES \
+            -workspace CustomEncryptionExample.xcworkspace \
+            -scheme CustomEncryptionExample \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 17' \
+            build CODE_SIGNING_ALLOWED=NO | xcpretty
+      - name: Maestro custom encryption upload and download tests
+        run: bash e2e/run.sh ios custom
       - name: Upload E2E evidence
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: maestro-ios
-          path: e2e/artifacts/ios
+          path: |
+            e2e/artifacts/ios
+            e2e/artifacts/custom/ios

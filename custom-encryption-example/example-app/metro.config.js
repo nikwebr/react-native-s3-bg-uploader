@@ -19,6 +19,22 @@ const config = {
     // Follow symlinks so the linked local package resolves correctly
     unstable_enableSymlinks: true,
     nodeModulesPaths: [path.resolve(__dirname, 'node_modules')],
+    ...(process.env.E2E === '1' ? {
+      disableHierarchicalLookup: true,
+      blockList: [
+        /[/\\]e2e[/\\](?:\.venv|\.tools|artifacts)[/\\]/,
+        /[/\\](?:uploader|custom-encryptor-rust|tools[/\\]decrypt)[/\\]target[/\\]/,
+        /[/\\](?:(?:example|example-app)[/\\](?:ios|android)|android)[/\\](?:build|Pods|\.cxx|\.gradle)[/\\]/,
+        /[/\\](?:example|example-app)[/\\]web-build[/\\]/,
+      ],
+      resolveRequest(context, moduleName, platform) {
+        if (moduleName === './App' &&
+            context.originModulePath === path.join(__dirname, 'index.js')) {
+          return { type: 'sourceFile', filePath: path.join(__dirname, 'e2e/TestApp.tsx') };
+        }
+        return context.resolveRequest(context, moduleName, platform);
+      },
+    } : {}),
   },
 };
 

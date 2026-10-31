@@ -12,7 +12,12 @@ const config = {
   watchFolders: [root],
   ...(process.env.E2E === '1' ? {
     resolver: {
-      blockList: [/[/\\]e2e[/\\](?:\.venv|\.tools|artifacts)[/\\]/],
+      blockList: [
+        /[/\\]e2e[/\\](?:\.venv|\.tools|artifacts)[/\\]/,
+        /[/\\](?:uploader|custom-encryptor-rust|tools[/\\]decrypt)[/\\]target[/\\]/,
+        /[/\\](?:(?:example|example-app)[/\\](?:ios|android)|android)[/\\](?:build|Pods|\.cxx|\.gradle)[/\\]/,
+        /[/\\](?:example|example-app)[/\\]web-build[/\\]/,
+      ],
       resolveRequest(context, moduleName, platform) {
         if (moduleName === './App' &&
             context.originModulePath === path.join(__dirname, 'index.js')) {

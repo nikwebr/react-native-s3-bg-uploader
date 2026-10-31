@@ -15,14 +15,19 @@ const webEntry = fs.existsSync(localWebEntry)
     );
 
 module.exports = {
-  entry: './index.web.js',
+  entry: process.env.E2E === '1' ? './e2e/index.web.js' : './index.web.js',
   output: {
     path: path.resolve(__dirname, 'web-build'),
     filename: 'bundle.js',
   },
   resolve: {
     alias: {
-      'react-native$': 'react-native-web',
+      'react-native$': process.env.E2E === '1'
+        ? path.dirname(require.resolve('react-native-web/package.json'))
+        : 'react-native-web',
+      ...(process.env.E2E === '1' ? {
+        'react$': path.dirname(require.resolve('react/package.json')),
+      } : {}),
       'react-native-s3-bg-uploader': webEntry,
       '@react-native-documents/picker': path.resolve(
         __dirname,

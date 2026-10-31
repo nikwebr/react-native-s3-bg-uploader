@@ -80,6 +80,20 @@ jobs:
         working-directory: example/android
         run: ./gradlew --stop
 
+      - name: Install custom example dependencies
+        run: npm ci --prefix custom-encryption-example/example-app
+      - name: Build independent custom encryption verifier
+        run: cargo build --release --locked --manifest-path custom-encryption-example/tools/decrypt/Cargo.toml
+      - name: Build custom AES-GCM native encryptor
+        working-directory: custom-encryption-example/custom-encryptor-rust
+        run: |
+          cargo ndk --platform 24 \
+            -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 \
+            -o ../example-app/android/app/src/main/jniLibs build --release --locked
+      - name: Build custom example debug APK
+        working-directory: custom-encryption-example/example-app/android
+        run: ./gradlew assembleDebug --no-daemon --build-cache
+
       - name: Enable emulator KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -93,10 +107,14 @@ jobs:
           target: google_apis
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          script: bash e2e/run.sh android
+          script: |
+            bash e2e/run.sh android
+            bash e2e/run.sh android custom
       - name: Upload E2E evidence
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: maestro-android
-          path: e2e/artifacts/android
+          path: |
+            e2e/artifacts/android
+            e2e/artifacts/custom/android

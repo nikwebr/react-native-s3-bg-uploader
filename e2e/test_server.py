@@ -11,17 +11,22 @@ from urllib.request import Request, urlopen
 
 from moto.server import ThreadedMotoServer
 from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_encrypt
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from server import Backend, BUCKET, FIXTURE, Handler, KEY, NONCE, PART_SIZE
 
 
-def encrypted_fixture():
+def encrypted_fixture(scheme="xchacha"):
     effective_size = PART_SIZE - 16 - 28
     parts = [FIXTURE[start:start + effective_size]
              for start in range(0, len(FIXTURE), effective_size)]
 
     def encrypt(data, number):
         nonce = bytearray.fromhex(NONCE)
+        if scheme == "aesgcm":
+            for index, value in enumerate(struct.pack("<I", number)):
+                nonce[index] ^= value
+            return AESGCM(bytes.fromhex(KEY)).encrypt(bytes(nonce[:12]), data, None)
         for index, value in enumerate(struct.pack("<I", number)):
             nonce[20 + index] ^= value
         return crypto_aead_xchacha20poly1305_ietf_encrypt(
@@ -34,6 +39,8 @@ def encrypted_fixture():
 
 
 class BackendTests(unittest.TestCase):
+    scheme = "xchacha"
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.moto = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
@@ -44,6 +51,7 @@ class BackendTests(unittest.TestCase):
             self.directory.name,
             endpoint=f"http://127.0.0.1:{self.server.server_port}",
             storage_endpoint=f"http://{host}:{port}",
+            scheme=self.scheme,
         )
         self.server.backend = self.backend
         self.thread = threading.Thread(target=self.server.serve_forever)
@@ -76,9 +84,28 @@ class BackendTests(unittest.TestCase):
         chunks = [FIXTURE[start:start + PART_SIZE] for start in range(0, len(FIXTURE), PART_SIZE)]
         self.upload("plain", chunks)
         self.backend.verify("plain")
-        self.upload("encrypted", encrypted_fixture())
+        self.upload("encrypted", encrypted_fixture(self.scheme))
         self.backend.verify("encrypted")
+        with self.assertRaisesRegex(AssertionError, "Missing 100%-to-completion"):
+            self.backend.report(final=True)
+        for mode in ("plain", "encrypted"):
+            self.backend.control("/completion-timing", {"mode": mode, "completedAfterMs": 20000})
         self.backend.report(final=True)
+
+    def test_completion_timing_rejects_missing_late_and_invalid_evidence(self):
+        self.backend.start({"mode": "plain"})
+        upload = self.backend.upload("plain")
+        with self.assertRaisesRegex(AssertionError, "requires a completed upload"):
+            self.backend.control("/completion-timing", {"mode": "plain", "completedAfterMs": 0})
+        upload.completed = True
+        for elapsed in (None, -1, 20001, float("nan"), float("inf"), True, "100"):
+            with self.subTest(elapsed=elapsed):
+                with self.assertRaisesRegex(AssertionError, "within 20 seconds"):
+                    self.backend.control("/completion-timing", {
+                        "mode": "plain", "completedAfterMs": elapsed,
+                    })
+        self.backend.control("/completion-timing", {"mode": "plain", "completedAfterMs": 20000})
+        self.assertEqual(self.backend.report()["plain"]["completedAfter100PercentMs"], 20000)
 
     def test_gate_blocks_parts_until_pause(self):
         started = self.backend.start({"mode": "plain"})
@@ -95,6 +122,14 @@ class BackendTests(unittest.TestCase):
             self.backend.control("/release", {"mode": "plain"})
             self.assertEqual(waiting.result(timeout=5), 200)
 
+    def test_fixture_responses_are_complete_and_framed(self):
+        for _ in range(2):
+            with urlopen(f"http://127.0.0.1:{self.server.server_port}/fixture") as response:
+                self.assertEqual(response.version, 11)
+                self.assertEqual(int(response.headers["Content-Length"]), len(FIXTURE))
+                self.assertEqual(response.headers["Connection"], "close")
+                self.assertEqual(response.read(), FIXTURE)
+
     def test_plaintext_cannot_pass_as_encrypted(self):
         self.backend.start({"mode": "encrypted"})
         upload = self.backend.upload("encrypted")
@@ -104,7 +139,7 @@ class BackendTests(unittest.TestCase):
             self.backend.verify("encrypted")
 
     def test_corrupted_ciphertext_fails_correct_key_check(self):
-        self.upload("encrypted", encrypted_fixture())
+        self.upload("encrypted", encrypted_fixture(self.scheme))
         upload = self.backend.upload("encrypted")
         with self.backend.s3.get_object(Bucket=BUCKET, Key=upload.key)["Body"] as stream:
             data = bytearray(stream.read())
@@ -131,6 +166,20 @@ class BackendTests(unittest.TestCase):
             self.backend.control("/paused", {"mode": "plain", "before": before, "after": after})
         with self.assertRaisesRegex(AssertionError, "second multipart"):
             self.backend.start({"mode": "plain"})
+
+
+class CustomBackendTests(BackendTests):
+    scheme = "aesgcm"
+
+    def test_builtin_ciphertext_cannot_pass_as_custom(self):
+        self.backend.start({"mode": "encrypted"})
+        upload = self.backend.upload("encrypted")
+        upload.completed = True
+        self.backend.s3.put_object(
+            Bucket=BUCKET, Key=upload.key, Body=b"".join(encrypted_fixture("xchacha")),
+        )
+        with self.assertRaisesRegex(AssertionError, "Correct-key decryption failed"):
+            self.backend.verify("encrypted")
 
 
 if __name__ == "__main__":
