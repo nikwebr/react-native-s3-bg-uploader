@@ -47,6 +47,17 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
     }
 
     // -------------------------------------------------------------------------
+    // Custom encryptor registration
+    // -------------------------------------------------------------------------
+
+    /// Register a host-provided custom encryptor factory.
+    /// The host provides only the vtable: key material arrives per upload.
+    override fun registerCustomEncryptor(vtablePointer: Double): Unit {
+        nativeRegisterCustomEncryptor(vtablePointer.toLong())
+    }
+
+
+    // -------------------------------------------------------------------------
     // Progress callback
     // -------------------------------------------------------------------------
 
@@ -101,6 +112,46 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             val fileHash = rawResult
 
             // If already running, trigger start_api eagerly; otherwise defer until resume().
+            val globalState = nativeGetGlobalState()
+            if (globalState == "RUNNING" || globalState == "RUNNING_IN_BG") {
+                launchInitApi(fileHash, transferId, filePath)
+            } else {
+                synchronized(pendingFiles) {
+                    pendingFiles.add(PendingFile(fileHash, transferId, filePath))
+                }
+            }
+
+            fileHash
+        }
+    }
+
+    override fun encryptAndUploadFile(
+        filePath: String,
+        transferId: String,
+        encryptionKey: String,
+        encryptionNonce: String,
+        userParams: Map<String, String>?,
+    ): Promise<String> {
+        return Promise.async(hashScope) {
+            val context = appContext() ?: throw IllegalStateException("No application context")
+            StoragePathInit.ensureInit(context)
+
+            val paramsJson = if (!userParams.isNullOrEmpty()) {
+                JSONObject(userParams as Map<*, *>).toString()
+            } else {
+                "{}"
+            }
+
+            val pfd = UploadForegroundService.openAsPfdStatic(context, filePath)
+                ?: throw IllegalArgumentException("Cannot open file: $filePath")
+            val fd = pfd.detachFd()
+            val fileName = resolveFileName(context, filePath)
+
+            val rawResult = nativeHashAndPreRegisterEncrypted(fd, fileName, transferId, encryptionKey, encryptionNonce, paramsJson)
+            if (rawResult.isEmpty()) throw RuntimeException("hash_and_pre_register_encrypted failed for $filePath")
+            if (rawResult.startsWith("ERROR:")) throw RuntimeException(rawResult.removePrefix("ERROR:"))
+            val fileHash = rawResult
+
             val globalState = nativeGetGlobalState()
             if (globalState == "RUNNING" || globalState == "RUNNING_IN_BG") {
                 launchInitApi(fileHash, transferId, filePath)
@@ -228,7 +279,42 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
 
     companion object {
         init {
+            // Nitro loads its own glue (libS3BgUploader.so), but every JNI entry point
+            // used below lives in the Rust library. Load it explicitly: nothing else
+            // does, and without it every native call throws UnsatisfiedLinkError.
             System.loadLibrary("uploader")
+        }
+
+        // JNI entry point from libcustom_encryptor.so
+        private external fun nativeGetVtablePointer(): Long
+
+        /**
+         * Register the custom encryptor. Called from MainApplication.onCreate()
+         * after libS3BgUploader.so is loaded, so libuploader.so symbols are available.
+         */
+        @JvmStatic
+        fun registerCustomEncryptorIfAvailable() {
+            try {
+                System.loadLibrary("custom_encryptor")
+                val vtablePtr = nativeGetVtablePointer()
+                if (vtablePtr != 0L) {
+                    val registered = nativeRegisterCustomEncryptor(vtablePtr)
+                    if (registered == 1) {
+                        android.util.Log.i(
+                            "S3BgUploader",
+                            "custom encryptor factory registered — per-upload keys will be used"
+                        )
+                    } else {
+                        android.util.Log.e("S3BgUploader", "custom encryptor registration was rejected")
+                    }
+                } else {
+                    android.util.Log.e("S3BgUploader", "nativeGetVtablePointer returned 0")
+                }
+            } catch (e: UnsatisfiedLinkError) {
+                android.util.Log.e("S3BgUploader", "libcustom_encryptor.so not found", e)
+            } catch (e: Exception) {
+                android.util.Log.e("S3BgUploader", "Failed to register custom encryptor", e)
+            }
         }
 
         @Volatile var progressCallback: ((UploadProgress, AggregateProgress, AggregateProgress) -> Unit)? = null
@@ -285,6 +371,16 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             userParamsJson: String,
         ): String
 
+        /** Phase 1 (encrypted): hash fd, pre-register with encryption config. Returns file hash. Takes ownership of fd. */
+        @JvmStatic external fun nativeHashAndPreRegisterEncrypted(
+            fd: Int,
+            fileName: String,
+            transferId: String,
+            keyHex: String,
+            nonceHex: String,
+            userParamsJson: String,
+        ): String
+
         /** Phase 2: call start_api and enqueue the file. Returns file key. Takes ownership of fd. */
         @JvmStatic external fun nativeInitializeFile(
             fd: Int,
@@ -321,6 +417,9 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         @JvmStatic external fun nativeGetFormattedTitle(): String
         @JvmStatic external fun nativeGetFormattedSubtitle(): String
         @JvmStatic external fun nativeInitProgressCallback()
+
+        /** Register a host-provided custom encryptor factory (vtable pointer only). */
+        @JvmStatic external fun nativeRegisterCustomEncryptor(vtablePointer: Long): Int
     }
 }
 

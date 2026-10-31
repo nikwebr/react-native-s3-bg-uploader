@@ -1,0 +1,21 @@
+[package]
+name = "custom-encryptor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "custom_encryptor"
+crate-type = ["staticlib", "rlib", "cdylib"]
+
+[dependencies]
+# NOTE: deliberately no dependency on the `uploader` crate.
+# The uploader's `register_custom_encryptor` FFI symbol is declared `extern "C"`
+# in src/lib.rs and resolved at link time from libuploader.framework, so this
+# crate does not link (or embed) a second copy of the uploader.
+aes-gcm = "0.10"
+getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+[features]
+wasm = ["wasm-bindgen", "js-sys"]

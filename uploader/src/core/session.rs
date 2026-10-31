@@ -1,7 +1,9 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+use crate::core::encryption::ArcEncryptor;
 
 // ---------------------------------------------------------------------------
 // State enums
@@ -83,9 +85,29 @@ pub struct FileEntry {
     pub run_version: u64,
     /// Extra params forwarded to startUploadApi.
     pub user_params: HashMap<String, String>,
+    /// True when this file was enqueued via encryptAndUploadFile().
+    /// Persisted so callers know to re-provide the key+nonce on resume.
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Active encryptor — not persisted, re-provided by the caller on each run.
+    #[serde(skip)]
+    pub encryption_config: Option<ArcEncryptor>,
 }
 
 impl FileEntry {
+    pub fn require_encryption_config(
+        &self,
+        encryption_config: Option<&ArcEncryptor>,
+    ) -> Result<(), String> {
+        if self.encrypted && encryption_config.is_none() {
+            return Err(
+                "File was started with encryption; re-provide key+nonce via encryptAndUploadFile()"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn new(
         file_key: String,
         file_hash: String,
@@ -111,6 +133,8 @@ impl FileEntry {
             completed_chunk_etags: Vec::new(),
             run_version: 0,
             user_params,
+            encrypted: false,
+            encryption_config: None,
         }
     }
 
@@ -232,6 +256,8 @@ pub struct PendingFileEntry {
     pub file_name: String,
     pub file_size: u64,
     pub user_params: HashMap<String, String>,
+    /// Encryptor to apply per chunk — not persisted.
+    pub encryption_config: Option<ArcEncryptor>,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +382,15 @@ impl Session {
         }
     }
 
+    /// Re-attach an encryptor to an existing entry after an app restart.
+    /// Called when the user re-invokes encryptAndUploadFile() for a resumable file.
+    pub fn update_encryption_config(&mut self, file_key: &str, config: ArcEncryptor) {
+        if let Some(entry) = self.files.get_mut(file_key) {
+            entry.encrypted = true;
+            entry.encryption_config = Some(config);
+        }
+    }
+
     /// Phase 1 of the new upload flow: store hash + metadata; start_api not yet called.
     pub fn pre_register_file(
         &mut self,
@@ -365,7 +400,16 @@ impl Session {
         file_name: String,
         file_size: u64,
         user_params: HashMap<String, String>,
-    ) {
+        encryption_config: Option<ArcEncryptor>,
+    ) -> Result<(), String> {
+        if let Some(entry) = self.find_by_hash(&file_hash) {
+            entry.require_encryption_config(encryption_config.as_ref())?;
+            let file_key = entry.file_key.clone();
+            if let Some(config) = encryption_config.clone() {
+                // resume_all() may schedule this entry before deferred initialization.
+                self.update_encryption_config(&file_key, config);
+            }
+        }
         self.pending_files.insert(
             file_hash.clone(),
             PendingFileEntry {
@@ -375,10 +419,12 @@ impl Session {
                 file_name,
                 file_size,
                 user_params,
+                encryption_config,
             },
         );
         // File is being re-provided — no longer missing.
         self.files_needing_provision.remove(&file_hash);
+        Ok(())
     }
 
     /// Phase 2: start_api succeeded — move from pending_files into session.files.
@@ -407,7 +453,12 @@ impl Session {
         entry.upload_id = Some(upload_id);
         entry.part_size = Some(part_size);
         entry.total_parts = total_parts;
-        self.hash_to_key.insert(file_hash.to_string(), file_key.clone());
+        if let Some(config) = pending.encryption_config {
+            entry.encrypted = true;
+            entry.encryption_config = Some(config);
+        }
+        self.hash_to_key
+            .insert(file_hash.to_string(), file_key.clone());
         self.files.insert(file_key.clone(), entry);
         let transfer = self
             .transfers
@@ -731,10 +782,15 @@ impl Session {
             GlobalUploaderState::Running
         } else if entries.iter().any(|e| e.state == UploadState::Failed) {
             GlobalUploaderState::Failed
-        } else if entries
-            .iter()
-            .all(|e| matches!(e.state, UploadState::Paused | UploadState::Completed | UploadState::NotStarted | UploadState::Initialized))
-            && entries.iter().any(|e| e.state == UploadState::Paused)
+        } else if entries.iter().all(|e| {
+            matches!(
+                e.state,
+                UploadState::Paused
+                    | UploadState::Completed
+                    | UploadState::NotStarted
+                    | UploadState::Initialized
+            )
+        }) && entries.iter().any(|e| e.state == UploadState::Paused)
         {
             GlobalUploaderState::Paused
         } else {
@@ -851,7 +907,8 @@ pub fn register_store(store: impl SessionStore + 'static) {
 pub fn session() -> MutexGuard<'static, Session> {
     SESSION
         .get_or_init(|| {
-            let mut initial = STORE.get()
+            let mut initial = STORE
+                .get()
                 .and_then(|s| s.load())
                 .unwrap_or_else(Session::new);
             initial.recompute_needs_provision();
@@ -921,5 +978,113 @@ pub fn clear_session() {
 pub fn set_storage_path(path: &str) {
     if let Some(store) = STORE.get() {
         store.set_storage_path(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::encryption::XChaCha20Poly1305Encryptor;
+
+    fn encryptor() -> ArcEncryptor {
+        Arc::new(
+            XChaCha20Poly1305Encryptor::from_hex(&"ab".repeat(32), &"cd".repeat(24))
+                .unwrap(),
+        )
+    }
+
+    fn restored_encrypted_session() -> Session {
+        let mut sess = Session::new();
+        sess.register_file(
+            "key".into(),
+            "hash".into(),
+            "transfer".into(),
+            "file".into(),
+            "file".into(),
+            1024,
+            HashMap::new(),
+        );
+        sess.update_encryption_config("key", encryptor());
+        let entry = sess.files.get_mut("key").unwrap();
+        entry.state = UploadState::Paused;
+        entry.upload_id = Some("upload-id".into());
+        entry.completed_chunk_etags = vec![(1, "etag".into())];
+        let mut restored = Session::from_json(&sess.to_json().unwrap()).unwrap();
+        restored.recompute_needs_provision();
+        restored
+    }
+
+    #[test]
+    fn restored_encrypted_upload_requires_keys() {
+        let sess = restored_encrypted_session();
+        let entry = &sess.files["key"];
+        assert!(entry.encrypted);
+        assert!(entry.encryption_config.is_none());
+        assert!(entry
+            .require_encryption_config(None)
+            .unwrap_err()
+            .contains("encryptAndUploadFile"));
+        assert!(entry.require_encryption_config(Some(&encryptor())).is_ok());
+    }
+
+    #[test]
+    fn plaintext_reprovision_leaves_encrypted_session_unchanged() {
+        let mut sess = restored_encrypted_session();
+        let before = sess.to_json().unwrap();
+        assert!(sess
+            .pre_register_file(
+                "hash".into(),
+                "transfer".into(),
+                "new-path".into(),
+                "file".into(),
+                1024,
+                HashMap::new(),
+                None,
+            )
+            .is_err());
+        assert_eq!(sess.to_json().unwrap(), before);
+        assert!(sess.files_needing_provision.contains("hash"));
+        assert!(sess.pending_files.is_empty());
+    }
+
+    #[test]
+    fn encrypted_reprovision_restores_keys_before_background_resume() {
+        let mut sess = restored_encrypted_session();
+        sess.pre_register_file(
+            "hash".into(),
+            "transfer".into(),
+            "new-path".into(),
+            "file".into(),
+            1024,
+            HashMap::new(),
+            Some(encryptor()),
+        )
+        .unwrap();
+        let entry = &sess.files["key"];
+        assert!(entry
+            .require_encryption_config(entry.encryption_config.as_ref())
+            .is_ok());
+        assert_eq!(entry.upload_id.as_deref(), Some("upload-id"));
+        assert_eq!(entry.completed_chunk_etags, vec![(1, "etag".into())]);
+        assert!(!sess.files_needing_provision.contains("hash"));
+    }
+
+    #[test]
+    fn plaintext_upload_does_not_require_keys() {
+        let mut sess = Session::new();
+        sess.pre_register_file(
+            "hash".into(),
+            "transfer".into(),
+            "path".into(),
+            "file".into(),
+            1024,
+            HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert!(sess.initialize_file("hash", "key".into(), "upload".into(), 1024, 1));
+        let entry = &sess.files["key"];
+        assert!(!entry.encrypted);
+        assert!(entry.require_encryption_config(None).is_ok());
     }
 }

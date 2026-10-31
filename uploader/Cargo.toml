@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 ios = ["nyquest"]
-android = ["jni", "reqwest", "reqwest/blocking", "reqwest/rustls-tls-webpki-roots", "android_logger", "log", "libc"]
+android = ["jni", "reqwest", "reqwest/blocking", "reqwest/rustls-tls-webpki-roots", "android_logger", "libc"]
 wasm = ["wasm-bindgen", "wasm-bindgen-file-reader", "web-sys", "wasm-bindgen-futures", "js-sys", "futures", "console_error_panic_hook", "rexie"]
 
 [dependencies]
@@ -17,12 +17,20 @@ indexmap = { version = "2", features = ["serde"] }
 async-trait = "0.1"
 pollster = "0.4"
 
+# RustCrypto: chunk encryption
+chacha20poly1305 = "0.10"
+getrandom = { version = "0.2", features = ["js"] }
+
 # Native persistence (iOS / Android)
 redb = { version = "2", optional = false }
 
 # https://github.com/rustwasm/wasm-bindgen
 console_error_panic_hook = { version = "0.1", optional = true }
-wasm-bindgen = { version = "0.2", optional = true }
+# Pinned: the wasm-bindgen bindgen format is versioned, so the crate and the
+# wasm-bindgen CLI that post-processes the module must agree exactly.
+# `scripts/build.sh wasm` installs the CLI version locked here, so bump both
+# together (Cargo.lock is what the script reads).
+wasm-bindgen = { version = "=0.2.129", optional = true }
 
 # https://github.com/Badel2/wasm-bindgen-file-reader
 wasm-bindgen-file-reader = { version = "1.0.0", optional = true }
@@ -44,8 +52,8 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 jni = { version = "0.21", optional = true, default-features = false }
 libc = { version = "0.2", optional = true }
 
-# For Android logging
-log = { version = "0.4", optional = true }
+# Logging (android logcat uses it; the core logs through it on every platform)
+log = "0.4"
 android_logger = { version = "0.14", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }

@@ -1,0 +1,13 @@
+# The uploader's FFI symbols (register_custom_encryptor) are provided by
+# libuploader.framework at runtime, never linked in statically — that is what
+# keeps exactly one copy of the uploader in the process. iOS builds of the
+# cdylib therefore allow the symbol to stay unresolved at link time and bind it
+# at load time from the framework the app already links.
+[target.aarch64-apple-ios]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.aarch64-apple-ios-sim]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-ios]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

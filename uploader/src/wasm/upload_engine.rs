@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::future::LocalBoxFuture;
+use futures::future::{FutureExt, LocalBoxFuture};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::core::chunk::ChunkInfo;
 use crate::core::upload;
 use crate::core::{ChunkUploadResult, MAX_CONCURRENT_UPLOADS};
 
-pub trait AsyncPlatformAdapter: Send + Sync + 'static {
+pub trait AsyncPlatformAdapter: 'static {
     fn is_paused(&self) -> bool;
 
     fn fetch_urls(
@@ -18,6 +18,19 @@ pub trait AsyncPlatformAdapter: Send + Sync + 'static {
 
     fn read_chunk(&self, file: &web_sys::File, chunk: &ChunkInfo) -> Result<Vec<u8>, String>;
 
+    /// Async variant of `read_chunk`: custom encryptors written in JavaScript
+    /// (browser crypto is Promise-based) are driven from here.
+    /// The default implementation defers to the sync version.
+    fn read_chunk_async(
+        &self,
+        file: &web_sys::File,
+        chunk: &ChunkInfo,
+    ) -> LocalBoxFuture<'static, Result<Vec<u8>, String>> {
+        // Clone the data synchronously so we can return a 'static future.
+        let data = self.read_chunk(file, chunk);
+        async move { data }.boxed_local()
+    }
+
     fn upload_chunk(
         &self,
         url: String,
@@ -25,6 +38,45 @@ pub trait AsyncPlatformAdapter: Send + Sync + 'static {
         part_number: u32,
         file_key: String,
     ) -> LocalBoxFuture<'static, Result<String, String>>;
+}
+
+/// Read (and, when a JS encryptor is registered, encrypt) one part and put its
+/// upload in flight. Reading is async because a web custom encryptor may call
+/// `crypto.subtle`, which returns Promises.
+#[allow(clippy::too_many_arguments)]
+async fn push_chunk<A: AsyncPlatformAdapter>(
+    adapter: &Arc<A>,
+    file: &Arc<web_sys::File>,
+    file_key: &str,
+    part_size: u64,
+    file_size: u64,
+    parts_to_upload: &[u32],
+    idx: usize,
+    url_pool: &mut HashMap<u32, String>,
+    in_flight: &mut FuturesUnordered<LocalBoxFuture<'static, Result<ChunkUploadResult, String>>>,
+) -> Result<bool, String> {
+    let part_number = parts_to_upload[idx];
+    let Some(url) = url_pool.remove(&part_number) else {
+        return Ok(false);
+    };
+
+    let chunk_info = ChunkInfo {
+        part_number,
+        start_pos: (part_number as u64 - 1) * part_size,
+        chunk_size: upload::part_size_for(part_number, part_size, file_size),
+        url: url.clone(),
+    };
+    let chunk = adapter.read_chunk_async(file, &chunk_info).await?;
+    let file_key = file_key.to_string();
+    let adapter = adapter.clone();
+
+    in_flight.push(Box::pin(async move {
+        let etag = adapter
+            .upload_chunk(url, chunk, part_number, file_key)
+            .await?;
+        Ok(ChunkUploadResult { part_number, etag })
+    }));
+    Ok(true)
 }
 
 pub async fn run_async_upload<A>(
@@ -49,38 +101,19 @@ where
     let mut next_idx = 0;
     let parts_len = parts_to_upload.len();
 
-    let push_chunk = |idx: usize,
-                      url_pool: &mut HashMap<u32, String>,
-                      in_flight: &mut FuturesUnordered<
-        LocalBoxFuture<'static, Result<ChunkUploadResult, String>>,
-    >|
-     -> Result<bool, String> {
-        let part_number = parts_to_upload[idx];
-        let Some(url) = url_pool.remove(&part_number) else {
-            return Ok(false);
-        };
-
-        let chunk_info = ChunkInfo {
-            part_number,
-            start_pos: (part_number as u64 - 1) * part_size,
-            chunk_size: upload::part_size_for(part_number, part_size, file_size),
-            url: url.clone(),
-        };
-        let chunk = adapter.read_chunk(&file, &chunk_info)?;
-        let file_key = file_key.to_string();
-        let adapter = adapter.clone();
-
-        in_flight.push(Box::pin(async move {
-            let etag = adapter
-                .upload_chunk(url, chunk, part_number, file_key)
-                .await?;
-            Ok(ChunkUploadResult { part_number, etag })
-        }));
-        Ok(true)
-    };
-
     while next_idx < parts_len && in_flight.len() < MAX_CONCURRENT_UPLOADS {
-        let _ = push_chunk(next_idx, &mut url_pool, &mut in_flight)?;
+        let _ = push_chunk(
+            &adapter,
+            &file,
+            file_key,
+            part_size,
+            file_size,
+            &parts_to_upload,
+            next_idx,
+            &mut url_pool,
+            &mut in_flight,
+        )
+        .await?;
         next_idx += 1;
     }
 
@@ -114,7 +147,18 @@ where
                 }
             }
 
-            let _ = push_chunk(next_idx, &mut url_pool, &mut in_flight)?;
+            let _ = push_chunk(
+                &adapter,
+                &file,
+                file_key,
+                part_size,
+                file_size,
+                &parts_to_upload,
+                next_idx,
+                &mut url_pool,
+                &mut in_flight,
+            )
+            .await?;
             next_idx += 1;
         }
     }

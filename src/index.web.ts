@@ -3,10 +3,21 @@ import type {
   AggregateProgress,
   ProgressCallback,
   UploadProgress,
+  WebEncryptorOptions,
   WebS3BgUploaderAPI,
 } from './specs/s3-bg-uploader.types'
 import { S3BgUploaderResumeError, S3BgUploaderDuplicateFileError } from './specs/s3-bg-uploader.types'
 import { UPLOADER_JS_CODE, UPLOADER_WASM_BASE64 } from './web/wasm-assets'
+
+
+/** Progress + configuration types, so consumers need no deep import path. */
+export type {
+  AggregateProgress,
+  GlobalUploaderState,
+  ProgressCallback,
+  UploadProgress,
+  UploadState,
+} from './specs/s3-bg-uploader.types'
 
 // ---------------------------------------------------------------------------
 // Inline worker source
@@ -20,6 +31,21 @@ function buildWorkerSource(jsCode: string, wasmBase64: string): string {
   return `
 /* Inline wasm_bindgen JS bindings — no importScripts needed */
 ${jsCode}
+
+/* Forward worker logs to the page: a failure inside the worker would otherwise
+   be invisible (the page only sees request/response messages). */
+(function () {
+  var forward = function (level, orig) {
+    return function () {
+      try {
+        postMessage({ type: 'log', level: level, message: Array.prototype.map.call(arguments, String).join(' ') });
+      } catch (e) {}
+      orig.apply(console, arguments);
+    };
+  };
+  console.error = forward('error', console.error);
+  console.warn = forward('warn', console.warn);
+})();
 
 /* Initialize WASM from embedded base64 data */
 const _wasmBase64 = ${JSON.stringify(wasmBase64)};
@@ -76,6 +102,40 @@ onmessage = async function (e) {
         postMessage({ type: 'result', requestId, ok: true, value: fileKey });
       } catch (err) {
         postMessage({ type: 'result', requestId, ok: false, error: String(err) });
+      }
+      break;
+    }
+
+    case 'encryptAndUploadFile': {
+      try {
+        const fileKey = await wasm.upload_file_encrypted(payload.file, payload.transferId, payload.encryptionKey, payload.encryptionNonce, payload.userParams ?? null);
+        postMessage({ type: 'result', requestId, ok: true, value: fileKey });
+      } catch (err) {
+        postMessage({ type: 'result', requestId, ok: false, error: String(err) });
+      }
+      break;
+    }
+
+    case 'registerWebEncryptor': {
+      try {
+        /* The factory is evaluated here, in the worker: browser crypto
+           (crypto.subtle) is available and no app-state closure can leak in. */
+        const factory = new Function('return (' + payload.source + ')')();
+        if (typeof factory !== 'function') {
+          throw new Error('the source must evaluate to a (key, nonce) => impl function');
+        }
+        /* The factory is not called here: the uploader calls it once per upload
+           with that upload's key/nonce bytes, so different files may use
+           different keys — the same contract as the native vtable's create. */
+        wasm.wasm_register_js_encryptor(
+          payload.overhead,
+          !!payload.hasFooter,
+          payload.footerLen || 0,
+          factory,
+        );
+        postMessage({ type: 'ack', requestId });
+      } catch (err) {
+        postMessage({ type: 'result', requestId, ok: false, error: 'registerWebEncryptor: ' + String(err) });
       }
       break;
     }
@@ -143,6 +203,12 @@ onmessage = async function (e) {
 let worker: Worker | null = null
 let progressCallback: ProgressCallback | null = null
 
+/** Ring buffer of worker-side log lines, for debugging web uploads. */
+const workerLog: string[] = []
+if (typeof globalThis !== 'undefined') {
+  ;(globalThis as unknown as Record<string, unknown>).__s3bgWorkerLog = workerLog
+}
+
 // Map from requestId → { resolve, reject } for request/response pairing
 const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
 let nextId = 1
@@ -157,6 +223,16 @@ function getWorker(): Worker {
 
     worker.onmessage = (e) => {
       const { type, requestId, data, ok, value, error } = e.data
+
+      if (type === 'log') {
+        const line = `[uploader worker] ${e.data.message}`
+        workerLog.push(line)
+        if (workerLog.length > 50) workerLog.shift()
+        // eslint-disable-next-line no-console
+        if (e.data.level === 'warn') console.warn(line)
+        else console.error(line)
+        return
+      }
 
       if (type === 'progress') {
         if (progressCallback) {
@@ -226,12 +302,46 @@ export const S3BgUploader: WebS3BgUploaderAPI = {
     /* No-op on web — background notifications not supported */
   },
 
+  registerCustomEncryptor(_vtablePointer: number): void {
+    /* No-op on web — browser encryptors are JavaScript, see registerWebEncryptor() */
+  },
+
+  async registerWebEncryptor(options: WebEncryptorOptions): Promise<void> {
+    if (!options || typeof options.source !== 'string' || options.source.trim() === '') {
+      throw new TypeError(
+        'S3BgUploader: registerWebEncryptor requires { source } — the source text of a (key, nonce) => impl factory.',
+      )
+    }
+    if (typeof options.overhead !== 'number' || options.overhead < 0) {
+      throw new TypeError('S3BgUploader: registerWebEncryptor requires a numeric overhead.')
+    }
+    await sendRequest('registerWebEncryptor', {
+      source: options.source,
+      overhead: options.overhead,
+      hasFooter: !!options.hasFooter,
+      footerLen: options.footerLen ?? 0,
+    })
+  },
+
   async uploadFile(file: File, transferId: string, userParams?: Record<string, string>): Promise<string> {
     if (typeof file === 'string') {
       throw new TypeError('S3BgUploader: On web platform, uploadFile requires a File value, not a string path.')
     }
     try {
       return await sendRequest('uploadFile', { file, transferId, userParams: userParams ?? null }) as Promise<string>
+    } catch (e: unknown) {
+      const msg = (e as Error)?.message ?? String(e)
+      if (msg.includes('DUPLICATE_FILE')) throw new S3BgUploaderDuplicateFileError(msg)
+      throw e
+    }
+  },
+
+  async encryptAndUploadFile(file: File, transferId: string, encryptionKey: string, encryptionNonce: string, userParams?: Record<string, string>): Promise<string> {
+    if (typeof file === 'string') {
+      throw new TypeError('S3BgUploader: On web platform, encryptAndUploadFile requires a File value, not a string path.')
+    }
+    try {
+      return await sendRequest('encryptAndUploadFile', { file, transferId, encryptionKey, encryptionNonce, userParams: userParams ?? null }) as Promise<string>
     } catch (e: unknown) {
       const msg = (e as Error)?.message ?? String(e)
       if (msg.includes('DUPLICATE_FILE')) throw new S3BgUploaderDuplicateFileError(msg)

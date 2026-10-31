@@ -1,6 +1,7 @@
 pub mod api;
 pub mod chunk;
 pub mod config;
+pub mod encryption;
 pub mod hash;
 pub mod progress;
 pub mod retry;

@@ -1,6 +1,7 @@
 pub mod api;
 mod bindings;
 pub mod hash;
+pub mod js_encryptor;
 pub mod progress;
 pub mod store;
 mod upload;
@@ -8,9 +9,11 @@ pub mod upload_engine;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use wasm_bindgen_futures::spawn_local;
 
+use crate::core::encryption::ArcEncryptor;
 use crate::core::runtime;
 use crate::core::session::{self, UploadState};
 use crate::core::upload_orchestrator::UploadOutcome;
@@ -29,6 +32,9 @@ thread_local! {
     /// Stores the web_sys::File for each pending (hashed but not yet initialized) upload.
     /// Keyed by file_hash. Cleared when start_api succeeds or on cancel_all.
     pub(crate) static PENDING_WASM_FILES: RefCell<HashMap<String, web_sys::File>> = RefCell::new(HashMap::new());
+    /// Stores the encryptor for each pending encrypted upload. Keyed by file_hash.
+    /// Not persisted — the caller re-provides key+nonce on every call to encryptAndUploadFile.
+    pub(crate) static PENDING_WASM_ENCRYPTION: RefCell<HashMap<String, ArcEncryptor>> = RefCell::new(HashMap::new());
 }
 
 /// Phase 1 only: hash file, pre-register in session, fire NOT_STARTED callback.
@@ -46,30 +52,101 @@ pub(super) async fn start_and_enqueue(
     transfer_id: String,
     user_params: HashMap<String, String>,
 ) -> Result<String, String> {
+    start_and_enqueue_inner(file, transfer_id, user_params, None).await
+}
+
+/// Encrypted variant: same as `start_and_enqueue`, but the upload's own key and
+/// nonce are handed to whichever scheme is registered (JS factory, or the
+/// built-in cipher when none is), exactly like the native platforms.
+pub(super) async fn start_and_enqueue_encrypted(
+    file: web_sys::File,
+    transfer_id: String,
+    user_params: HashMap<String, String>,
+    key_hex: String,
+    nonce_hex: String,
+) -> Result<String, String> {
+    start_and_enqueue_inner(file, transfer_id, user_params, Some((key_hex, nonce_hex))).await
+}
+
+async fn start_and_enqueue_inner(
+    file: web_sys::File,
+    transfer_id: String,
+    user_params: HashMap<String, String>,
+    encryption: Option<(String, String)>,
+) -> Result<String, String> {
     let file_hash = hash::hash_web_file(&file, &transfer_id)?;
+
+    // Reject duplicates before invoking a factory that could replace an active instance.
+    let existing_state = {
+        let sess = session::session();
+        match sess.find_by_hash(&file_hash) {
+            Some(entry) => {
+                if entry.state != UploadState::Completed && encryption.is_none() {
+                    entry.require_encryption_config(None)?;
+                }
+                Some((entry.state.clone(), entry.is_resumable()))
+            }
+            None => None,
+        }
+    };
+    match existing_state {
+        Some((UploadState::Completed, _)) => return Ok(file_hash),
+        Some((_, false)) => {
+            return Err(format!(
+                "DUPLICATE_FILE: file with hash {} is already active in this session",
+                file_hash
+            ));
+        }
+        _ => {}
+    }
+    if session::session().pending_files.contains_key(&file_hash) {
+        return Err(format!(
+            "DUPLICATE_FILE: file with hash {} is already pending in this session",
+            file_hash
+        ));
+    }
+
+    // Build this file's encryptor from its key material. A registered JS factory
+    // gets the bytes and keeps one instance per file; the config below is then
+    // only the built-in fallback (never used while that instance exists).
+    let encryption_config = match encryption.as_ref() {
+        Some((key_hex, nonce_hex)) => {
+            let key = crate::core::encryption::hex_decode(key_hex, "encryption key")?;
+            let nonce = crate::core::encryption::hex_decode(nonce_hex, "encryption nonce")?;
+            let config = crate::core::encryption::build_encryptor(key_hex, nonce_hex)?;
+            crate::wasm::js_encryptor::create_instance(&file_hash, &key, &nonce)
+                .map_err(|e| format!("registerWebEncryptor: {e}"))?;
+            Some(config)
+        }
+        None => {
+            crate::wasm::js_encryptor::forget_instance(&file_hash);
+            None
+        }
+    };
 
     // If this hash already exists in session (resumable or completed) don't create a
     // duplicate UI entry — just re-associate the File object.
-    let existing_state = session::session()
-        .find_by_hash(&file_hash)
-        .map(|e| (e.state.clone(), e.is_resumable()));
     match existing_state {
         Some((UploadState::Completed, _)) => {
             return Ok(file_hash);
         }
         Some((_, true)) => {
-            session::session().files_needing_provision.remove(&file_hash);
+            session::session()
+                .files_needing_provision
+                .remove(&file_hash);
             PENDING_WASM_FILES.with(|m| m.borrow_mut().insert(file_hash.clone(), file));
+            if let Some(config) = encryption_config {
+                PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().insert(file_hash.clone(), config));
+            }
             return Ok(file_hash);
         }
         Some(_) => {
-            return Err(format!("DUPLICATE_FILE: file with hash {} is already active in this session", file_hash));
+            return Err(format!(
+                "DUPLICATE_FILE: file with hash {} is already active in this session",
+                file_hash
+            ));
         }
         None => {}
-    }
-
-    if session::session().pending_files.contains_key(&file_hash) {
-        return Err(format!("DUPLICATE_FILE: file with hash {} is already pending in this session", file_hash));
     }
 
     session::session().pre_register_file(
@@ -79,9 +156,13 @@ pub(super) async fn start_and_enqueue(
         file.name(),
         file.size() as u64,
         user_params,
-    );
+        encryption_config.clone(),
+    )?;
 
     PENDING_WASM_FILES.with(|m| m.borrow_mut().insert(file_hash.clone(), file));
+    if let Some(config) = encryption_config {
+        PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().insert(file_hash.clone(), config));
+    }
     Ok(file_hash)
 }
 
@@ -95,19 +176,22 @@ pub(crate) fn process_pending_files() {
         let sess = session::session();
         sess.pending_files
             .values()
-            .map(|p| (
-                p.file_hash.clone(),
-                p.transfer_id.clone(),
-                p.file_name.clone(),
-                p.file_size,
-                p.user_params.clone(),
-            ))
+            .map(|p| {
+                (
+                    p.file_hash.clone(),
+                    p.transfer_id.clone(),
+                    p.file_name.clone(),
+                    p.file_size,
+                    p.user_params.clone(),
+                )
+            })
             .collect()
     };
 
     for (file_hash, transfer_id, file_name, file_size, user_params) in pending {
         let file_opt = PENDING_WASM_FILES.with(|m| m.borrow().get(&file_hash).cloned());
         let Some(file) = file_opt else { continue };
+        let enc_opt = PENDING_WASM_ENCRYPTION.with(|m| m.borrow().get(&file_hash).cloned());
         spawn_local(async move {
             let result = crate::core::upload::start_and_register(
                 file_hash.clone(),
@@ -116,6 +200,7 @@ pub(crate) fn process_pending_files() {
                 file_name,
                 file_size,
                 user_params,
+                enc_opt,
                 &WasmApiClient,
             )
             .await;
@@ -127,6 +212,7 @@ pub(crate) fn process_pending_files() {
                     let still_active = session::session().pending_files.contains_key(&file_hash);
                     session::session().pending_files.remove(&file_hash);
                     PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
+                    PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().remove(&file_hash));
                     if !still_active {
                         // Undo the session.files insertion made by start_and_register.
                         session::session().cancel_file(&file_key);
@@ -148,11 +234,8 @@ pub(crate) fn process_pending_files() {
 
     // Handle re-provided resumable files: stored in PENDING_WASM_FILES by start_and_enqueue
     // but skipped pre_register_file (so they're NOT in pending_files).
-    let pending_file_hashes: std::collections::HashSet<String> = session::session()
-        .pending_files
-        .keys()
-        .cloned()
-        .collect();
+    let pending_file_hashes: std::collections::HashSet<String> =
+        session::session().pending_files.keys().cloned().collect();
     let resumable: Vec<(String, web_sys::File)> = PENDING_WASM_FILES.with(|m| {
         m.borrow()
             .iter()
@@ -166,6 +249,11 @@ pub(crate) fn process_pending_files() {
             _ => continue,
         };
         PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
+        // Restore the encryption config if the caller re-provided it.
+        let enc_opt = PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().remove(&file_hash));
+        if let Some(config) = enc_opt {
+            session::session().update_encryption_config(&file_key, config);
+        }
         runtime::notify_file_registered(wasmProgress::progress_manager(), &file_key);
         enqueue_file(file_key, file);
     }

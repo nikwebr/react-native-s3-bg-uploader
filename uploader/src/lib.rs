@@ -1,4 +1,4 @@
-mod core;
+pub mod core;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
@@ -54,6 +54,17 @@ pub struct ProgressEvent {
 }
 
 pub type ProgressCallback = extern "C" fn(*const ProgressEvent);
+
+/// Register a host-provided (custom) encryptor.
+/// Defined at crate root so cbindgen emits the `EncryptorVTable` type and the
+/// function into the C header without needing the `ios` feature to be active.
+#[cfg(not(feature = "wasm"))]
+#[no_mangle]
+pub extern "C" fn register_custom_encryptor(
+    vtable: *const core::encryption::EncryptorVTable,
+) {
+    core::encryption::register_custom_encryptor(vtable);
+}
 
 /// Register (or clear) the iOS progress callback.
 /// Defined at crate root so cbindgen can see both the type and the function

@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::os::raw::c_void;
+use std::sync::Arc;
 
+use crate::core::encryption::{self, XChaCha20Poly1305Encryptor};
 use crate::core::runtime;
 use crate::core::session::{self, register_store, UploadState};
 use crate::ios::progress as iosProgress;
@@ -72,17 +75,67 @@ pub extern "C" fn hash_and_pre_register(
         serde_json::from_str(json_str).unwrap_or_default()
     };
 
-    match super::hash_and_pre_register(&path, &tid, user_params) {
-        Ok(file_hash) => {
-            CString::new(file_hash)
-                .map(|s| s.into_raw())
-                .unwrap_or(std::ptr::null_mut())
-        }
+    match super::hash_and_pre_register(&path, &tid, user_params, None) {
+        Ok(file_hash) => CString::new(file_hash)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => CString::new(format!("ERROR:{}", e))
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+/// Phase 1 (encrypted): hash file, pre-register with XChaCha20-Poly1305 encryptor.
+/// `key_hex` = 64 hex chars (32 bytes), `nonce_hex` = 48 hex chars (24 bytes).
+/// Returns file hash as C string (caller frees).
+#[no_mangle]
+pub extern "C" fn hash_and_pre_register_encrypted(
+    file_path: *const c_char,
+    transfer_id: *const c_char,
+    key_hex: *const c_char,
+    nonce_hex: *const c_char,
+    user_params_json: *const c_char,
+) -> *mut c_char {
+    if file_path.is_null() || transfer_id.is_null() || key_hex.is_null() || nonce_hex.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let path = unsafe { CStr::from_ptr(file_path) }
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let tid = unsafe { CStr::from_ptr(transfer_id) }
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    let key = unsafe { CStr::from_ptr(key_hex) }.to_str().unwrap_or("");
+    let nonce = unsafe { CStr::from_ptr(nonce_hex) }.to_str().unwrap_or("");
+
+    let user_params: HashMap<String, String> = if user_params_json.is_null() {
+        HashMap::new()
+    } else {
+        let json_str = unsafe { CStr::from_ptr(user_params_json) }
+            .to_str()
+            .unwrap_or("{}");
+        serde_json::from_str(json_str).unwrap_or_default()
+    };
+
+    let encryptor = match crate::core::encryption::build_encryptor(key, nonce) {
+        Ok(e) => e,
         Err(e) => {
-            CString::new(format!("ERROR:{}", e))
+            return CString::new(format!("ERROR:{}", e))
                 .map(|s| s.into_raw())
-                .unwrap_or(std::ptr::null_mut())
+                .unwrap_or(std::ptr::null_mut());
         }
+    };
+
+    match super::hash_and_pre_register(&path, &tid, user_params, Some(encryptor)) {
+        Ok(file_hash) => CString::new(file_hash)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(e) => CString::new(format!("ERROR:{}", e))
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
     }
 }
 
@@ -130,11 +183,23 @@ pub extern "C" fn cancel_file(file_hash: *const c_char) {
     let (file_key, file_name, transfer_id, total_bytes, uploaded_bytes) = {
         let sess = session::session();
         if let Some(p) = sess.pending_files.get(hash) {
-            (String::new(), p.file_name.clone(), p.transfer_id.clone(), 0u64, 0u64)
+            (
+                String::new(),
+                p.file_name.clone(),
+                p.transfer_id.clone(),
+                0u64,
+                0u64,
+            )
         } else if let Some(key) = sess.hash_to_key.get(hash) {
             let key = key.clone();
             if let Some(e) = sess.files.get(&key) {
-                (key, e.file_name.clone(), e.transfer_id.clone(), e.total_bytes, e.uploaded_bytes)
+                (
+                    key,
+                    e.file_name.clone(),
+                    e.transfer_id.clone(),
+                    e.total_bytes,
+                    e.uploaded_bytes,
+                )
             } else {
                 (key, String::new(), String::new(), 0, 0)
             }
@@ -308,4 +373,17 @@ pub extern "C" fn free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe { drop(CString::from_raw(s)) };
     }
+}
+
+// ===========================================================================
+//  Custom encryptor registration (FFI export)
+// ===========================================================================
+
+/// Register a host-provided encryptor factory. The host supplies a vtable whose
+/// `create` callback receives each upload's key material.
+///
+/// This is the stable entry point that host apps use to inject their
+/// own encryption implementation without rebuilding the nitro module.
+pub extern "C" fn register_custom_encryptor(vtable: *const encryption::EncryptorVTable) {
+    encryption::register_custom_encryptor(vtable);
 }

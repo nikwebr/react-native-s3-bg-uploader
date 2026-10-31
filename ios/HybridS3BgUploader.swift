@@ -145,6 +145,17 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     }
 
     // -------------------------------------------------------------------------
+    // Custom encryptor registration
+    // -------------------------------------------------------------------------
+
+    /// Register a host-provided custom encryptor factory.
+    /// Only the vtable is passed here: key material arrives with each upload.
+    func registerCustomEncryptor(vtablePointer: Double) throws {
+        register_custom_encryptor(
+            UnsafePointer<EncryptorVTable>(bitPattern: UInt(vtablePointer))
+        )
+    }
+    // -------------------------------------------------------------------------
     // Progress callback
     // -------------------------------------------------------------------------
 
@@ -209,6 +220,60 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
             let fileHash = rawResult
 
             // If already running, trigger start_api eagerly; otherwise defer until resume().
+            let globalState: String
+            if let ptr = get_global_state() {
+                globalState = String(cString: ptr); free_string(ptr)
+            } else {
+                globalState = "NOT_STARTED"
+            }
+            if globalState == "RUNNING" || globalState == "RUNNING_IN_BG" {
+                self.triggerInitApi(hash: fileHash, transferId: transferId)
+            } else {
+                HybridS3BgUploader.pendingHashesLock.lock()
+                HybridS3BgUploader.pendingHashes.append((hash: fileHash, transferId: transferId))
+                HybridS3BgUploader.pendingHashesLock.unlock()
+            }
+
+            return fileHash
+        }
+    }
+
+    func encryptAndUploadFile(filePath: String, transferId: String, encryptionKey: String, encryptionNonce: String, userParams: [String: String]?) throws -> Promise<String> {
+        return Promise.parallel(HybridS3BgUploader.hashQueue) { [self] in
+            let paramsJson: String
+            if let params = userParams, !params.isEmpty {
+                let data = try JSONSerialization.data(withJSONObject: params)
+                paramsJson = String(data: data, encoding: .utf8) ?? "{}"
+            } else {
+                paramsJson = "{}"
+            }
+
+            let rawResult: String = filePath.withCString { pathPtr -> String in
+                transferId.withCString { tidPtr -> String in
+                    encryptionKey.withCString { keyPtr -> String in
+                        encryptionNonce.withCString { noncePtr -> String in
+                            paramsJson.withCString { paramsPtr -> String in
+                                if let ptr = hash_and_pre_register_encrypted(pathPtr, tidPtr, keyPtr, noncePtr, paramsPtr) {
+                                    let h = String(cString: ptr); free_string(ptr); return h
+                                }
+                                return ""
+                            }
+                        }
+                    }
+                }
+            }
+
+            guard !rawResult.isEmpty else {
+                throw NSError(domain: "S3BgUploader", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "hash_and_pre_register_encrypted failed"])
+            }
+            guard !rawResult.hasPrefix("ERROR:") else {
+                let message = String(rawResult.dropFirst("ERROR:".count))
+                throw NSError(domain: "S3BgUploader", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: message])
+            }
+            let fileHash = rawResult
+
             let globalState: String
             if let ptr = get_global_state() {
                 globalState = String(cString: ptr); free_string(ptr)

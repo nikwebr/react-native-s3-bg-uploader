@@ -71,9 +71,18 @@ pub fn start_upload_body(
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
-    body_map.insert("fileName".to_string(), serde_json::Value::String(file_name.to_string()));
-    body_map.insert("fileHash".to_string(), serde_json::Value::String(file_hash.to_string()));
-    body_map.insert("fileSize".to_string(), serde_json::Value::Number(file_size.into()));
+    body_map.insert(
+        "fileName".to_string(),
+        serde_json::Value::String(file_name.to_string()),
+    );
+    body_map.insert(
+        "fileHash".to_string(),
+        serde_json::Value::String(file_hash.to_string()),
+    );
+    body_map.insert(
+        "fileSize".to_string(),
+        serde_json::Value::Number(file_size.into()),
+    );
     serde_json::to_string(&body_map)
         .map_err(|e| format!("Failed to serialize start_upload body: {}", e))
 }

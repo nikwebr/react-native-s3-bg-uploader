@@ -19,6 +19,19 @@ npm run example:android
 npm run example:web
 ```
 
+For iOS, install the Ruby version pinned in `example/.ruby-version` and use
+Bundler 2.4.19, as recorded in `example/Gemfile.lock`. With rbenv:
+
+```sh
+cd example
+rbenv install --skip-existing
+gem install bundler -v 2.4.19
+npm run pod
+```
+
+Ensure rbenv is initialized in your shell so `ruby` and `bundle` use the pinned
+version rather than macOS's system Ruby.
+
 If you instead want to run the example application with a prebuild version of the library, do the following:
 Inside example, run
 ```sh
@@ -29,10 +42,7 @@ npm run android
 
 npm run web
 
-bundle install
-cd ios
-pod install
-cd ..
+npm run pod
 npm run ios
 ```
 

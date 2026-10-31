@@ -50,7 +50,16 @@ S3BgUploader.setProgressCallback((file, session, transfer) => {
 
 // Enqueue files and start
 const transferId = 'my-transfer'
-await S3BgUploader.uploadFile('/path/to/file.mp4', transferId, { userId: '42' })
+await S3BgUploader.uploadFile(
+  '/path/to/file.mp4', transferId, { userId: '42' }
+)
+await S3BgUploader.encryptAndUploadFile(
+  '/path/to/file2.mp4',
+  'my-encrypted-transfer',
+  keyHex,   // 32-byte key as 64 hex characters
+  nonceHex, // 24-byte base nonce as 48 hex characters
+  { userId: '42' }
+)
 await S3BgUploader.resume()
 
 // Pause / resume / cancel
@@ -99,12 +108,136 @@ Follow the instructions [here](https://reactnative.dev/docs/signed-apk-android#g
 After that:
 ```bash
 cd example
-npx react-native build-android --mode=release
 npm run android -- --mode="release"
 ```
 
 #### iOS
 Change build configuration to production inside XCode: Open S3BackgroundUploaderExample.xcworkspace and edit the scheme.
+
+## End to end encryption
+
+### Default algorithm
+
+`encryptAndUploadFile()` uses **XChaCha20-Poly1305** by default: the XChaCha20
+stream cipher provides confidentiality, and a Poly1305 authentication tag detects
+tampering with each chunk. Encryption runs locally before any file content is
+uploaded, on iOS, Android, and web, without registering a custom encryptor.
+Plain `uploadFile()` remains unencrypted.
+
+The built-in cipher takes a 32-byte key and a 24-byte base nonce, supplied as hex
+strings with each upload. It derives a deterministic nonce for each part and
+authenticates the part number, allowing individual parts to be retried or resumed
+while detecting reordering. An authenticated descriptor appended to the final
+part records the chunk layout and total data-part count for decryption.
+
+For end-to-end encryption, your app must manage keys and deliver them securely to
+the intended recipient without exposing them to the upload backend or storage
+provider. The uploader encrypts uploads; it does not manage key exchange or
+automatically decrypt downloaded objects.
+
+### Custom encryptors
+
+A host app can plug in its own chunk-encryption scheme without rebuilding this package, by
+registering an `EncryptorVTable` (see `uploader/src/core/encryption.rs` and the generated
+`ios/rust/uploader.h`). The uploader reads every field unconditionally:
+
+| field | meaning |
+|---|---|
+| `create(key, key_len, nonce, nonce_len)` | build the encryptor for **one upload** from the key material of that `encryptAndUploadFile(...)` call. Return `NULL` to fall back to the built-in cipher for that upload |
+| `encrypt_chunk(ctx, input, input_len, part_number)` | encrypt one S3 part and return a heap allocation in an `EncryptResult` |
+| `free(ctx, data, len, capacity)` | release a result — the uploader copies the bytes out first, so the host may allocate however it likes |
+| `destroy(ctx)` | release a context built by `create` — exactly once per upload, when the file's session entry is dropped (finished, cancelled or evicted) |
+| `ciphertext_overhead` | bytes your scheme adds per chunk (tag, IV prefix, …); the engine reads `part_size - overhead` plaintext per part so the ciphertext fills the URL slot exactly. Use `0` for a stream cipher |
+| `has_footer` | `true` if the wire format ends with a synthesised descriptor, appended to the last data part |
+| `footer_len` | bytes that descriptor occupies; the engine reserves them in every part so the final part still fits its URL slot. Must be non-zero when `has_footer` is `true` |
+| `compute_footer(ctx, n_data_parts, effective_part_size)` | builds that descriptor; only called when `has_footer` is `true` (Rust hosts use `no_descriptor` when it is `false`, C/C++/Swift hosts may pass `NULL`) |
+
+The descriptor is **never an S3 part of its own** — it is appended to the final data part. S3
+requires every part except the last to be at least 5 MiB, so a tiny trailing part would demote
+the real last part to an intermediate one and `CompleteMultipartUpload` would fail with
+`EntityTooSmall` for every file whose final part is below that minimum (which is most files).
+Riding inside the last part keeps that part last, where any size is allowed.
+
+Anything that works part-by-part is expressible: an AEAD tag (`overhead` = tag size), an IV
+prefix (`overhead` = IV size), a stream cipher (`overhead = 0`), with or without a descriptor.
+With `has_footer = false`, `footer_len` is `0`, `compute_footer` is never called and the engine
+reserves nothing extra.
+
+Register the factory once at startup from native code. No key material is passed there —
+only the table:
+
+```swift
+CustomEncryptor.register()                                   // iOS / Swift
+HybridS3BgUploader.registerCustomEncryptor(vtablePointer)    // Android / Kotlin
+S3BgUploader.registerCustomEncryptor(vtablePointer)          // JS, if you prefer to register late
+```
+
+Every encrypted upload then supplies **its own** key and nonce:
+
+```ts
+await S3BgUploader.encryptAndUploadFile(path, transferId, keyHex, nonceHex)
+```
+
+The uploader decodes those hex strings and calls `create`, which builds one encryptor instance
+per file. That means:
+
+- two uploads in flight at the same time may use different keys (no global key state);
+- new uploads are marked encrypted before they become schedulable or are first persisted,
+  so they cannot temporarily run as plaintext during initialization;
+- the instance is stored with that file's session entry, so pause/resume re-encrypts with the
+  same key while the process remains alive. Keys and encryptor instances are not persisted:
+  after a restart, re-provide encrypted files with `encryptAndUploadFile()` and the original
+  key/nonce. Plain `uploadFile()` reprovisioning and background uploads without the required
+  encryption configuration fail instead of sending plaintext;
+- a scheme that keeps its key on the device (Keychain / Keystore) may ignore the bytes and
+  return a context anyway. Returning `NULL` instead makes the uploader use its built-in
+  XChaCha20-Poly1305 for that upload.
+
+Plain `uploadFile(...)` stays plaintext.
+
+#### Web
+
+A browser has no second binary, so the mechanism is JavaScript running in the uploader's worker,
+registered as a factory with the same per-upload contract:
+
+```ts
+await S3BgUploader.registerWebEncryptor({
+  source: myFactory.toString(),   // (key: Uint8Array, nonce: Uint8Array) => { encryptChunk, computeFooter? }
+  overhead: 16,
+  hasFooter: true,
+  footerLen: 28,
+});
+
+await S3BgUploader.encryptAndUploadFile(file, transferId, keyHex, nonceHex);
+```
+
+The factory is called **once per upload** with that upload's decoded key/nonce, and the instance it
+returns encrypts that file only — so a browser build has the same per-upload key semantics as the
+native vtable's `create`. Return `null` to fall back to the built-in cipher for that upload. The
+callbacks may return Promises (`crypto.subtle` is async).
+
+#### What the ABI cannot express
+
+`encrypt_chunk` is called once per S3 part with that part's plaintext only. The engine never
+hands over the whole file: it seeks to `(part_number - 1) * part_size`, reads that one part,
+and keeps at most a few parts in flight. The descriptor callback sees only `n_data_parts` and
+`effective_part_size` — never the data.
+
+So a scheme that needs a **single pass over the whole file** cannot be expressed:
+
+- block chaining across parts (e.g. CBC/CTR state carried from part to part),
+- a global trailer or digest computed over the entire plaintext,
+- anything that needs the complete ciphertext before it can emit a part.
+
+That part-independence is deliberate: every part must be re-encryptable from
+`key + base_nonce + part_number` alone, which is what makes pause/resume cheap and
+deterministic — a scheme carrying global state has no way to resume or retry a single part.
+
+A worked example that also shows the linking model (the host crate must **not** depend on the
+`uploader` crate — it imports `register_custom_encryptor` so the framework stays the single
+copy of the uploader) lives at `custom-encryption-example/` (AES-256-GCM, descriptor in the
+final part), together with `tools/decrypt` — a standalone verifier that decodes an uploaded object
+from the wire format and reports which encryptor produced it.
 
 ## Troubleshooting
 ### ReferenceError: Can't find variable: wasm_bindgen
@@ -120,60 +253,3 @@ Bootstrapped with [create-nitro-module](https://github.com/patrickkabwe/create-n
 ## Contributing
 
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-
-### GitHub agent
-
-The gh-aw workflow in `.github/workflows/agent-serviceuser.md` uses Pi with
-DeepSeek, matching the ysendit agent setup. Repository writers can assign an
-issue or pull request to `agent-serviceuser`, request its review, or mention
-`@agent-serviceuser`. It also responds to new comments and reviews on assigned
-threads. Reviews can comment or request changes, but cannot approve.
-
-Set the repository Actions secrets `DEEPSEEK_API_KEY` and `GH_TOKEN`. The
-interactive agent uses `GH_TOKEN` for creating package PRs and pushing updates
-to PR branches, so their CI checks can start automatically. Reviews and inline
-review comments also use the PAT account; reviews still cannot approve PRs.
-GitHub does not allow that account to review its own PRs. Using the default
-`GITHUB_TOKEN` for these operations instead makes GitHub require approval before
-running the resulting PR workflows. The agent does not update the external
-documentation repository.
-
-A separate workflow, `.github/workflows/post-merge-docs.md`, runs when a PR is
-**merged into `master`**, not when opened or closed without merging. It uses Pi
-with DeepSeek to check whether the merged changes require documentation updates
-in [`nikwebr/react-native-s3-bg-uploader-docs`](https://github.com/nikwebr/react-native-s3-bg-uploader-docs).
-It uses `pull_request_target` so merged fork contributions can trigger it with
-the required secrets, with checkout restricted to the two trusted repositories'
-`master` branches, never the PR head.
-It also checks that the exported version in the docs site's `lib/version.ts`
-matches the latest published stable GitHub Release, never a predicted version.
-The existing release-time API-types/version sync remains unchanged; the
-post-merge agent checks for missing updates without racing an unpublished bump.
-
-The post-merge workflow opens at most one docs PR against `master`, restricted
-to `content/**` and `lib/version.ts`, or does nothing when no changes are needed.
-It cannot approve or merge PRs. `GH_TOKEN` must be a PAT with **Contents:
-read/write** and **Pull requests: read/write** access to both the package and
-docs repositories. The PAT is used by trusted checkout and publishing steps,
-not either agent's execution environment or GitHub tools. Credentials are not
-persisted in the agent checkout. New PRs are authored by the PAT account.
-Both workflows explicitly publish signed commits through GitHub's
-`createCommitOnBranch` API, which attributes published commits to the PAT owner.
-Temporary sandbox commits may still use the local `github-actions[bot]` identity;
-their local author metadata is not the published signed-commit identity.
-Ordinary issue/PR conversation comments also use the PAT account.
-
-Both agents use read-only GitHub tools and apply changes through gh-aw safe
-outputs. No Copilot token is required. AI threat detection remains disabled,
-matching ysendit.
-
-After editing the Markdown workflow, regenerate and commit its compiled workflow:
-
-```bash
-gh extension install github/gh-aw # Once; use v0.93.5 for this workflow
-gh aw compile agent-serviceuser post-merge-docs
-```
-
-Commit both generated `.github/workflows/*.lock.yml` files and any changes to
-`.github/aw/actions-lock.json` alongside the source. The previous Pi action is
-archived in `old_github_workflows/pi-agent.yml` and no longer runs.

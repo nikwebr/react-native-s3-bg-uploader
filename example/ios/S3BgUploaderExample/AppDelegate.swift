@@ -5,6 +5,9 @@ import ReactAppDependencyProvider
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
+  /// Filled in by SceneDelegate. The app adopts the UIScene lifecycle, which
+  /// iOS 27 requires: UIKit traps at launch with
+  /// "UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption" otherwise.
   var window: UIWindow?
 
   var reactNativeDelegate: ReactNativeDelegate?
@@ -21,15 +24,37 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     reactNativeDelegate = delegate
     reactNativeFactory = factory
 
-    window = UIWindow(frame: UIScreen.main.bounds)
+    return true
+  }
 
-    factory.startReactNative(
+  /// Starts React Native in the window owned by the app's scene.
+  func startReactNative(in window: UIWindow, launchOptions: [UIApplication.LaunchOptionsKey: Any]?) {
+    reactNativeFactory?.startReactNative(
       withModuleName: "S3BgUploaderExample",
       in: window,
       launchOptions: launchOptions
     )
+  }
+}
 
-    return true
+/// The app's single scene. The RN root view is created here instead of in
+/// didFinishLaunching, because the scene (not the app delegate) owns the window
+/// once the UIScene lifecycle is adopted.
+class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+  var window: UIWindow?
+
+  func scene(
+    _ scene: UIScene,
+    willConnectTo session: UISceneSession,
+    options connectionOptions: UIScene.ConnectionOptions
+  ) {
+    guard let windowScene = scene as? UIWindowScene else { return }
+    let window = UIWindow(windowScene: windowScene)
+    self.window = window
+    (UIApplication.shared.delegate as? AppDelegate)?.startReactNative(
+      in: window,
+      launchOptions: nil
+    )
   }
 }
 
