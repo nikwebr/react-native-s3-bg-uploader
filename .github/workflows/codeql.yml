@@ -1,6 +1,7 @@
 name: "CodeQL Advanced"
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "master" ]
   pull_request:
@@ -72,7 +73,7 @@ jobs:
             -scheme S3BgUploaderExample \
             -sdk iphonesimulator \
             -configuration Debug \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -destination 'generic/platform=iOS Simulator' \
             build \
             CODE_SIGNING_ALLOWED=NO
       - uses: github/codeql-action/analyze@v4
