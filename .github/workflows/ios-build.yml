@@ -19,6 +19,9 @@ jobs:
     name: Build iOS Example App
     runs-on: macOS-26
     timeout-minutes: 60
+    env:
+      # Cold hosted simulators can take several minutes to start XCTest.
+      MAESTRO_DRIVER_STARTUP_TIMEOUT: '600000'
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2

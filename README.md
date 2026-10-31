@@ -305,6 +305,9 @@ The native tests route React Native's default Metro port to the isolated test
 server on 8080 (an iOS launch argument and Android ADB reverse with an explicit
 app-local debug host), leaving any development server on the host's port 8081
 untouched.
+The iOS workflow allows up to ten minutes for Maestro's XCTest driver to start
+on a cold hosted simulator (`MAESTRO_DRIVER_STARTUP_TIMEOUT=600000`, in
+milliseconds). This does not increase flow or upload assertion timeouts.
 
 The same workflows also test `custom-encryption-example` with both plaintext and
 custom AES-256-GCM uploads. Add `custom` as the runner's second argument
