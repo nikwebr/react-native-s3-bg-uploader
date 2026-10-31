@@ -16,12 +16,11 @@
 //! # Usage
 //!
 //! 1. Link `libcustom_encryptor.a` and `libuploader.framework` into the app.
-//! 2. Call `CustomEncryptor.register(keyHex:nonceHex:)` at startup (Swift), which
+//! 2. Call `CustomEncryptor.register()` at startup (Swift), which
 //!    calls `custom_encryptor_register()` below.
 //! 3. Use `S3BgUploader.encryptAndUploadFile()`.
 
 use std::ffi::c_void;
-use std::os::raw::c_char;
 
 // ---------------------------------------------------------------------------
 // C ABI — must stay layout-identical to uploader/src/core/encryption.rs

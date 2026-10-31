@@ -18,15 +18,15 @@ rustup target list --installed | grep -q "aarch64-apple-ios$" || rustup target a
 rustup target list --installed | grep -q "aarch64-apple-ios-sim" || rustup target add aarch64-apple-ios-sim
 rustup target list --installed | grep -q "x86_64-apple-ios" || rustup target add x86_64-apple-ios
 
-# Build all targets
+# Build only static libraries; the app link resolves the uploader's FFI symbol.
 echo "Building for iOS device (aarch64)..."
-cargo build --release --target aarch64-apple-ios --manifest-path "$LIB_DIR/Cargo.toml"
+cargo rustc --release --locked --lib --crate-type staticlib --target aarch64-apple-ios --manifest-path "$LIB_DIR/Cargo.toml"
 
 echo "Building for iOS simulator (aarch64)..."
-cargo build --release --target aarch64-apple-ios-sim --manifest-path "$LIB_DIR/Cargo.toml"
+cargo rustc --release --locked --lib --crate-type staticlib --target aarch64-apple-ios-sim --manifest-path "$LIB_DIR/Cargo.toml"
 
 echo "Building for iOS simulator (x86_64)..."
-cargo build --release --target x86_64-apple-ios --manifest-path "$LIB_DIR/Cargo.toml"
+cargo rustc --release --locked --lib --crate-type staticlib --target x86_64-apple-ios --manifest-path "$LIB_DIR/Cargo.toml"
 
 # Create universal simulator library
 echo "Creating universal simulator library..."

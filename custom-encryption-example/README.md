@@ -88,44 +88,9 @@ bash custom-encryption-example/build-rust-lib.sh
 The first command builds the uploader and runs native code generation. The second builds
 the custom encryptor for device and simulator and creates
 `example-app/ios/Libraries/libcustom_encryptor.xcframework`, which the podspec consumes.
+The script builds only static libraries for iOS: `register_custom_encryptor` is
+resolved from the uploader when the app links, not while building a standalone dylib.
 There is no need to swap `.a` files manually when switching between simulator and device.
-
-For a **Debug simulator run**, start Metro in one terminal:
-
-```bash
-cd custom-encryption-example/example-app
-npm start
-```
-
-In another terminal, starting from the repository root:
-
-```bash
-xcrun simctl list devices available
-cd custom-encryption-example/example-app
-# Replace the simulator name with one installed on your machine.
-npm run ios -- --scheme CustomEncryptionExample --simulator "iPhone 17" --no-packager
-```
-
-For a **physical device**, connect and trust the iPhone, enable Developer Mode, then open
-the workspace from the repository root:
-
-```bash
-open custom-encryption-example/example-app/ios/CustomEncryptionExample.xcworkspace
-```
-
-Select the `CustomEncryptionExample` scheme, set your development team under
-**Signing & Capabilities**, select the connected device, and choose **Run**.
-Debug builds need Metro reachable from the device.
-
-Alternatively, after configuring signing, build, install, and launch a **Release** build:
-
-```bash
-cd custom-encryption-example/example-app
-npm run ios -- --scheme CustomEncryptionExample --device "Your iPhone" --mode Release --no-packager
-```
-
-Replace `Your iPhone` with the connected device's name. Release bundles JavaScript and
-does not require Metro.
 
 ### Android
 
@@ -139,40 +104,27 @@ or start an emulator.
 npm run build:android
 
 # Custom encryptor .so files for those same ABIs.
-cargo ndk --platform 24 \
-  -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 \
-  -o custom-encryption-example/example-app/android/app/src/main/jniLibs \
-  build --release \
-  --manifest-path custom-encryption-example/custom-encryptor-rust/Cargo.toml
+(
+  cd custom-encryption-example/custom-encryptor-rust
+  cargo ndk --platform 24 \
+    -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 \
+    -o ../example-app/android/app/src/main/jniLibs \
+    build --release --locked
+)
 ```
+
+Run `cargo ndk` from the crate directory: it looks up the manifest in its current
+directory before forwarding arguments to `cargo build`.
 
 The uploader libraries go into the repository's `android/src/main/jniLibs/`; the custom
 libraries go into the example app's `jniLibs/`. Both are required. The app already contains
 the native registration call; no extra Kotlin file or CMake linking changes are needed.
 
-For a **Debug run**, start Metro in one terminal:
-
-```bash
-cd custom-encryption-example/example-app
-npm start
-```
-
-In another terminal, starting from the repository root, connect one device or emulator:
-
-```bash
-adb devices
-adb reverse tcp:8081 tcp:8081
-cd custom-encryption-example/example-app
-npm run android -- --no-packager
-```
-
 For a **Release run without Metro**, start from the repository root:
 
 ```bash
 cd custom-encryption-example/example-app/android
-./gradlew :app:assembleRelease --no-daemon
-adb install -r app/build/outputs/apk/release/app-release.apk
-adb shell am start -n com.customencryptionexample/.MainActivity
+npm run android -- --mode="release"
 ```
 
 The example signs Release with its debug keystore for local use. Configure production
@@ -396,6 +348,21 @@ cargo run --release -- /tmp/cfv/adapter-object.bin --expect /tmp/cfv/adapter-pla
    to decode).
 
 ## Troubleshooting
+
+### Android: a problem occurred starting process `node`
+
+If `node --version` works in your terminal but Gradle cannot start `node`, retry
+with a fresh daemon environment:
+
+```bash
+cd custom-encryption-example/example-app/android
+./gradlew --stop
+cd ..
+npm run android -- --mode=release --no-packager
+```
+
+Ensure Node.js is on `PATH` in the same terminal. For Release, `--no-packager`
+avoids starting Metro; the app uses its bundled JavaScript.
 
 ### Library changes have no effect (stale/duplicate uploader)
 - **Cause**: the custom-encryptor crate depends on `uploader` (rlib) and re-exports
