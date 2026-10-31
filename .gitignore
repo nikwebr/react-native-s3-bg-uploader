@@ -92,7 +92,6 @@ src/web/wasm-assets.ts
 
 # Example
 example/ios/Podfile.lock
-example/Gemfile.lock
 example/ios/S3BgUploaderExample.xcworkspace/contents.xcworkspacedata
 
 # Misc

@@ -50,7 +50,16 @@ S3BgUploader.setProgressCallback((file, session, transfer) => {
 
 // Enqueue files and start
 const transferId = 'my-transfer'
-await S3BgUploader.uploadFile('/path/to/file.mp4', transferId, { userId: '42' })
+await S3BgUploader.uploadFile(
+  '/path/to/file.mp4', transferId, { userId: '42' }
+)
+await S3BgUploader.encryptAndUploadFile(
+  '/path/to/file2.mp4',
+  'my-encrypted-transfer',
+  keyHex,   // 32-byte key as 64 hex characters
+  nonceHex, // 24-byte base nonce as 48 hex characters
+  { userId: '42' }
+)
 await S3BgUploader.resume()
 
 // Pause / resume / cancel
@@ -99,14 +108,34 @@ Follow the instructions [here](https://reactnative.dev/docs/signed-apk-android#g
 After that:
 ```bash
 cd example
-npx react-native build-android --mode=release
 npm run android -- --mode="release"
 ```
 
 #### iOS
 Change build configuration to production inside XCode: Open S3BackgroundUploaderExample.xcworkspace and edit the scheme.
 
-## Custom encryptors
+## End to end encryption
+
+### Default algorithm
+
+`encryptAndUploadFile()` uses **XChaCha20-Poly1305** by default: the XChaCha20
+stream cipher provides confidentiality, and a Poly1305 authentication tag detects
+tampering with each chunk. Encryption runs locally before any file content is
+uploaded, on iOS, Android, and web, without registering a custom encryptor.
+Plain `uploadFile()` remains unencrypted.
+
+The built-in cipher takes a 32-byte key and a 24-byte base nonce, supplied as hex
+strings with each upload. It derives a deterministic nonce for each part and
+authenticates the part number, allowing individual parts to be retried or resumed
+while detecting reordering. An authenticated descriptor appended to the final
+part records the chunk layout and total data-part count for decryption.
+
+For end-to-end encryption, your app must manage keys and deliver them securely to
+the intended recipient without exposing them to the upload backend or storage
+provider. The uploader encrypts uploads; it does not manage key exchange or
+automatically decrypt downloaded objects.
+
+### Custom encryptors
 
 A host app can plug in its own chunk-encryption scheme without rebuilding this package, by
 registering an `EncryptorVTable` (see `uploader/src/core/encryption.rs` and the generated
@@ -187,7 +216,7 @@ returns encrypts that file only — so a browser build has the same per-upload k
 native vtable's `create`. Return `null` to fall back to the built-in cipher for that upload. The
 callbacks may return Promises (`crypto.subtle` is async).
 
-### What the ABI cannot express
+#### What the ABI cannot express
 
 `encrypt_chunk` is called once per S3 part with that part's plaintext only. The engine never
 hands over the whole file: it seeks to `(part_number - 1) * part_size`, reads that one part,
