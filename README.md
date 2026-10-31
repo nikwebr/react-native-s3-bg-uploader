@@ -324,6 +324,11 @@ not the `Open` fallback produced when the stream buffer is still locked, and
 that EOF is delivered after the last buffered bytes are consumed.
 The test screen also reads current progress after obtaining the upload key, so a
 fast first-part callback emitted before the start call resolves is not lost.
+The pause check waits for progress to stop changing instead of sleeping a fixed
+time, because parts already in flight may finish after a pause and a slow runner
+would otherwise report those permitted completions as progress made while
+paused. Set `E2E_RELEASE_STAGGER_MS=1000` to make the backend answer those
+in-flight parts seconds apart and reproduce that timing locally.
 
 The same workflows also test `custom-encryption-example` with both plaintext and
 custom AES-256-GCM uploads. Add `custom` as the runner's second argument

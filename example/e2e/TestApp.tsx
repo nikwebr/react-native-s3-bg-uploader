@@ -120,6 +120,32 @@ export default function TestApp({ initializeEncryptor }: {
     return file;
   };
 
+  // Parts already sent when pause arrives are allowed to finish. Wait until progress
+  // has been unchanged for a full window, so a slow runner cannot report those
+  // permitted completions as progress that happened "while paused".
+  const settle = async (): Promise<UploadProgress> => {
+    const deadline = Date.now() + 30000;
+    let stable = await snapshot();
+    let stableSince = Date.now();
+    while (Date.now() - stableSince < 2000) {
+      if (Date.now() > deadline) throw new Error('Upload did not settle while paused');
+      await sleep(200);
+      const next = await snapshot().catch(() => {
+        // A finished upload is evicted from the session: the pause was a no-op.
+        throw new Error('All parts uploaded while paused');
+      });
+      if (next.completedParts !== stable.completedParts ||
+          next.uploadedBytes !== stable.uploadedBytes) {
+        if (next.completedParts >= next.totalParts) {
+          throw new Error('All parts uploaded while paused');
+        }
+        stable = next;
+        stableSince = Date.now();
+      }
+    }
+    return stable;
+  };
+
   const pause = async () => {
     S3BgUploader.pause();
     const deadline = Date.now() + 10000;
@@ -133,18 +159,21 @@ export default function TestApp({ initializeEncryptor }: {
     }
     // Open the server gate while still paused: a no-op pause cannot pass this check.
     await api('/release', { mode: current.current?.mode });
-    await sleep(2000);
-    // Already-sent parts may finish; pause must stop scheduling the remaining parts.
-    const before = await snapshot();
+    // Already-sent parts may finish after a pause. Wait for progress to stop moving
+    // instead of sleeping a fixed time: a fixed window made the check depend on how
+    // fast the runner completed those in-flight parts.
+    const before = await settle();
     if (before.completedParts >= before.totalParts) {
       throw new Error('All parts uploaded while paused');
     }
-    await sleep(2000);
-    const after = await snapshot();
+    // confirm nothing moves again for a full window
+    const after = await settle();
     if (after.completedParts !== before.completedParts ||
-        after.uploadedBytes !== before.uploadedBytes ||
-        (await S3BgUploader.getAggregateProgress()).state !== 'PAUSED') {
+        after.uploadedBytes !== before.uploadedBytes) {
       throw new Error('Upload advanced while paused');
+    }
+    if ((await S3BgUploader.getAggregateProgress()).state !== 'PAUSED') {
+      throw new Error('Uploader left PAUSED while paused');
     }
     await api('/paused', { mode: current.current?.mode, before, after });
     setStatus('Pause verified');

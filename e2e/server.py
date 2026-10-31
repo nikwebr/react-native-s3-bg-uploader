@@ -6,10 +6,12 @@ from dataclasses import dataclass, field
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from urllib.parse import parse_qs, urlsplit
 
 import boto3
@@ -29,6 +31,12 @@ BUCKET = "maestro-e2e"
 def require(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+# Stress hook: reply to the gated parts with a stagger so their completions land
+# seconds apart, as they do on a slow runner. Zero (the default) replies at once.
+# Run with E2E_RELEASE_STAGGER_MS=1000 to reproduce the pause-settling race.
+RELEASE_STAGGER_MS = int(os.environ.get("E2E_RELEASE_STAGGER_MS", "0"))
 
 
 @dataclass
@@ -274,9 +282,12 @@ class Handler(BaseHTTPRequestHandler):
             upload.put_requests.update([part])
         data = self.rfile.read(int(self.headers["Content-Length"]))
         # Part one completes normally; all other PUTs wait until the app pauses.
-        if part != 1 and not upload.released.wait(timeout=120):
-            self.reply(504, b'{"error":"Timed out waiting for pause"}')
-            return
+        if part != 1:
+            if not upload.released.wait(timeout=120):
+                self.reply(504, b'{"error":"Timed out waiting for pause"}')
+                return
+            if RELEASE_STAGGER_MS:
+                time.sleep(RELEASE_STAGGER_MS * (part - 2) / 1000)
         storage = self.server.backend.storage
         connection = http.client.HTTPConnection(storage.hostname, storage.port, timeout=30)
         try:
