@@ -67,6 +67,10 @@ jobs:
 
       - name: Build
         run: npm run build:ios
+      - name: Test native upload race regressions
+        run: |
+          cargo test --locked --manifest-path uploader/Cargo.toml native::upload_engine::tests
+          cargo test --locked --manifest-path uploader/Cargo.toml -p nyquest-backend-nsurlsession --lib stream::ns_stream::tests
       - name: Install Pods
         working-directory: example/ios
         run: npm run pod

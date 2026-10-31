@@ -316,6 +316,14 @@ Before launching either iOS example, the runner requests its test bundle from
 Metro with a separate ten-minute preparation limit. This keeps cold JavaScript
 bundling outside the screen-readiness wait; failures stop the run explicitly.
 Preparation timing is retained in `metro-warmup.log`.
+The iOS workflow also runs a native regression that pauses or replaces an upload
+while its old network worker is blocked. The upload queue must return promptly
+and allow a resumed run to finish without waiting for that old request.
+It also checks that native end-of-stream events expose `AtEnd` to their delegate,
+not the `Open` fallback produced when the stream buffer is still locked, and
+that EOF is delivered after the last buffered bytes are consumed.
+The test screen also reads current progress after obtaining the upload key, so a
+fast first-part callback emitted before the start call resolves is not lost.
 
 The same workflows also test `custom-encryption-example` with both plaintext and
 custom AES-256-GCM uploads. Add `custom` as the runner's second argument

@@ -272,7 +272,6 @@ pub extern "C" fn resume_all() -> *mut c_char {
             .map(|e| e.file_key.clone())
             .collect()
     };
-    PAUSE_FLAG.store(false, std::sync::atomic::Ordering::Relaxed);
     session::resume_all();
     for key in &resumed_keys {
         iosProgress::progress_manager().remove(key);
@@ -280,6 +279,8 @@ pub extern "C" fn resume_all() -> *mut c_char {
     let mut queue = QUEUE.lock().unwrap();
     queue.pending.clear();
     queue.pending_keys.clear();
+    // Do not let the worker dequeue an old paused run before its version is reset.
+    PAUSE_FLAG.store(false, std::sync::atomic::Ordering::Relaxed);
     drop(queue);
     let next_key = session::session().next_pending_file();
     if let Some(file_key) = next_key {

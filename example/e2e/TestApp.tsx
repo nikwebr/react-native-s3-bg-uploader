@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Platform, ScrollView, StyleSheet, Text, TextInput } from 'react-native';
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
 import type { UploadProgress } from '../../src/specs/s3-bg-uploader.types';
@@ -34,36 +34,38 @@ export default function TestApp({ initializeEncryptor }: {
   const completionTiming = useRef(new CompletionTiming());
   const completionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
+  const onProgress = useCallback((file: UploadProgress) => {
+    if (file.fileHash !== current.current?.hash || file.transferId !== current.current?.mode) return;
+    setProgress({ ...file });
+    if (file.state === 'FAILED') setError(`Upload failed: ${file.fileName}`);
+    const timing = completionTiming.current;
+    try {
+      timing.observe(file, performance.now());
+      if (timing.completedAfterMs !== undefined) {
+        clearTimeout(completionTimer.current);
+        setCompletionAfterMs(timing.assertComplete());
+      } else if (timing.reached100At !== undefined && completionTimer.current === undefined) {
+        completionTimer.current = setTimeout(() => {
+          try {
+            timing.assertComplete();
+          } catch (e: unknown) {
+            setError(e instanceof Error ? e.message : String(e));
+          }
+        }, Math.max(0, COMPLETION_TIMEOUT_MS - (performance.now() - timing.reached100At)) + 1);
+      }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
   useEffect(() => {
     S3BgUploader.setConfig(`${BACKEND}/start`, `${BACKEND}/urls`, `${BACKEND}/complete`);
-    S3BgUploader.setProgressCallback(file => {
-      if (file.fileHash !== current.current?.hash || file.transferId !== current.current?.mode) return;
-      setProgress({ ...file });
-      if (file.state === 'FAILED') setError(`Upload failed: ${file.fileName}`);
-      const timing = completionTiming.current;
-      try {
-        timing.observe(file, performance.now());
-        if (timing.completedAfterMs !== undefined) {
-          clearTimeout(completionTimer.current);
-          setCompletionAfterMs(timing.assertComplete());
-        } else if (timing.reached100At !== undefined && completionTimer.current === undefined) {
-          completionTimer.current = setTimeout(() => {
-            try {
-              timing.assertComplete();
-            } catch (e: unknown) {
-              setError(e instanceof Error ? e.message : String(e));
-            }
-          }, Math.max(0, COMPLETION_TIMEOUT_MS - (performance.now() - timing.reached100At)) + 1);
-        }
-      } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    });
+    S3BgUploader.setProgressCallback(onProgress);
     return () => {
       clearTimeout(completionTimer.current);
       S3BgUploader.setProgressCallback(null);
     };
-  }, []);
+  }, [onProgress]);
 
   const run = async (operation: () => Promise<void>) => {
     setBusy(true);
@@ -103,6 +105,10 @@ export default function TestApp({ initializeEncryptor }: {
     current.current = { hash, mode };
     setStatus(`${mode} queued`);
     await S3BgUploader.resume();
+    // Native uploads can emit progress before uploadFile resolves with their key.
+    for (const fileProgress of await S3BgUploader.getProgress(mode, hash)) {
+      onProgress(fileProgress);
+    }
     setStatus('Upload started');
   };
 
