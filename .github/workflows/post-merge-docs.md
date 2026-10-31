@@ -52,10 +52,12 @@ network:
 tools:
   github:
     toolsets: [default]
+    github-token: ${{ secrets.GH_TOKEN }}
   bash: true
   edit:
 
 safe-outputs:
+  github-token: ${{ secrets.GH_TOKEN }}
   create-pull-request:
     target-repo: nikwebr/react-native-s3-bg-uploader-docs
     base-branch: master
@@ -64,7 +66,6 @@ safe-outputs:
     max: 1
     auto-close-issue: false
     allowed-files: [content/**, lib/version.ts]
-    github-token: ${{ secrets.GH_TOKEN }}
     signed-commits: true
   threat-detection:
     engine: false
