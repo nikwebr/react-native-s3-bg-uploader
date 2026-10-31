@@ -27,6 +27,9 @@ jobs:
       - name: Install dependencies (bun)
         working-directory: .
         run: bun install
+      - name: Test 100%-to-completion deadline boundaries
+        working-directory: .
+        run: bun test example/e2e/completionTiming.test.mts
 
       - uses: actions/setup-python@v6
         with:

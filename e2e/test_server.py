@@ -86,7 +86,26 @@ class BackendTests(unittest.TestCase):
         self.backend.verify("plain")
         self.upload("encrypted", encrypted_fixture(self.scheme))
         self.backend.verify("encrypted")
+        with self.assertRaisesRegex(AssertionError, "Missing 100%-to-completion"):
+            self.backend.report(final=True)
+        for mode in ("plain", "encrypted"):
+            self.backend.control("/completion-timing", {"mode": mode, "completedAfterMs": 20000})
         self.backend.report(final=True)
+
+    def test_completion_timing_rejects_missing_late_and_invalid_evidence(self):
+        self.backend.start({"mode": "plain"})
+        upload = self.backend.upload("plain")
+        with self.assertRaisesRegex(AssertionError, "requires a completed upload"):
+            self.backend.control("/completion-timing", {"mode": "plain", "completedAfterMs": 0})
+        upload.completed = True
+        for elapsed in (None, -1, 20001, float("nan"), float("inf"), True, "100"):
+            with self.subTest(elapsed=elapsed):
+                with self.assertRaisesRegex(AssertionError, "within 20 seconds"):
+                    self.backend.control("/completion-timing", {
+                        "mode": "plain", "completedAfterMs": elapsed,
+                    })
+        self.backend.control("/completion-timing", {"mode": "plain", "completedAfterMs": 20000})
+        self.assertEqual(self.backend.report()["plain"]["completedAfter100PercentMs"], 20000)
 
     def test_gate_blocks_parts_until_pause(self):
         started = self.backend.start({"mode": "plain"})

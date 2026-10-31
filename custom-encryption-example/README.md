@@ -360,6 +360,8 @@ the same multipart upload without re-uploading the completed first part. The loc
 S3-compatible backend downloads the stored objects over HTTP. Plaintext must
 match the original bytes; ciphertext must decrypt byte-for-byte with the right
 key and reject the wrong key.
+Both modes must also report `COMPLETED` within 20 seconds of their first 100%
+progress callback, with the elapsed time retained in the verification artifacts.
 
 Custom ciphertext is checked by `tools/decrypt` with **`--scheme aesgcm`**, never
 auto-detection: falling back to the built-in XChaCha encryptor fails the test.

@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Button, Platform, ScrollView, StyleSheet, Text, TextInput } from 'react-native';
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
 import type { UploadProgress } from '../../src/specs/s3-bg-uploader.types';
+import { CompletionTiming, COMPLETION_TIMEOUT_MS } from './completionTiming';
 
 // Public, deterministic test material only. Never used by the normal example.
 const KEY = '0123456789abcdef'.repeat(4);
@@ -28,15 +29,40 @@ export default function TestApp({ initializeEncryptor }: {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<UploadProgress>();
+  const [completionAfterMs, setCompletionAfterMs] = useState<number>();
   const current = useRef<{ hash: string; mode: string } | undefined>(undefined);
+  const completionTiming = useRef(new CompletionTiming());
+  const completionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => {
     S3BgUploader.setConfig(`${BACKEND}/start`, `${BACKEND}/urls`, `${BACKEND}/complete`);
     S3BgUploader.setProgressCallback(file => {
+      if (file.fileHash !== current.current?.hash || file.transferId !== current.current?.mode) return;
       setProgress({ ...file });
       if (file.state === 'FAILED') setError(`Upload failed: ${file.fileName}`);
+      const timing = completionTiming.current;
+      try {
+        timing.observe(file, performance.now());
+        if (timing.completedAfterMs !== undefined) {
+          clearTimeout(completionTimer.current);
+          setCompletionAfterMs(timing.assertComplete());
+        } else if (timing.reached100At !== undefined && completionTimer.current === undefined) {
+          completionTimer.current = setTimeout(() => {
+            try {
+              timing.assertComplete();
+            } catch (e: unknown) {
+              setError(e instanceof Error ? e.message : String(e));
+            }
+          }, Math.max(0, COMPLETION_TIMEOUT_MS - (performance.now() - timing.reached100At)) + 1);
+        }
+      } catch (e: unknown) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     });
-    return () => S3BgUploader.setProgressCallback(null);
+    return () => {
+      clearTimeout(completionTimer.current);
+      S3BgUploader.setProgressCallback(null);
+    };
   }, []);
 
   const run = async (operation: () => Promise<void>) => {
@@ -52,6 +78,11 @@ export default function TestApp({ initializeEncryptor }: {
   };
 
   const prepare = async (mode: 'plain' | 'encrypted') => {
+    clearTimeout(completionTimer.current);
+    completionTimer.current = undefined;
+    completionTiming.current = new CompletionTiming();
+    current.current = undefined;
+    setCompletionAfterMs(undefined);
     await initializeEncryptor?.();
     S3BgUploader.cancel();
     // A query also fences the worker's asynchronous cancel() on web.
@@ -124,6 +155,10 @@ export default function TestApp({ initializeEncryptor }: {
     if (progress?.state !== 'COMPLETED' || progress.fileHash !== current.current?.hash) {
       throw new Error('Upload is not complete');
     }
+    await api('/completion-timing', {
+      mode: current.current?.mode,
+      completedAfterMs: completionTiming.current.assertComplete(),
+    });
     await api('/verify', { mode: current.current?.mode });
     setStatus(current.current?.mode === 'encrypted'
       ? 'Encrypted download verified; correct key decrypts; wrong key rejected'
@@ -157,6 +192,9 @@ export default function TestApp({ initializeEncryptor }: {
       <Text>{progress?.state === 'COMPLETED'
         ? 'Upload completed'
         : `Completed parts: ${progress?.completedParts ?? 0}`}</Text>
+      {completionAfterMs !== undefined && (
+        <Text>Completion within 20 seconds verified</Text>
+      )}
       {busy && <Text>Working</Text>}
       {!!error && <Text accessibilityRole="alert">E2E error: {error}</Text>}
     </ScrollView>

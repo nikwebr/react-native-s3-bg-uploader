@@ -42,6 +42,7 @@ class Upload:
     resumed: bool = False
     completed: bool = False
     verified: bool = False
+    completed_after_ms: float | None = None
 
 
 class Backend:
@@ -130,6 +131,12 @@ class Backend:
             upload.resumed = True
         elif path == "/verify":
             self.verify(body["mode"])
+        elif path == "/completion-timing":
+            elapsed = body.get("completedAfterMs")
+            require(upload.completed, "Timing evidence requires a completed upload")
+            require(type(elapsed) in (int, float) and 0 <= elapsed <= 20000,
+                    "Missing or invalid completion timing: must be within 20 seconds of 100%")
+            upload.completed_after_ms = elapsed
         else:
             raise ValueError(f"Unknown control endpoint {path}")
         return {}
@@ -189,6 +196,7 @@ class Backend:
             "scheme": self.scheme if mode == "encrypted" else "plain",
             "paused": upload.paused, "resumed": upload.resumed,
             "completed": upload.completed, "verified": upload.verified,
+            "completedAfter100PercentMs": upload.completed_after_ms,
             "partUrlRequests": dict(upload.requested),
             "partPutRequests": dict(upload.put_requests),
         } for mode, upload in self.uploads.items()}
@@ -197,6 +205,8 @@ class Backend:
             require(set(report) == {"plain", "encrypted"}, "Both upload modes must run")
             require(all(u["verified"] and u["paused"] and u["resumed"] and u["completed"]
                         for u in report.values()), "Missing upload/download/pause/resume evidence")
+            require(all(u["completedAfter100PercentMs"] is not None for u in report.values()),
+                    "Missing 100%-to-completion timing evidence")
         return report
 
 

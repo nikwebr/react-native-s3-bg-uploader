@@ -265,6 +265,10 @@ first chunk, and downloads both
 objects. The independent Python oracle checks exact plaintext bytes, ciphertext
 size and absence of plaintext, correct-key decryption back to the original
 bytes, and rejection of a wrong key.
+Both upload modes must report `COMPLETED` within **20 seconds of the first
+100% progress callback**. The shared test uses a monotonic clock and a watchdog;
+later progress drops do not reset the deadline. The elapsed time is saved as
+`completedAfter100PercentMs` in the verification artifacts.
 
 Tests use a local Moto S3-compatible HTTP server and synthetic 31 MiB fixtures;
 no AWS credentials, external demo bucket, or Maestro Cloud subscription are
@@ -308,6 +312,10 @@ untouched.
 The iOS workflow allows up to ten minutes for Maestro's XCTest driver to start
 on a cold hosted simulator (`MAESTRO_DRIVER_STARTUP_TIMEOUT=600000`, in
 milliseconds). This does not increase flow or upload assertion timeouts.
+Before launching either iOS example, the runner requests its test bundle from
+Metro with a separate ten-minute preparation limit. This keeps cold JavaScript
+bundling outside the screen-readiness wait; failures stop the run explicitly.
+Preparation timing is retained in `metro-warmup.log`.
 
 The same workflows also test `custom-encryption-example` with both plaintext and
 custom AES-256-GCM uploads. Add `custom` as the runner's second argument

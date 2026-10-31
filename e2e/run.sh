@@ -134,6 +134,13 @@ XML
     mkdir -p "$container/Documents"
     cp "$artifacts/fixture.bin" "$container/Documents/fixture.bin"
     fixture_path="$container/Documents/fixture.bin"
+    # /status only checks the server; prepare the cold bundle before the UI wait.
+    echo "Preparing iOS test bundle before launching Maestro"
+    curl --fail --silent --show-error --connect-timeout 10 --max-time 600 \
+      --get --data-urlencode "app=$app_id" --output /dev/null \
+      --write-out 'Metro bundle HTTP %{http_code}; preparation took %{time_total} seconds\n' \
+      'http://127.0.0.1:8080/index.bundle?platform=ios&dev=true&lazy=true&minify=false&inlineSourceMap=false&modulesOnly=false&runModule=true&excludeSource=true&sourcePaths=url-server' \
+      > "$artifacts/metro-warmup.log"
   fi
 fi
 "${maestro_args[@]}" \
