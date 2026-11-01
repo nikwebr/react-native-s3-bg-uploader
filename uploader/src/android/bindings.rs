@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use jni::objects::{GlobalRef, JClass, JString, JValue};
-use jni::sys::{jint, jlong, jstring};
+use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
 
 use crate::android::progress as androidProgress;
@@ -137,6 +137,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetConfig(
     start_upload_api: JString,
     get_upload_urls_api: JString,
     complete_api: JString,
+    send_file_hash: jboolean,
 ) {
     ensure_store();
     let s: String = env
@@ -151,7 +152,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetConfig(
         .get_string(&complete_api)
         .map(|s| s.into())
         .unwrap_or_default();
-    crate::core::config::set_config(&s, &g, &c);
+    crate::core::config::set_config(&s, &g, &c, send_file_hash != 0);
 }
 
 #[no_mangle]

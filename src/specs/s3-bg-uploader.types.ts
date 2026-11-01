@@ -28,10 +28,16 @@ export interface UploadProgress {
   fileKey?: string
   /** original file name */
   fileName: string
-  /** hash of the file */
+  /** hash of the **unencrypted** file content (also used for resume/dedup) */
   fileHash: string
   transferId: string
+  /**
+   * Size of the uploaded object in bytes. For encrypted uploads this is the
+   * ciphertext size (plaintext + the scheme's per-part overhead + its descriptor),
+   * not the size of the local file.
+   */
   totalBytes: number
+  /** Bytes of the uploaded object already stored (ciphertext for encrypted uploads). */
   uploadedBytes: number
   /** Count of completed part uploads for this file */
   completedParts: number
@@ -87,8 +93,13 @@ interface BaseUploaderAPI {
    * Set the backend http endpoints.
    * The endpoints must accept and return the data documented [here](https://uploader.ysendit.com/docs/backend)
    * Must be called before calling `resume()`.
+   *
+   * @param sendFileHash  Whether `fileHash` is included in the `startUpload()` request body.
+   *   Defaults to `true`. The hash is always computed locally (over the **unencrypted**
+   *   file) for deduplication and resume detection, so disabling it only changes what the
+   *   backend receives. Useful when the backend must not learn a content hash.
    */
-  setConfig(startUploadApi: string, getUploadUrlsApi: string, completeApi: string): void
+  setConfig(startUploadApi: string, getUploadUrlsApi: string, completeApi: string, sendFileHash?: boolean): void
 
   /**
    * Set a callback that receives progress events.

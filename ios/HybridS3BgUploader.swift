@@ -134,11 +134,11 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     // Config
     // -------------------------------------------------------------------------
 
-    func setConfig(startUploadApi: String, getUploadUrlsApi: String, completeApi: String) throws {
+    func setConfig(startUploadApi: String, getUploadUrlsApi: String, completeApi: String, sendFileHash: Bool?) throws {
         startUploadApi.withCString { startPtr in
             getUploadUrlsApi.withCString { getUrlsPtr in
                 completeApi.withCString { completePtr in
-                    set_config(startPtr, getUrlsPtr, completePtr)
+                    set_config(startPtr, getUrlsPtr, completePtr, sendFileHash ?? true)
                 }
             }
         }

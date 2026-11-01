@@ -51,6 +51,8 @@ class Upload:
     completed: bool = False
     verified: bool = False
     completed_after_ms: float | None = None
+    # Size derived from the startUpload declaration (or the scheme default).
+    declared_size: int = 0
 
 
 class Backend:
@@ -83,11 +85,52 @@ class Backend:
     def start(self, body):
         mode = body["mode"]
         require(mode in ("plain", "encrypted"), "Unknown encryption mode")
+        # Default expectations for callers that start an upload without a startUpload
+        # body (the contract tests in e2e/test_server.py).
+        effective_size = PART_SIZE - 16 - 28
+        part_count = (len(FIXTURE) + effective_size - 1) // effective_size
+        declared_size = len(FIXTURE)
+        if mode == "encrypted":
+            declared_size += part_count * 16 + 28
+        if "fileSize" in body:
+            # The uploader always reports the local, unencrypted size. For an
+            # encrypted upload the body also carries the encryptor's format numbers,
+            # so the backend derives the stored (ciphertext) size from its own part
+            # size — the client never has to guess it.
+            require(
+                body["fileSize"] == len(FIXTURE),
+                f"startUpload fileSize {body['fileSize']} is not the plaintext size "
+                f"{len(FIXTURE)} for {mode} mode",
+            )
+            encryption = body.get("encryption")
+            if mode == "plain":
+                require(encryption is None, "Plain upload declared encryption parameters")
+            else:
+                require(isinstance(encryption, dict),
+                        "Encrypted upload must declare encryption parameters")
+                overhead = encryption.get("overhead")
+                has_footer = encryption.get("hasFooter")
+                footer_len = encryption.get("footerLen")
+                # Both the built-in cipher and the custom AES-GCM example add a
+                # 16-byte tag per part and a 28-byte descriptor in the final part.
+                require((overhead, has_footer, footer_len) == (16, True, 28),
+                        f"Unexpected encryption parameters: {encryption}")
+                # The rule from the README: tag and descriptor are reserved in every
+                # part, so the plaintext slot is partSize - reserved.
+                reserved = overhead + (footer_len if has_footer else 0)
+                effective_size = PART_SIZE - reserved
+                require(effective_size > 0, "PART_SIZE cannot hold the declared format")
+                part_count = max(1 if has_footer else 0,
+                                 (len(FIXTURE) + effective_size - 1) // effective_size)
+                declared_size = len(FIXTURE) + overhead * part_count
+                if has_footer:
+                    declared_size += footer_len
         with self.lock:
             require(mode not in self.uploads, "Resume created a second multipart upload")
             key = f"{mode}/fixture.bin"
             result = self.s3.create_multipart_upload(Bucket=BUCKET, Key=key)
             upload = Upload(key, result["UploadId"])
+            upload.declared_size = declared_size
             self.uploads[mode] = upload
         return {"key": key, "uploadId": upload.upload_id, "partSize": PART_SIZE}
 
@@ -180,10 +223,11 @@ class Backend:
         else:
             require(downloaded != FIXTURE, "Encrypted upload is plaintext")
             require(FIXTURE[:128] not in downloaded, "Plaintext prefix leaked into ciphertext")
-            effective_size = PART_SIZE - 16 - 28
-            part_count = (len(FIXTURE) + effective_size - 1) // effective_size
-            require(len(downloaded) == len(FIXTURE) + part_count * 16 + 28,
-                    "Wrong ciphertext wire size")
+            # The stored size must match what this backend derived from the
+            # startUpload declaration, without the client predicting it.
+            require(len(downloaded) == upload.declared_size,
+                    f"Stored ciphertext is {len(downloaded)} bytes, derived "
+                    f"{upload.declared_size} from the startUpload declaration")
             output_path = self.artifacts / "encrypted.decrypted"
             result = subprocess.run(self.decrypt_command(KEY, input_path, output_path),
                                     capture_output=True, text=True)

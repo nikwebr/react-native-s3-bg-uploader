@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::core::api::{ApiClient, StartUploadResponse};
+use crate::core::api::{ApiClient, EncryptionInfo, StartUploadResponse};
 use crate::core::encryption::ArcEncryptor;
 use crate::core::session::{self, UploadState};
 use crate::core::ChunkUploadResult;
@@ -44,7 +44,97 @@ pub struct PreparedUpload {
     /// Data parts only — a descriptor, when the scheme has one, rides inside the last
 /// data part. Drives `remaining_parts`.
     pub remaining_parts: Vec<u32>,
+    /// Bytes already in S3 for completed parts — ciphertext bytes (each part's
+    /// plaintext length plus the encryptor's overhead and, for the final part,
+    /// the descriptor). This is what progress callbacks report.
     pub committed_bytes: u64,
+    /// Exact size of the uploaded object in bytes (ciphertext size for encrypted
+    /// uploads). Progress percentages are relative to this value.
+    pub total_ciphertext_bytes: u64,
+}
+
+/// Exact wire layout of one object, derived from the part size the backend chose.
+#[derive(Debug, Clone, Copy)]
+pub struct CiphertextLayout {
+    /// Plaintext bytes the engine reads per part.
+    pub part_size: u64,
+    /// Data parts; a descriptor, when present, rides inside the last one.
+    pub data_parts: u32,
+    /// Exact size of the uploaded object.
+    pub total_bytes: u64,
+    pub overhead: u64,
+    pub has_footer: bool,
+    pub footer_len: u64,
+}
+
+impl CiphertextLayout {
+    /// Ciphertext bytes a single part occupies on the wire.
+    pub fn part_len(&self, part_number: u32, plaintext_bytes: u64) -> u64 {
+        let plain = part_size_for(part_number, self.part_size, plaintext_bytes);
+        let footer = if self.has_footer && part_number == self.data_parts {
+            self.footer_len
+        } else {
+            0
+        };
+        plain + self.overhead + footer
+    }
+
+    /// Ciphertext bytes of all already-completed parts.
+    pub fn committed_bytes(&self, done_parts: &HashSet<u32>, plaintext_bytes: u64) -> u64 {
+        done_parts
+            .iter()
+            .filter(|&&p| p >= 1 && p <= self.data_parts)
+            .map(|&p| self.part_len(p, plaintext_bytes))
+            .sum()
+    }
+}
+
+/// Format numbers of the encryptor that will actually encrypt a file's chunks.
+///
+/// These are needed before the backend has chosen a part size (to predict the
+/// callback size) and when the file is registered. Keeping them explicit lets the
+/// web build pass the numbers of a registered JavaScript encryptor instead of the
+/// built-in cipher's.
+#[derive(Debug, Clone, Copy)]
+pub struct CipherParams {
+    pub overhead: u64,
+    pub has_footer: bool,
+    pub footer_len: u64,
+}
+
+impl CipherParams {
+    pub fn of(enc: &dyn crate::core::encryption::ChunkEncryptor) -> Self {
+        Self {
+            overhead: enc.ciphertext_overhead() as u64,
+            has_footer: enc.has_footer(),
+            footer_len: enc.footer_len() as u64,
+        }
+    }
+
+    pub fn of_config(config: Option<&ArcEncryptor>) -> Option<Self> {
+        config.map(|c| Self::of(c.as_ref()))
+    }
+
+    pub fn layout(self, plaintext_bytes: u64, server_part_size: u64) -> Option<CiphertextLayout> {
+        ciphertext_layout(
+            plaintext_bytes,
+            server_part_size,
+            self.overhead,
+            self.has_footer,
+            self.footer_len,
+        )
+    }
+}
+
+/// The wire description sent to `startUpload` for an encrypted upload.
+impl From<CipherParams> for EncryptionInfo {
+    fn from(params: CipherParams) -> Self {
+        Self {
+            overhead: params.overhead,
+            has_footer: params.has_footer,
+            footer_len: params.footer_len,
+        }
+    }
 }
 
 pub fn start_decision(file_hash: &str) -> StartDecision {
@@ -68,6 +158,7 @@ pub async fn start_and_register<A: ApiClient>(
     file_size: u64,
     user_params: HashMap<String, String>,
     encryption_config: Option<ArcEncryptor>,
+    cipher_params: Option<CipherParams>,
     api: &A,
 ) -> Result<StartResult, String> {
     match start_decision(&file_hash) {
@@ -79,8 +170,19 @@ pub async fn start_and_register<A: ApiClient>(
             Ok(StartResult::Resumed(file_key))
         }
         StartDecision::StartNew => {
+            let params =
+                cipher_params.or_else(|| CipherParams::of_config(encryption_config.as_ref()));
+            // `fileSize` is always the plaintext size of the local file; the
+            // encryption details let the backend derive the ciphertext size it will
+            // actually store, using the part size it returns for this upload.
             let start_resp = api
-                .start_upload(&file_name, &file_hash, file_size, &user_params)
+                .start_upload(
+                    &file_name,
+                    &file_hash,
+                    file_size,
+                    params.map(EncryptionInfo::from),
+                    &user_params,
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             let file_key = register_started_upload(
@@ -91,12 +193,70 @@ pub async fn start_and_register<A: ApiClient>(
                 file_size,
                 user_params,
                 encryption_config,
+                params,
                 start_resp,
             );
             session::persist_session();
             Ok(StartResult::Started(file_key))
         }
     }
+}
+
+/// S3's minimum size for every part except the last.
+pub const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// Predicted ciphertext size for the smallest legal plaintext part size.
+///
+/// Used only for local progress before the backend has returned its part size
+/// (pending files). The `startUpload` body sends the plaintext size plus the
+/// encryption details instead, so the backend computes the stored size itself.
+///
+/// An intermediate ciphertext part is `part_size + overhead` bytes and S3 requires
+/// at least [`S3_MIN_PART_SIZE`], so the smallest legal plaintext part size is
+/// `S3_MIN_PART_SIZE - overhead`.
+pub fn predicted_ciphertext_bytes(
+    plaintext_bytes: u64,
+    overhead: u64,
+    has_footer: bool,
+    footer_len: u64,
+) -> u64 {
+    let min_part_size = S3_MIN_PART_SIZE.saturating_sub(overhead).max(1);
+    let mut data_parts = total_parts(plaintext_bytes, min_part_size);
+    if has_footer && data_parts == 0 {
+        data_parts = 1;
+    }
+    plaintext_bytes
+        + overhead.saturating_mul(data_parts as u64)
+        + if has_footer { footer_len } else { 0 }
+}
+
+/// Exact wire layout for the part size the backend returned.
+///
+/// `None` when that part size cannot hold the encryptor's per-part reservation.
+pub fn ciphertext_layout(
+    plaintext_bytes: u64,
+    server_part_size: u64,
+    overhead: u64,
+    has_footer: bool,
+    footer_len: u64,
+) -> Option<CiphertextLayout> {
+    let part_size = effective_part_size(server_part_size, overhead, has_footer, footer_len)?;
+    let mut data_parts = total_parts(plaintext_bytes, part_size);
+    // An empty file still needs one part to carry the descriptor.
+    if has_footer && data_parts == 0 {
+        data_parts = 1;
+    }
+    let total_bytes = plaintext_bytes
+        + overhead.saturating_mul(data_parts as u64)
+        + if has_footer { footer_len } else { 0 };
+    Some(CiphertextLayout {
+        part_size,
+        data_parts,
+        total_bytes,
+        overhead,
+        has_footer,
+        footer_len,
+    })
 }
 
 pub fn register_started_upload(
@@ -107,10 +267,19 @@ pub fn register_started_upload(
     file_size: u64,
     user_params: HashMap<String, String>,
     encryption_config: Option<ArcEncryptor>,
+    cipher_params: Option<CipherParams>,
     start_resp: StartUploadResponse,
 ) -> String {
     let file_key = start_resp.key.clone();
-    let total_parts = total_parts(file_size, start_resp.part_size);
+    let params = cipher_params.or_else(|| CipherParams::of_config(encryption_config.as_ref()));
+    let layout = params.and_then(|p| p.layout(file_size, start_resp.part_size));
+    let data_parts = layout
+        .map(|l| l.data_parts)
+        .unwrap_or_else(|| total_parts(file_size, start_resp.part_size));
+    // Progress and the persisted session track the size of the object in S3, so an
+    // encrypted file reports its ciphertext size while `plaintext_bytes` keeps the
+    // size of the local file (used to read chunks).
+    let wire_size = layout.map(|l| l.total_bytes).unwrap_or(file_size);
 
     // Publish the entry, upload metadata and encryption state under one lock.
     let mut sess = session::session();
@@ -120,14 +289,15 @@ pub fn register_started_upload(
         transfer_id.to_string(),
         file_path,
         file_name,
-        file_size,
+        wire_size,
         user_params,
     );
+    sess.set_file_sizes(&file_key, wire_size, file_size);
     sess.set_upload_info(
         &file_key,
         start_resp.upload_id,
         start_resp.part_size,
-        total_parts,
+        data_parts,
     );
     if let Some(config) = encryption_config {
         sess.update_encryption_config(&file_key, config);
@@ -165,19 +335,21 @@ pub fn prepare_upload(
     // uploaded ciphertext fits the presigned-URL slot. The descriptor is reserved
     // in every part as well, since it rides inside the last one.
     let reserved = ciphertext_overhead + if has_footer { footer_len } else { 0 };
-    let effective_part_size = effective_part_size(server_part_size, ciphertext_overhead, has_footer, footer_len)
-        .ok_or_else(|| {
-            format!(
-                "part_size {} is too small for the active encryptor (overhead={}, \
-                 has_footer={}, footer_len={} -> reserved={} bytes)",
-                server_part_size, ciphertext_overhead, has_footer, footer_len, reserved
-            )
-        })?;
-    let mut total_data_parts = total_parts(total_bytes, effective_part_size);
-    // An empty file still needs one part to carry the descriptor.
-    if has_footer && total_data_parts == 0 {
-        total_data_parts = 1;
-    }
+    let layout = ciphertext_layout(
+        total_bytes,
+        server_part_size,
+        ciphertext_overhead,
+        has_footer,
+        footer_len,
+    )
+    .ok_or_else(|| {
+        format!(
+            "part_size {} is too small for the active encryptor (overhead={}, \
+             has_footer={}, footer_len={} -> reserved={} bytes)",
+            server_part_size, ciphertext_overhead, has_footer, footer_len, reserved
+        )
+    })?;
+    let total_data_parts = layout.data_parts;
 
     let completed_etags = entry.completed_chunk_etags;
     let done_parts: HashSet<u32> = completed_etags.iter().map(|(p, _)| *p).collect();
@@ -188,22 +360,20 @@ pub fn prepare_upload(
         .filter(|p| !done_parts.contains(p))
         .collect();
 
-    // Committed bytes: only data parts, not the footer.
-    let committed_bytes = done_parts
-        .iter()
-        .filter(|&&p| p <= total_data_parts)
-        .map(|&p| part_size_for(p, effective_part_size, total_bytes))
-        .sum();
+    // Committed bytes are ciphertext bytes (data part plaintext plus the tag and,
+    // for the final part, the descriptor) so progress matches what S3 received.
+    let committed_bytes = layout.committed_bytes(&done_parts, total_bytes);
 
     Ok(PreparedUpload {
         transfer_id: entry.transfer_id,
         upload_id,
-        part_size: effective_part_size,
+        part_size: layout.part_size,
         total_parts: total_data_parts,
         completed_etags,
         done_parts,
         remaining_parts,
         committed_bytes,
+        total_ciphertext_bytes: layout.total_bytes,
     })
 }
 
@@ -313,6 +483,7 @@ mod tests {
                 2500,
                 HashMap::new(),
                 Some(config.clone()),
+                None,
                 StartUploadResponse {
                     key: key.clone(),
                     upload_id: "upload-id".into(),
@@ -331,14 +502,24 @@ mod tests {
                 Some(&config),
             )
             .unwrap();
-            session::session().cancel_file(&key);
 
             let expected_part_size = if has_footer { 996 } else { 1016 };
             assert_eq!(prepared.part_size, expected_part_size);
             assert_eq!(prepared.total_parts, 3);
             assert_eq!(prepared.remaining_parts, vec![2, 3]);
             assert_eq!(prepared.completed_etags, vec![(1, "etag".into())]);
-            assert_eq!(prepared.committed_bytes, expected_part_size);
+            // Part 1 is a data part (not the last), so it carries the tag but no footer.
+            assert_eq!(prepared.committed_bytes, expected_part_size + 8);
+            assert_eq!(
+                prepared.total_ciphertext_bytes,
+                2500 + 8 * 3 + if has_footer { 20 } else { 0 }
+            );
+            assert_eq!(
+                session::session().files[&key].total_bytes,
+                prepared.total_ciphertext_bytes
+            );
+            assert_eq!(session::session().files[&key].plaintext_bytes, 2500);
+            session::session().cancel_file(&key);
 
             for part in 1..=prepared.total_parts {
                 let plain_len = part_size_for(part, prepared.part_size, 2500) as usize;
@@ -375,6 +556,7 @@ mod tests {
                 2500,
                 HashMap::new(),
                 config.clone(),
+                None,
                 StartUploadResponse {
                     key: key.clone(),
                     upload_id: "upload-id".into(),
@@ -446,9 +628,111 @@ mod tests {
             assert_eq!(prepared.total_parts, 2);
             assert_eq!(prepared.remaining_parts, vec![2]);
             assert_eq!(prepared.completed_etags, vec![(1, "etag".into())]);
-            assert_eq!(prepared.committed_bytes, prepared.part_size);
+            let committed = if encrypted {
+                prepared.part_size + 16 // ciphertext of part 1 (tag, no footer)
+            } else {
+                prepared.part_size
+            };
+            assert_eq!(prepared.committed_bytes, committed);
+            assert_eq!(
+                prepared.total_ciphertext_bytes,
+                if encrypted { 1500 + 32 + 28 } else { 1500 }
+            );
             session::session().files.remove(&key);
         }
+    }
+
+    #[test]
+    fn start_upload_body_lets_the_backend_compute_the_stored_size() {
+        let config: ArcEncryptor = std::sync::Arc::new(encryptor());
+        let params = CipherParams::of_config(Some(&config)).unwrap();
+
+        for plaintext in [0u64, 31 * 1024 * 1024 + 123] {
+            let body = crate::core::api::start_upload_body(
+                "f.bin",
+                "hash",
+                plaintext,
+                false,
+                Some(params.into()),
+                &HashMap::new(),
+            )
+            .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+            // `fileSize` is the unencrypted size, always.
+            assert_eq!(json["fileSize"].as_u64().unwrap(), plaintext);
+            let overhead = json["encryption"]["overhead"].as_u64().unwrap();
+            let has_footer = json["encryption"]["hasFooter"].as_bool().unwrap();
+            let footer_len = json["encryption"]["footerLen"].as_u64().unwrap();
+
+            // The backend knows the part size it will return, so these numbers are
+            // enough for it to derive the exact stored (ciphertext) size.
+            for server_part_size in [5 * 1024 * 1024 + 28, 32 * 1024 * 1024, 1024 * 1024] {
+                let reserved = overhead + if has_footer { footer_len } else { 0 };
+                let effective = server_part_size - reserved;
+                let mut parts = total_parts(plaintext, effective);
+                if has_footer && parts == 0 {
+                    parts = 1;
+                }
+                let backend_total =
+                    plaintext + overhead * parts as u64 + if has_footer { footer_len } else { 0 };
+                let layout = ciphertext_layout(
+                    plaintext,
+                    server_part_size,
+                    overhead,
+                    has_footer,
+                    footer_len,
+                )
+                .unwrap();
+                assert_eq!(
+                    backend_total, layout.total_bytes,
+                    "backend derivation diverges for part size {server_part_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_layout_matches_every_uploaded_part() {
+        let enc = encryptor();
+        let config: ArcEncryptor = std::sync::Arc::new(enc);
+        let plaintext = 12_345_678u64;
+        let server_part_size = 4 * 1024 * 1024;
+        let layout = ciphertext_layout(
+            plaintext,
+            server_part_size,
+            config.ciphertext_overhead() as u64,
+            config.has_footer(),
+            config.footer_len() as u64,
+        )
+        .unwrap();
+
+        let mut uploaded = 0u64;
+        for part in 1..=layout.data_parts {
+            let plain_len = part_size_for(part, layout.part_size, plaintext) as usize;
+            uploaded += config.encrypt_chunk(&vec![0; plain_len], part).len() as u64;
+            uploaded += if layout.has_footer && part == layout.data_parts {
+                config
+                    .compute_footer(layout.data_parts, layout.part_size)
+                    .unwrap()
+                    .len() as u64
+            } else {
+                0
+            };
+        }
+        assert_eq!(uploaded, layout.total_bytes);
+
+        let done: HashSet<u32> = (1..=layout.data_parts).collect();
+        assert_eq!(layout.committed_bytes(&done, plaintext), layout.total_bytes);
+    }
+
+    #[test]
+    fn empty_encrypted_file_has_a_descriptor_only_part() {
+        let enc = encryptor();
+        let layout = ciphertext_layout(0, 1024, 16, true, 28).unwrap();
+        assert_eq!(layout.data_parts, 1);
+        assert_eq!(layout.total_bytes, 16 + 28);
+        assert_eq!(layout.part_len(1, 0), 16 + 28);
     }
 
     /// The layout that broke real uploads against S3: a 36.6 MB file at the server's

@@ -25,6 +25,7 @@ pub extern "C" fn set_config(
     start_upload_api: *const c_char,
     get_upload_urls_api: *const c_char,
     complete_api: *const c_char,
+    send_file_hash: bool,
 ) {
     ensure_store();
     let s = unsafe { CStr::from_ptr(start_upload_api) }
@@ -36,7 +37,7 @@ pub extern "C" fn set_config(
     let c = unsafe { CStr::from_ptr(complete_api) }
         .to_str()
         .unwrap_or("");
-    crate::core::config::set_config(s, g, c);
+    crate::core::config::set_config(s, g, c, send_file_hash);
 }
 
 #[no_mangle]

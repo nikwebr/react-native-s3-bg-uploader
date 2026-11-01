@@ -22,8 +22,8 @@ export type {
 
 
 export const S3BgUploader: S3BgUploaderAPI = {
-  setConfig(startUploadApi, getUploadUrlsApi, completeApi) {
-    Native.setConfig(startUploadApi, getUploadUrlsApi, completeApi)
+  setConfig(startUploadApi, getUploadUrlsApi, completeApi, sendFileHash) {
+    Native.setConfig(startUploadApi, getUploadUrlsApi, completeApi, sendFileHash)
   },
 
   setProgressCallback(callback: ProgressCallback | null) {
