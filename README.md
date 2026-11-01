@@ -154,12 +154,15 @@ below).
 uploaded object, and `percentage` relative to it. For encrypted uploads that is
 the real ciphertext size, so a paused or resumed upload reports the same totals
 as a completed one.
-- `uploadedBytes` counts only parts the backend has acknowledged with an ETag, so
-`percentage` reaches `100` only once every part is stored (the `COMPLETED` state
-follows immediately). A part whose body reached the server but whose response
-was lost has no ETag yet and is retried; its bytes are not counted, which means a
-dropped connection can neither show `100%` early nor make the bar drop when it
-reconnects. A paused snapshot also reports committed parts only.
+- `percentage` follows the part that is on the wire: `uploadedBytes` includes the bytes
+of the part currently being sent, so the bar moves during a part upload instead of
+jumping from part boundary to part boundary. `100` is reported only together with the
+`COMPLETED` state, because those in-flight bytes are not stored yet — a connection that
+dies after the last byte left the device still fails that part. The uploader then
+re-sends it, and only the bytes actually re-sent are counted again, so the bar drops
+back to the acknowledged parts and climbs with the retry instead of claiming to be
+finished. A paused snapshot reports acknowledged parts only, and a resumed upload
+continues from them.
 
 The `encryption` object looks like this:
 
@@ -322,19 +325,21 @@ first chunk, and downloads both
 objects. The independent Python oracle checks exact plaintext bytes, ciphertext
 size and absence of plaintext, correct-key decryption back to the original
 bytes, and rejection of a wrong key.
-Both upload modes must report `COMPLETED` within **20 seconds of the first
-100% progress callback**. The shared test uses a monotonic clock and a watchdog;
-later progress drops do not reset the deadline. The elapsed time is saved as
-`completedAfter100PercentMs` in the verification artifacts.
-`100%` means every part has been acknowledged by the backend, so the same run
-also checks the contract that produced the bug report: after the pause it drops
-one presigned part `PUT` **after the whole body arrived** (a link that dies before
-the response), which the uploader has to retry. The test app records every
-progress callback, and the backend rejects the run if a running upload ever
-reported fewer bytes than an earlier callback (`progressRegressions`, including
-across the pause and resume) or reported `100%` while parts were still
-unacknowledged (`prematureHundreds`). It also requires evidence that the dropped
-part was retried (`networkErrorRetried`), so a silent fallback cannot pass.
+Both upload modes must report `COMPLETED` within **20 seconds of the first progress
+callback of the resumed run that reported every byte of the file** (the moment the bar
+is maxed out after reconnecting). The shared test uses a monotonic clock and a watchdog;
+later progress changes do not reset the deadline. The elapsed time is saved as `completedAfter100PercentMs` in the
+verification artifacts.
+`100%` is only reported together with `COMPLETED`, so the same run also checks the
+contract that produced the bug report: after the pause it drops one presigned
+part `PUT` **after the whole body arrived** (a link that dies before the
+response), which the uploader has to retry. The test app records every progress
+callback, and the backend rejects the run if `100%` was reported before `COMPLETED`
+(`prematureHundreds`), if the count of acknowledged parts ever went backwards
+(`committedRegressions`), if the resumed run reported less than the paused snapshot
+(`resumeRegressions`), or if the bar never moved while a part was being uploaded
+(`networkProgressReports`). It also requires evidence that the dropped part was
+retried (`networkErrorRetried`), so a silent fallback cannot pass.
 
 Tests use a local Moto S3-compatible HTTP server and synthetic 31 MiB fixtures;
 no AWS credentials, external demo bucket, or Maestro Cloud subscription are

@@ -44,18 +44,20 @@ export interface UploadProgress {
   /** Total count of parts for this file */
   totalParts: number
   /**
-   * Percentage for this individual file (0–100), based only on parts the backend has
-   * acknowledged. `100` therefore means every part is stored, and the `COMPLETED`
-   * state follows immediately. Bytes handed to the transport but not yet acknowledged
-   * are not counted: a dropped connection can still fail and retry that part, so
-   * counting it would show `100%` too early and then drop the bar again.
+   * Percentage for this individual file (0–100). While the file is running this includes
+   * the bytes of the part that is on the wire right now, so the bar moves during a part
+   * upload (network progress) and not only at part boundaries. `100` is reported only
+   * together with the `COMPLETED` state: a part can still fail after all of its bytes were
+   * sent, and that part is then re-sent — its bytes drop back to the acknowledged level
+   * and climb again with the retry, so a reported `100%` always means every part is
+   * stored.
    */
   percentage: number
   state: UploadState
 }
 
 export interface AggregateProgress {
-  /** Same committed-bytes rule as the per-file percentage. */
+  /** `100` only while the aggregate is `COMPLETED`; running aggregates stay just below. */
   percentage: number
   totalSize: number
   uploadedSize: number
