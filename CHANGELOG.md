@@ -1,3 +1,14 @@
+## [1.3.1](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.3.0...v1.3.1) (2026-11-01)
+
+### 🐛 Bug Fixes
+
+* **encryption:** let the backend derive the encrypted size ([cad2249](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/cad2249bc7aff4a3b324a567b01f3612ad3e50cc))
+* **encryption:** report ciphertext sizes for encrypted uploads ([139bc97](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/139bc97aab8be04764158cd3e7494fad69e4ea6e))
+
+### 📚 Documentation
+
+* **agents:** add commit-type and release rules for coding agents ([b2b9fce](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/b2b9fceb2c421416ca70141a90f7488cbd292b42))
+
 ## [1.3.0](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.2.0...v1.3.0) (2026-11-01)
 
 ### ✨ Features
