@@ -72,13 +72,25 @@ class BackendTests(unittest.TestCase):
         self.backend.control("/release", {"mode": mode})
         snapshot = {"completedParts": 1, "totalParts": len(chunks), "uploadedBytes": PART_SIZE}
         self.backend.control("/paused", {"mode": mode, "before": snapshot, "after": snapshot})
+        # The real flows drop the last pending part's PUT once, after its body arrived.
+        last = len(chunks)
+        self.backend.control("/fault", {"mode": mode, "part": last})
         self.backend.control("/resumed", {"mode": mode})
         parts = []
         for number, chunk in enumerate(chunks, 1):
+            if number == last:
+                with self.assertRaises(Exception):
+                    urlopen(Request(urls[str(number)], data=chunk, method="PUT"), timeout=10)
             with urlopen(Request(urls[str(number)], data=chunk, method="PUT"), timeout=10) as result:
                 parts.append({"PartNumber": number, "ETag": result.headers["ETag"]})
         self.backend.complete(f"/complete/{started['uploadId']}/{started['key']}", {"parts": parts})
         return started
+
+    def timing(self, mode, **evidence):
+        payload = {"mode": mode, "completedAfterMs": 0, "networkProgressReports": 12,
+                   "prematureHundreds": 0, "committedRegressions": 0, "resumeRegressions": 0}
+        payload.update(evidence)
+        return self.backend.control("/completion-timing", payload)
 
     def test_round_trip_and_final_evidence(self):
         chunks = [FIXTURE[start:start + PART_SIZE] for start in range(0, len(FIXTURE), PART_SIZE)]
@@ -89,23 +101,59 @@ class BackendTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "Missing 100%-to-completion"):
             self.backend.report(final=True)
         for mode in ("plain", "encrypted"):
-            self.backend.control("/completion-timing", {"mode": mode, "completedAfterMs": 20000})
+            self.timing(mode, completedAfterMs=20000)
         self.backend.report(final=True)
 
     def test_completion_timing_rejects_missing_late_and_invalid_evidence(self):
         self.backend.start({"mode": "plain"})
         upload = self.backend.upload("plain")
         with self.assertRaisesRegex(AssertionError, "requires a completed upload"):
-            self.backend.control("/completion-timing", {"mode": "plain", "completedAfterMs": 0})
+            self.timing("plain")
         upload.completed = True
         for elapsed in (None, -1, 20001, float("nan"), float("inf"), True, "100"):
             with self.subTest(elapsed=elapsed):
                 with self.assertRaisesRegex(AssertionError, "within 20 seconds"):
-                    self.backend.control("/completion-timing", {
-                        "mode": "plain", "completedAfterMs": elapsed,
-                    })
-        self.backend.control("/completion-timing", {"mode": "plain", "completedAfterMs": 20000})
+                    self.timing("plain", completedAfterMs=elapsed)
+        for evidence, expected in (
+            ({"networkProgressReports": 0}, "Missing network progress"),
+            ({"networkProgressReports": None}, "Missing network progress"),
+            ({"prematureHundreds": 1}, "Progress reported 100%"),
+            ({"prematureHundreds": None}, "Progress reported 100%"),
+            ({"committedRegressions": 1}, "fewer acknowledged parts"),
+            ({"committedRegressions": None}, "fewer acknowledged parts"),
+            ({"resumeRegressions": 1}, "fewer bytes than the paused snapshot"),
+            ({"resumeRegressions": None}, "fewer bytes than the paused snapshot"),
+        ):
+            with self.subTest(evidence=evidence):
+                with self.assertRaisesRegex(AssertionError, expected):
+                    self.timing("plain", **evidence)
+        self.timing("plain", completedAfterMs=20000)
         self.assertEqual(self.backend.report()["plain"]["completedAfter100PercentMs"], 20000)
+
+    def test_network_fault_is_armed_on_a_paused_upload_and_injected_once(self):
+        started = self.backend.start({"mode": "plain"})
+        urls = self.backend.urls({**started, "parts": [1, 2]})["urls"]
+        with self.assertRaisesRegex(AssertionError, "needs a paused upload"):
+            self.backend.control("/fault", {"mode": "plain", "part": 2})
+        self.backend.control("/release", {"mode": "plain"})
+        snapshot = {"completedParts": 1, "totalParts": 2, "uploadedBytes": PART_SIZE}
+        self.backend.control("/paused", {"mode": "plain", "before": snapshot, "after": snapshot})
+        for part in (1, None, "2"):
+            with self.subTest(part=part):
+                with self.assertRaisesRegex(AssertionError, "after the first one"):
+                    self.backend.control("/fault", {"mode": "plain", "part": part})
+        self.backend.control("/fault", {"mode": "plain", "part": 2})
+        with self.assertRaisesRegex(AssertionError, "already armed"):
+            self.backend.control("/fault", {"mode": "plain", "part": 2})
+        self.backend.control("/resumed", {"mode": "plain"})
+        with self.assertRaisesRegex(AssertionError, "before resuming"):
+            self.backend.control("/fault", {"mode": "plain", "part": 2})
+        with self.assertRaises(Exception):
+            urlopen(Request(urls["2"], data=b"dropped", method="PUT"), timeout=10)
+        self.assertTrue(self.backend.upload("plain").fault_injected)
+        with urlopen(Request(urls["2"], data=b"retried", method="PUT"), timeout=10) as result:
+            self.assertEqual(result.status, 200)
+        self.assertTrue(self.backend.upload("plain").fault_retried())
 
     def test_gate_blocks_parts_until_pause(self):
         started = self.backend.start({"mode": "plain"})

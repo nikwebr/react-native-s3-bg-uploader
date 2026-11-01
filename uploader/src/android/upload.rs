@@ -10,12 +10,12 @@ use crate::android::AndroidNetwork;
 use crate::android::{build_client, dup_fd, enqueue, enqueue_front, PAUSE_FLAG};
 use crate::core::api::ApiClient;
 use crate::core::chunk::ChunkInfo;
+use crate::core::clean_etag;
 use crate::core::encryption::{ArcEncryptor, ChunkEncryptor};
 use crate::core::runtime;
 use crate::core::session::{self, UploadState};
 use crate::core::upload::PreparedUpload;
 use crate::core::upload_orchestrator::{self, UploadBackend, UploadOutcome};
-use crate::core::{clean_etag, MAX_RETRIES};
 use crate::native::upload_engine::{
     self, BlockingEngineConfig, BlockingPlatformAdapter, BlockingPrefetch, BlockingWorker,
 };
@@ -331,7 +331,9 @@ fn upload_chunk_with_retry(
     run_version: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let chunk_size = data.len() as u64;
-    let policy = crate::core::retry::RetryPolicy::new(MAX_RETRIES);
+    // Short backoff: a part whose response was lost is re-sent immediately instead of
+    // after the 1s/2s/4s/8s API ladder (see RetryPolicy::part_upload).
+    let policy = crate::core::retry::RetryPolicy::part_upload();
     let file_key = file_key.to_string();
 
     crate::core::retry::run_with_retry_string(
@@ -344,6 +346,9 @@ fn upload_chunk_with_retry(
                 return Err("stale run".to_string());
             }
 
+            // Reset this part to zero before every attempt: the previous attempt's bytes
+            // were never acknowledged and the body is sent again from the beginning, so
+            // the bar drops back to the stored parts and climbs with the re-upload.
             runtime::update_in_flight(
                 androidProgress::progress_manager(),
                 &file_key,
