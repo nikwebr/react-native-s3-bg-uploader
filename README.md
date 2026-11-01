@@ -145,18 +145,46 @@ detection and resume behave exactly the same for `uploadFile()` and
 `encryptAndUploadFile()`. `setConfig(startUploadApi, getUploadUrlsApi,
 completeApi, sendFileHash)` defaults to `true`; pass `false` to keep the hash
 local and omit it from the `startUpload()` request body.
-- `startUpload()` receives the size of the object that will be stored: the
-plaintext size for `uploadFile()` and the ciphertext size for
-`encryptAndUploadFile()` (plaintext + the scheme's per-part overhead + its
-descriptor when one is appended to the final part). The exact ciphertext size
-depends on the part size the backend returns, which is not known before this
-request; the uploader computes it from S3's minimum part size (5 MiB), which is
-exact for a backend that returns the minimum part size and a small upper bound
-otherwise.
+- `startUpload()` always receives the size of the **local, unencrypted** file as
+`fileSize`, so the backend never has to treat an estimated number as the real
+file size. For `encryptAndUploadFile()` the body also carries an `encryption`
+object with the format numbers the backend needs to derive the stored size (see
+below).
 - Progress callbacks report `totalBytes` and `uploadedBytes` in bytes of the
 uploaded object, and `percentage` relative to it. For encrypted uploads that is
 the real ciphertext size, so a paused or resumed upload reports the same totals
 as a completed one.
+
+The `encryption` object looks like this:
+
+```json
+{
+  "fileName": "video.mp4",
+  "fileHash": "…",
+  "fileSize": 31457280,
+  "encryption": { "overhead": 16, "hasFooter": true, "footerLen": 28 }
+}
+```
+
+The backend already chooses `partSize`, so although the exact ciphertext size is
+only known after that choice, the backend can compute it itself — the client does
+not send an estimate:
+
+```text
+reserved     = overhead + (hasFooter ? footerLen : 0)  // reserved in every part
+effective    = partSize - reserved                     // plaintext bytes per part
+dataParts    = ceil(fileSize / effective)              // at least 1 if hasFooter
+storedBytes  = fileSize + overhead * dataParts + (hasFooter ? footerLen : 0)
+```
+
+Custom encryptors declare the same three numbers through the vtable
+(`ciphertext_overhead`, `has_footer`, `footer_len`), so a backend sizes them with
+the same formula. This relies on what the chunk engine already requires: a
+constant number of extra bytes per part and a descriptor of fixed length. A
+scheme whose ciphertext length is not a fixed function of the plaintext length
+(compression, padding to a data-dependent boundary, a descriptor whose length
+depends on the data) cannot be sized this way — and is not supported by the
+chunk engine either.
 
 ### Custom encryptors
 

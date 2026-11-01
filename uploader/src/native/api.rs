@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use crate::core::api::{
     complete_upload_body, complete_upload_url, start_upload_body, upload_urls_batch_body,
-    ApiClient, StartUploadResponse, UploadUrlsBatchResponse,
+    ApiClient, EncryptionInfo, StartUploadResponse, UploadUrlsBatchResponse,
 };
 use crate::core::config::get_config;
 use crate::core::retry::{run_with_retry_string, RetryPolicy};
@@ -25,11 +25,19 @@ impl<N: BlockingNetwork> ApiClient for NativeApiClient<N> {
         file_name: &str,
         file_hash: &str,
         file_size: u64,
+        encryption: Option<EncryptionInfo>,
         user_params: &HashMap<String, String>,
     ) -> Result<StartUploadResponse, String> {
         let url = get_config().start_upload_api.clone();
         let send_file_hash = get_config().send_file_hash;
-        let body = start_upload_body(file_name, file_hash, file_size, send_file_hash, user_params)?;
+        let body = start_upload_body(
+            file_name,
+            file_hash,
+            file_size,
+            send_file_hash,
+            encryption,
+            user_params,
+        )?;
         let text = self
             .network
             .post_json(&url, body)

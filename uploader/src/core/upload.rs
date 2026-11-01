@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::core::api::{ApiClient, StartUploadResponse};
+use crate::core::api::{ApiClient, EncryptionInfo, StartUploadResponse};
 use crate::core::encryption::ArcEncryptor;
 use crate::core::session::{self, UploadState};
 use crate::core::ChunkUploadResult;
@@ -115,15 +115,6 @@ impl CipherParams {
         config.map(|c| Self::of(c.as_ref()))
     }
 
-    pub fn predicted_bytes(self, plaintext_bytes: u64) -> u64 {
-        predicted_ciphertext_bytes(
-            plaintext_bytes,
-            self.overhead,
-            self.has_footer,
-            self.footer_len,
-        )
-    }
-
     pub fn layout(self, plaintext_bytes: u64, server_part_size: u64) -> Option<CiphertextLayout> {
         ciphertext_layout(
             plaintext_bytes,
@@ -132,6 +123,17 @@ impl CipherParams {
             self.has_footer,
             self.footer_len,
         )
+    }
+}
+
+/// The wire description sent to `startUpload` for an encrypted upload.
+impl From<CipherParams> for EncryptionInfo {
+    fn from(params: CipherParams) -> Self {
+        Self {
+            overhead: params.overhead,
+            has_footer: params.has_footer,
+            footer_len: params.footer_len,
+        }
     }
 }
 
@@ -170,11 +172,17 @@ pub async fn start_and_register<A: ApiClient>(
         StartDecision::StartNew => {
             let params =
                 cipher_params.or_else(|| CipherParams::of_config(encryption_config.as_ref()));
-            // The backend receives the size of the object it will store. For an
-            // encrypted upload that is the ciphertext size, not the plaintext size.
-            let reported_size = start_upload_size(file_size, params);
+            // `fileSize` is always the plaintext size of the local file; the
+            // encryption details let the backend derive the ciphertext size it will
+            // actually store, using the part size it returns for this upload.
             let start_resp = api
-                .start_upload(&file_name, &file_hash, reported_size, &user_params)
+                .start_upload(
+                    &file_name,
+                    &file_hash,
+                    file_size,
+                    params.map(EncryptionInfo::from),
+                    &user_params,
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             let file_key = register_started_upload(
@@ -194,26 +202,14 @@ pub async fn start_and_register<A: ApiClient>(
     }
 }
 
-/// Size sent to startUpload for one file.
-///
-/// Plain uploads report the plaintext size. Encrypted uploads report the
-/// ciphertext size the object will occupy. The exact ciphertext size depends on
-/// the part size the backend returns, which is only known *after* this request, so
-/// it is computed from the smallest part size S3 accepts: that yields the largest
-/// possible part count, making the value exact for a backend that returns the
-/// minimum part size and an upper bound for larger part sizes (the difference is
-/// the encryptor's per-part overhead for each part the backend saves).
-pub fn start_upload_size(plaintext_bytes: u64, params: Option<CipherParams>) -> u64 {
-    match params {
-        Some(params) => params.predicted_bytes(plaintext_bytes),
-        None => plaintext_bytes,
-    }
-}
-
 /// S3's minimum size for every part except the last.
 pub const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Predicted ciphertext size for the smallest legal plaintext part size.
+///
+/// Used only for local progress before the backend has returned its part size
+/// (pending files). The `startUpload` body sends the plaintext size plus the
+/// encryption details instead, so the backend computes the stored size itself.
 ///
 /// An intermediate ciphertext part is `part_size + overhead` bytes and S3 requires
 /// at least [`S3_MIN_PART_SIZE`], so the smallest legal plaintext part size is
@@ -647,25 +643,53 @@ mod tests {
     }
 
     #[test]
-    fn start_upload_size_is_the_wire_size_not_the_plaintext_size() {
-        let enc = encryptor();
-        let config: ArcEncryptor = std::sync::Arc::new(enc);
-        let plaintext = 31 * 1024 * 1024 + 123;
+    fn start_upload_body_lets_the_backend_compute_the_stored_size() {
+        let config: ArcEncryptor = std::sync::Arc::new(encryptor());
+        let params = CipherParams::of_config(Some(&config)).unwrap();
 
-        // Plain uploads keep reporting the plaintext size.
-        assert_eq!(start_upload_size(plaintext, None), plaintext);
+        for plaintext in [0u64, 31 * 1024 * 1024 + 123] {
+            let body = crate::core::api::start_upload_body(
+                "f.bin",
+                "hash",
+                plaintext,
+                false,
+                Some(params.into()),
+                &HashMap::new(),
+            )
+            .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
 
-        // Encrypted uploads report plaintext + one tag per part + the descriptor.
-        let params = CipherParams::of_config(Some(&config));
-        let overhead = config.ciphertext_overhead() as u64;
-        let footer = config.footer_len() as u64;
-        let min_part = S3_MIN_PART_SIZE - overhead;
-        let parts = total_parts(plaintext, min_part);
-        assert_eq!(parts, 7);
-        assert_eq!(
-            start_upload_size(plaintext, params),
-            plaintext + overhead * parts as u64 + footer
-        );
+            // `fileSize` is the unencrypted size, always.
+            assert_eq!(json["fileSize"].as_u64().unwrap(), plaintext);
+            let overhead = json["encryption"]["overhead"].as_u64().unwrap();
+            let has_footer = json["encryption"]["hasFooter"].as_bool().unwrap();
+            let footer_len = json["encryption"]["footerLen"].as_u64().unwrap();
+
+            // The backend knows the part size it will return, so these numbers are
+            // enough for it to derive the exact stored (ciphertext) size.
+            for server_part_size in [5 * 1024 * 1024 + 28, 32 * 1024 * 1024, 1024 * 1024] {
+                let reserved = overhead + if has_footer { footer_len } else { 0 };
+                let effective = server_part_size - reserved;
+                let mut parts = total_parts(plaintext, effective);
+                if has_footer && parts == 0 {
+                    parts = 1;
+                }
+                let backend_total =
+                    plaintext + overhead * parts as u64 + if has_footer { footer_len } else { 0 };
+                let layout = ciphertext_layout(
+                    plaintext,
+                    server_part_size,
+                    overhead,
+                    has_footer,
+                    footer_len,
+                )
+                .unwrap();
+                assert_eq!(
+                    backend_total, layout.total_bytes,
+                    "backend derivation diverges for part size {server_part_size}"
+                );
+            }
+        }
     }
 
     #[test]

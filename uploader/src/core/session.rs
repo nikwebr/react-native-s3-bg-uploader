@@ -269,9 +269,11 @@ pub struct PendingFileEntry {
 }
 
 impl PendingFileEntry {
-    /// Size this file will occupy in S3 once startUpload answered.
-    /// Encrypted entries are predicted from the smallest legal part size because
-    /// the backend's part size is not known before the startUpload call.
+    /// Estimated size this file will occupy in S3, used only for local progress
+    /// while the file is still pending (the backend's part size is not known yet).
+    /// `startUpload` sends the plaintext size plus the encryption details and lets
+    /// the backend compute the stored size. Once registered, the entry is re-sized
+    /// from the authoritative part size.
     pub fn reported_size(&self) -> u64 {
         match self.encryption_config.as_ref() {
             Some(enc) => crate::core::upload::predicted_ciphertext_bytes(
