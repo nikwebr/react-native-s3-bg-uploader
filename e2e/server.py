@@ -212,7 +212,7 @@ class Backend:
             require(regressions == 0,
                     f"Progress went backwards {regressions!r} time(s) before completion")
             require(premature == 0,
-                    f"Progress reported 100% {premature!r} time(s) before completion")
+                    f"Progress reported 100% {premature!r} time(s) while parts were unacknowledged")
             upload.completed_after_ms = elapsed
             upload.progress_regressions = regressions
             upload.premature_hundreds = premature
@@ -299,7 +299,7 @@ class Backend:
             require(all(u["progressRegressionsBeforeCompletion"] == 0 for u in report.values()),
                     "Upload progress went backwards before completion")
             require(all(u["prematureHundredPercent"] == 0 for u in report.values()),
-                    "Upload reported 100% before completion")
+                    "Upload reported 100% while parts were still unacknowledged")
         return report
 
 

@@ -44,8 +44,9 @@ export default function TestApp({ initializeEncryptor }: {
     try {
       timing.observe(file, performance.now());
       if (file.state === 'COMPLETED') {
-        // The server drops one part PUT after receiving its body, so completion can
-        // only be reached by retrying a part whose bytes were already counted.
+        // The server drops one part PUT after receiving its body. Because only
+        // acknowledged parts count, completion can still be reached without the bar
+        // ever claiming 100% for the unacknowledged part.
         timing.assertClean();
         setNetworkRetryVerified(true);
       }
@@ -198,8 +199,8 @@ export default function TestApp({ initializeEncryptor }: {
       throw new Error('Uploader left PAUSED while paused');
     }
     await api('/paused', { mode: current.current?.mode, before, after });
-    // The paused snapshot counts committed parts only, so the resumed run starts there.
-    completionTiming.current.resetProgressBaseline(after.uploadedBytes);
+    // Paused and resumed runs both report committed bytes only, so the monotonic
+    // check spans the pause: a resumed run that dropped back would be caught.
     setStatus('Pause verified');
   };
 

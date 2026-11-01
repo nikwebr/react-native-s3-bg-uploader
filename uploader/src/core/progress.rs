@@ -1,32 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use crate::core::session::{AggregateProgress, FileProgress, GlobalUploaderState, UploadState};
-
-/// Percentage reported while an upload is still running.
-///
-/// In-flight bytes are bytes handed to the transport, not bytes the backend has
-/// acknowledged. A connection that drops after the last byte left the device still
-/// fails that part, which is then retried — or the upload is paused/resumed — while a
-/// naive 100% already told the user the upload was done. That also made the retry look
-/// like a stall of the whole ladder *after* 100%, and resetting the retried part's
-/// in-flight bytes looked like progress being lost. Keep running uploads just below 100
-/// and report the real 100 only once the upload is committed, so a reported 100% always
-/// means "completed".
-pub const RUNNING_PERCENTAGE_CAP: f64 = 99.9;
-
-/// Percentage cap for a session or transfer aggregate in the given state.
-pub fn percentage_cap(state: &GlobalUploaderState) -> f64 {
-    if *state == GlobalUploaderState::Completed {
-        100.0
-    } else {
-        RUNNING_PERCENTAGE_CAP
-    }
-}
+use crate::core::session::{AggregateProgress, FileProgress, UploadState};
 
 // ---------------------------------------------------------------------------
-// Per-file upload progress (in-flight tracking during chunk uploads)
+// Per-file upload progress (committed bytes only)
 // ---------------------------------------------------------------------------
+//
+// Progress only counts parts whose ETag the backend has returned. Bytes handed to
+// the transport are *not* progress: a connection that drops after the last byte
+// left the device still fails that part, and it has to be sent again. Counting it
+// early made the bar claim 100% (and then fall back on the retry or resume) for an
+// upload that was not finished. Because unacknowledged bytes are never counted,
+// there is nothing to rewind either, so reconnecting continues from the last
+// committed part instead of dropping the bar.
 
 #[derive(Debug, Clone)]
 pub struct UploadProgress {
@@ -39,8 +26,6 @@ pub struct UploadProgress {
     pub total_parts: u32,
     /// Bytes in completed chunks only.
     pub completed_bytes: u64,
-    /// part_number → bytes uploaded so far (in-flight, cleared on chunk completion).
-    pub in_flight_progress: HashMap<u32, u64>,
     pub completed_parts: u32,
     pub status: UploadState,
     /// Guards against double-counting when stale workers from a previous run
@@ -65,16 +50,16 @@ impl UploadProgress {
             total_bytes,
             total_parts,
             completed_bytes: 0,
-            in_flight_progress: HashMap::new(),
             completed_parts: 0,
             status: UploadState::Running,
             completed_part_set: HashSet::new(),
         }
     }
 
+    /// Bytes the backend has acknowledged. In-flight bytes are deliberately excluded:
+    /// they can still fail and be sent again, so they are not durable progress.
     pub fn uploaded_bytes(&self) -> u64 {
-        let in_flight_sum: u64 = self.in_flight_progress.values().sum();
-        self.completed_bytes + in_flight_sum
+        self.completed_bytes
     }
 
     pub fn percentage(&self) -> f64 {
@@ -84,29 +69,14 @@ impl UploadProgress {
         if self.total_bytes == 0 {
             return 0.0;
         }
-        ((self.uploaded_bytes() as f64 / self.total_bytes as f64) * 100.0)
-            .min(RUNNING_PERCENTAGE_CAP)
-    }
-
-    /// Record in-flight bytes for one part.
-    ///
-    /// A retried part starts again at zero bytes on the wire, but progress that moves
-    /// backwards reads as data being lost — and after a connection error it would have
-    /// to climb back to the same value before the retry is acknowledged. Keep the
-    /// highest value reported for the part during this run instead. A new run rebuilds
-    /// the entry from the committed parts, so the baseline still resets when it should.
-    pub fn update_in_flight(&mut self, part_number: u32, bytes_uploaded: u64) {
-        let reported = self.in_flight_progress.entry(part_number).or_insert(0);
-        *reported = (*reported).max(bytes_uploaded);
+        ((self.completed_bytes as f64 / self.total_bytes as f64) * 100.0).min(100.0)
     }
 
     pub fn complete_chunk(&mut self, part_number: u32, chunk_size: u64) {
         if !self.completed_part_set.insert(part_number) {
             // Already counted by a concurrent worker from the same or a previous run.
-            self.in_flight_progress.remove(&part_number);
             return;
         }
-        self.in_flight_progress.remove(&part_number);
         self.completed_bytes += chunk_size;
         self.completed_parts += 1;
     }
@@ -164,39 +134,15 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         }
     }
 
-    /// Build session- and transfer-level aggregates that include in-flight bytes
-    /// from all currently tracked files, merged on top of the session baseline.
+    /// Session- and transfer-level aggregates already include every committed part
+    /// (the session is updated before the progress manager), so there is no in-flight
+    /// delta left to merge here.
     fn build_aggregates(
-        lock: &HashMap<String, UploadProgress>,
-        mut session_agg: AggregateProgress,
-        mut transfer_agg: AggregateProgress,
-        current_transfer_id: &str,
+        _lock: &HashMap<String, UploadProgress>,
+        session_agg: AggregateProgress,
+        transfer_agg: AggregateProgress,
+        _current_transfer_id: &str,
     ) -> (AggregateProgress, AggregateProgress) {
-        // For each tracked file, replace the session's `uploaded_bytes` baseline
-        // with the live value (completed + in-flight) from ProgressManager.
-        for p in lock.values() {
-            let live = p.uploaded_bytes();
-            // The session already counted `p.completed_bytes` worth of uploads.
-            // Add only the delta (in-flight portion) on top.
-            let delta = live.saturating_sub(p.completed_bytes);
-
-            session_agg.uploaded_size = session_agg.uploaded_size.saturating_add(delta);
-            if session_agg.total_size > 0 {
-                session_agg.percentage =
-                    ((session_agg.uploaded_size as f64 / session_agg.total_size as f64) * 100.0)
-                        .min(percentage_cap(&session_agg.state));
-            }
-
-            if p.transfer_id == current_transfer_id {
-                transfer_agg.uploaded_size = transfer_agg.uploaded_size.saturating_add(delta);
-                if transfer_agg.total_size > 0 {
-                    transfer_agg.percentage = ((transfer_agg.uploaded_size as f64
-                        / transfer_agg.total_size as f64)
-                        * 100.0)
-                        .min(percentage_cap(&transfer_agg.state));
-                }
-            }
-        }
         (session_agg, transfer_agg)
     }
 
@@ -236,30 +182,6 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         self.progress.lock().unwrap().clear();
     }
 
-    pub fn update_in_flight(
-        &self,
-        file_key: &str,
-        part_number: u32,
-        bytes_uploaded: u64,
-        session_agg: AggregateProgress,
-        transfer_agg: AggregateProgress,
-    ) {
-        let mut lock = self.progress.lock().unwrap();
-        if let Some(p) = lock.get_mut(file_key) {
-            if p.status != UploadState::Running {
-                // Don't re-populate in_flight after pause; stale bytes would inflate
-                // progress reported by polls and aggregate calculations.
-                return;
-            }
-            p.update_in_flight(part_number, bytes_uploaded);
-            let fp = p.to_file_progress();
-            let tid = p.transfer_id.clone();
-            let (s, t) = Self::build_aggregates(&lock, session_agg, transfer_agg, &tid);
-            drop(lock);
-            self.notifier.notify(&fp, &s, &t);
-        }
-    }
-
     pub fn complete_chunk(
         &self,
         file_key: &str,
@@ -289,17 +211,6 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         let mut lock = self.progress.lock().unwrap();
         if let Some(p) = lock.get_mut(file_key) {
             p.status = status.clone();
-            if matches!(
-                status,
-                UploadState::Paused | UploadState::Failed | UploadState::Completed
-            ) {
-                // In-flight bytes belong to an upload that stopped: they were never
-                // acknowledged. Keeping them reported progress (up to the whole file)
-                // for an upload that was no longer running, and the resumed run then
-                // rebuilt the entry from the committed parts and dropped back — the
-                // visible progress loss users saw after a connection error.
-                p.in_flight_progress.clear();
-            }
             let fp = p.to_file_progress();
             let tid = p.transfer_id.clone();
             let (s, t) = Self::build_aggregates(&lock, session_agg, transfer_agg, &tid);
@@ -366,7 +277,7 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         self.notifier.notify(fp, session_agg, transfer_agg);
     }
 
-    /// Return live FileProgress snapshots (including in-flight bytes) for all tracked files.
+    /// Return live FileProgress snapshots for all tracked files.
     /// Optionally filtered by transfer_id or file_hash.
     pub fn get_live_progress(
         &self,
@@ -383,7 +294,7 @@ impl<N: ProgressNotifier> ProgressManager<N> {
             .collect()
     }
 
-    /// Return live aggregate progress (including in-flight bytes) merged with session baseline.
+    /// Return the aggregate progress already merged with the committed parts.
     pub fn get_live_aggregate(
         &self,
         session_agg: AggregateProgress,
@@ -411,43 +322,54 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_bytes_never_report_100_before_completion() {
+    fn unacknowledged_bytes_are_not_progress() {
         let mut p = progress(1000, 2);
-        p.update_in_flight(1, 600);
-        p.update_in_flight(2, 400);
-        assert_eq!(p.uploaded_bytes(), 1000);
-        // Every byte left the device, but part 2 is not acknowledged yet: the upload
-        // can still fail and be retried, so it must not claim to be finished.
-        assert_eq!(p.percentage(), RUNNING_PERCENTAGE_CAP);
+        // Part 1 is stored, part 2 is still on the wire. The transport progress of
+        // part 2 must not count: its response can still be lost and the part retried.
+        p.complete_chunk(1, 500);
+        assert_eq!(p.uploaded_bytes(), 500);
+        assert_eq!(p.percentage(), 50.0);
 
+        p.complete_chunk(2, 500);
+        assert_eq!(p.uploaded_bytes(), 1000);
+        // All bytes are committed now; completion follows immediately and reports 100.
+        assert_eq!(p.percentage(), 100.0);
         p.status = UploadState::Completed;
         assert_eq!(p.percentage(), 100.0);
     }
 
     #[test]
-    fn retried_part_keeps_the_bytes_it_already_reported() {
+    fn a_retry_never_rewinds_progress() {
         let mut p = progress(1000, 2);
-        p.update_in_flight(1, 400);
-        p.update_in_flight(2, 300);
+        p.complete_chunk(1, 500);
         let before = p.uploaded_bytes();
 
-        // The retry restarts the part from zero bytes on the wire.
-        p.update_in_flight(2, 0);
+        // Part 2 failed and is sent again: no bytes of it were ever counted, so the
+        // bar stays where it was instead of climbing down and back up.
         assert_eq!(p.uploaded_bytes(), before);
-        p.update_in_flight(2, 100);
-        assert_eq!(p.uploaded_bytes(), before);
-        p.update_in_flight(2, 500);
-        assert_eq!(p.uploaded_bytes(), 900);
+        assert_eq!(p.percentage(), 50.0);
+        p.complete_chunk(2, 500);
+        assert_eq!(p.uploaded_bytes(), 1000);
+        assert_eq!(p.percentage(), 100.0);
+    }
+
+    #[test]
+    fn a_stopped_upload_keeps_its_committed_progress() {
+        let mut p = progress(1000, 2);
+        p.complete_chunk(1, 500);
+        p.status = UploadState::Failed;
+        // Nothing was counted for the failed part, so resuming cannot drop below this.
+        assert_eq!(p.uploaded_bytes(), 500);
+        assert_eq!(p.percentage(), 50.0);
     }
 
     #[test]
     fn committed_part_is_counted_once() {
         let mut p = progress(1000, 2);
-        p.update_in_flight(1, 1000);
         p.complete_chunk(1, 400);
         p.complete_chunk(1, 400);
         assert_eq!(p.uploaded_bytes(), 400);
         assert_eq!(p.completed_parts, 1);
-        assert!(p.percentage() <= RUNNING_PERCENTAGE_CAP);
+        assert_eq!(p.percentage(), 40.0);
     }
 }

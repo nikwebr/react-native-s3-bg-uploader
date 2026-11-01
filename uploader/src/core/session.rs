@@ -153,11 +153,11 @@ impl FileEntry {
         if self.total_bytes == 0 {
             return 0.0;
         }
-        // A file whose parts are all stored but whose completion is still pending (the
-        // completion call failed and is retried, or the upload is paused right before it)
-        // is not done yet, so it must not report 100% either.
-        ((self.uploaded_bytes as f64 / self.total_bytes as f64) * 100.0)
-            .min(crate::core::progress::RUNNING_PERCENTAGE_CAP)
+        // `uploaded_bytes` only counts acknowledged parts. When all of them are stored
+        // this reaches 100 and the multipart completion follows immediately; a dropped
+        // part response keeps the value at the last committed part instead of claiming
+        // the upload is done.
+        ((self.uploaded_bytes as f64 / self.total_bytes as f64) * 100.0).min(100.0)
     }
 
     pub fn is_resumable(&self) -> bool {
@@ -859,8 +859,7 @@ impl Session {
             let pct = if total_size == 0 {
                 0.0
             } else {
-                ((raw_uploaded_size as f64 / total_size as f64) * 100.0)
-                    .min(crate::core::progress::percentage_cap(&state))
+                ((raw_uploaded_size as f64 / total_size as f64) * 100.0).min(100.0)
             };
             (pct, raw_uploaded_size)
         };

@@ -154,11 +154,12 @@ below).
 uploaded object, and `percentage` relative to it. For encrypted uploads that is
 the real ciphertext size, so a paused or resumed upload reports the same totals
 as a completed one.
-- `percentage` reaches `100` only together with the `COMPLETED` state, and never
-moves backwards while a file is running. `uploadedBytes` also counts bytes handed
-to the transport, which a dropped connection can still reject: that part is
-retried (or the file paused and resumed) and the byte count must not jump back
-to where it was already. A paused snapshot reports committed parts only.
+- `uploadedBytes` counts only parts the backend has acknowledged with an ETag, so
+`percentage` reaches `100` only once every part is stored (the `COMPLETED` state
+follows immediately). A part whose body reached the server but whose response
+was lost has no ETag yet and is retried; its bytes are not counted, which means a
+dropped connection can neither show `100%` early nor make the bar drop when it
+reconnects. A paused snapshot also reports committed parts only.
 
 The `encryption` object looks like this:
 
@@ -325,14 +326,15 @@ Both upload modes must report `COMPLETED` within **20 seconds of the first
 100% progress callback**. The shared test uses a monotonic clock and a watchdog;
 later progress drops do not reset the deadline. The elapsed time is saved as
 `completedAfter100PercentMs` in the verification artifacts.
-`100%` is only reported together with `COMPLETED`, so the same run also checks the
-contract that produced the bug report: after the pause it drops one presigned
-part `PUT` **after the whole body arrived** (a link that dies before the
-response), which the uploader has to retry. The test app records every progress
-callback, and the backend rejects the run if a running upload ever reported fewer
-bytes than an earlier callback (`progressRegressions`) or reported `100%` before
-`COMPLETED` (`prematureHundreds`). It also requires evidence that the dropped part
-was retried (`networkErrorRetried`), so a silent fallback cannot pass.
+`100%` means every part has been acknowledged by the backend, so the same run
+also checks the contract that produced the bug report: after the pause it drops
+one presigned part `PUT` **after the whole body arrived** (a link that dies before
+the response), which the uploader has to retry. The test app records every
+progress callback, and the backend rejects the run if a running upload ever
+reported fewer bytes than an earlier callback (`progressRegressions`, including
+across the pause and resume) or reported `100%` while parts were still
+unacknowledged (`prematureHundreds`). It also requires evidence that the dropped
+part was retried (`networkErrorRetried`), so a silent fallback cannot pass.
 
 Tests use a local Moto S3-compatible HTTP server and synthetic 31 MiB fixtures;
 no AWS credentials, external demo bucket, or Maestro Cloud subscription are
