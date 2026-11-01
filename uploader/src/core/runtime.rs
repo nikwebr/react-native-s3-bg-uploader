@@ -113,8 +113,8 @@ pub fn init_progress<N: ProgressNotifier>(
         transfer_agg,
     );
     // pause_all() may have set the session to Paused between mark_state_persist(Running)
-    // and here. Snap the ProgressManager entry immediately so the UI sees Paused right
-    // away instead of briefly Running.
+    // and here. Snap the ProgressManager entry immediately so no in-flight bytes leak
+    // through and the UI sees Paused right away instead of briefly Running.
     if already_paused {
         set_status(manager, file_key, UploadState::Paused);
     }
@@ -129,18 +129,20 @@ pub fn set_status<N: ProgressNotifier>(
     manager.set_status(file_key, status, session_agg, transfer_agg);
 }
 
-/// Telemetry hook for transport progress while a part body is being sent.
-///
-/// Deliberately does nothing: bytes are only progress once the backend returns the
-/// part's ETag. Counting them here is what made a dropped connection show 100% and
-/// then rewind the bar on the retry. Keep the entrypoint so the platform readers do
-/// not need to know where the progress accounting lives.
 pub fn update_in_flight<N: ProgressNotifier>(
-    _manager: &ProgressManager<N>,
-    _file_key: &str,
-    _part_number: u32,
-    _bytes_uploaded: u64,
+    manager: &ProgressManager<N>,
+    file_key: &str,
+    part_number: u32,
+    bytes_uploaded: u64,
 ) {
+    let (_, session_agg, transfer_agg) = aggregate_snapshot_for_file(file_key);
+    manager.update_in_flight(
+        file_key,
+        part_number,
+        bytes_uploaded,
+        session_agg,
+        transfer_agg,
+    );
 }
 
 pub fn complete_chunk<N: ProgressNotifier>(

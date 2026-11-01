@@ -7,11 +7,11 @@ use wasm_bindgen_futures::JsFuture;
 use async_trait::async_trait;
 
 use crate::core::chunk::ChunkInfo;
+use crate::core::clean_etag;
 use crate::core::encryption::{ArcEncryptor, ChunkEncryptor};
 use crate::core::runtime;
 use crate::core::upload::PreparedUpload;
 use crate::core::upload_orchestrator::{self, UploadBackend, UploadOutcome};
-use crate::core::{clean_etag, MAX_RETRIES};
 use crate::wasm::api::WasmApiClient;
 use crate::wasm::is_pause_requested;
 use crate::wasm::progress::{self as wasmProgress, WasmProgressNotifier};
@@ -291,7 +291,9 @@ async fn upload_chunk_with_retry(
     part_number: u32,
     file_key: &str,
 ) -> Result<String, String> {
-    let policy = crate::core::retry::RetryPolicy::new(MAX_RETRIES);
+    // Short backoff: a part whose response was lost is re-sent immediately instead of
+    // after the 1s/2s/4s/8s API ladder (see RetryPolicy::part_upload).
+    let policy = crate::core::retry::RetryPolicy::part_upload();
     let file_key = file_key.to_string();
     let url = url.to_string();
     let data = data.to_vec();
@@ -306,6 +308,10 @@ async fn upload_chunk_with_retry(
                 if is_pause_requested() {
                     return Err("paused".to_string());
                 }
+                // Reset this part to zero before every attempt: the previous attempt's
+                // bytes were never acknowledged and the body is sent again from the
+                // beginning, so the bar drops back to the stored parts and climbs with
+                // the re-upload.
                 runtime::update_in_flight(wasmProgress::progress_manager(), &fk, part_number, 0);
                 upload_chunk_xhr(&url, &data, part_number, &fk).await
             }

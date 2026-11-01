@@ -65,12 +65,8 @@ pub fn progress_manager() -> &'static ProgressManager<IosProgressNotifier> {
 }
 
 // ---------------------------------------------------------------------------
-// ProgressReader — guards the body stream against pause/stale runs
+// ProgressReader — in-flight progress tracking during chunk upload
 // ---------------------------------------------------------------------------
-//
-// Transport bytes are not progress (progress is only reported when a part's ETag
-// arrives), but the reader still checks the pause flag and run version on every
-// read so an aborted pause stops the request promptly.
 
 const NOTIFY_EVERY_BYTES: u64 = 256 * 1024; // 256 KB
 

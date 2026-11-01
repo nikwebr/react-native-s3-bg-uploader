@@ -104,8 +104,8 @@ pub async fn run_upload<B: UploadBackend>(backend: &B) -> UploadOutcome {
                 // Don't overwrite the new run's state or progress with Paused.
             } else {
                 runtime::mark_state_persist(&file_key, UploadState::Paused);
-                // Ensure the ProgressManager reflects Paused even when pause_all ran
-                // before init_progress created the ProgressManager entry.
+                // Ensure the ProgressManager reflects Paused (clears in-flight bytes) even
+                // when pause_all ran before init_progress created the ProgressManager entry.
                 runtime::set_status(backend.progress_manager(), &file_key, UploadState::Paused);
             }
         }

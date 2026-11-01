@@ -489,9 +489,9 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeResumeAll(
 ) -> jstring {
     // Collect paused keys before clearing state so we can remove their ProgressManager
     // entries after resume. This matches iOS behaviour: old worker threads that are still
-    // running after a rapid pause→resume cannot report into the new run's tracking because
-    // the entry no longer exists. init_progress() will create a fresh entry when the new
-    // run starts.
+    // running after a rapid pause→resume cannot add stale in-flight bytes to the new
+    // run's tracking because the entry no longer exists. init_progress() will create
+    // a fresh entry when the new run starts.
     let paused_keys: Vec<String> = {
         let sess = session::session();
         sess.files
