@@ -83,6 +83,21 @@ class Backend:
     def start(self, body):
         mode = body["mode"]
         require(mode in ("plain", "encrypted"), "Unknown encryption mode")
+        # The uploader must declare the size of the object it stores: plaintext for
+        # plain uploads, ciphertext for encrypted ones (one 16-byte tag per part plus
+        # the 28-byte descriptor in the last part). The e2e backend uses the minimum
+        # legal part size, so this is the exact wire size the uploader predicts.
+        if "fileSize" in body:
+            effective_size = PART_SIZE - 16 - 28
+            part_count = (len(FIXTURE) + effective_size - 1) // effective_size
+            expected = len(FIXTURE)
+            if mode == "encrypted":
+                expected += part_count * 16 + 28
+            require(
+                body["fileSize"] == expected,
+                f"startUpload declared fileSize {body['fileSize']}, expected {expected} "
+                f"for {mode} mode",
+            )
         with self.lock:
             require(mode not in self.uploads, "Resume created a second multipart upload")
             key = f"{mode}/fixture.bin"

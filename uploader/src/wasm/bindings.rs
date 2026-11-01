@@ -122,8 +122,14 @@ pub fn wasm_set_config(
     start_upload_api: String,
     get_upload_urls_api: String,
     complete_api: String,
+    send_file_hash: bool,
 ) {
-    crate::core::config::set_config(&start_upload_api, &get_upload_urls_api, &complete_api);
+    crate::core::config::set_config(
+        &start_upload_api,
+        &get_upload_urls_api,
+        &complete_api,
+        send_file_hash,
+    );
 }
 
 #[wasm_bindgen]

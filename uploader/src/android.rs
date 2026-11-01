@@ -136,6 +136,7 @@ pub(super) fn initialize_and_enqueue(
         file_size,
         pending.user_params.clone(),
         pending.encryption_config.clone(),
+        None,
         &api,
     ))
     .map_err(|e| {

@@ -61,24 +61,38 @@ impl CompleteRequest {
     }
 }
 
+/// Build the startUpload request body.
+///
+/// `file_size` is the size of the object that will be stored (the ciphertext size
+/// for encrypted uploads), not the plaintext size.
+/// `send_file_hash` omits `fileHash` from the body while the hash is still
+/// computed and kept locally for dedup/resume.
+/// Reserved keys (`fileName`, `fileHash`, `fileSize`) always win over
+/// `user_params`, so a caller cannot accidentally send a plaintext `fileSize`.
 pub fn start_upload_body(
     file_name: &str,
     file_hash: &str,
     file_size: u64,
+    send_file_hash: bool,
     user_params: &HashMap<String, String>,
 ) -> Result<String, String> {
     let mut body_map: serde_json::Map<String, serde_json::Value> = user_params
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
+    body_map.remove("fileName");
+    body_map.remove("fileHash");
+    body_map.remove("fileSize");
     body_map.insert(
         "fileName".to_string(),
         serde_json::Value::String(file_name.to_string()),
     );
-    body_map.insert(
-        "fileHash".to_string(),
-        serde_json::Value::String(file_hash.to_string()),
-    );
+    if send_file_hash {
+        body_map.insert(
+            "fileHash".to_string(),
+            serde_json::Value::String(file_hash.to_string()),
+        );
+    }
     body_map.insert(
         "fileSize".to_string(),
         serde_json::Value::Number(file_size.into()),
@@ -119,6 +133,8 @@ impl ChunkUploadResult {
 
 #[async_trait(?Send)]
 pub trait ApiClient {
+    /// `file_size` is the wire size of the object (ciphertext size for encrypted
+    /// uploads). Implementations decide whether to include `fileHash` from config.
     async fn start_upload(
         &self,
         file_name: &str,
@@ -140,4 +156,52 @@ pub trait ApiClient {
         upload_id: &str,
         results: Vec<ChunkUploadResult>,
     ) -> Result<(), String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_upload_body_sends_file_hash_by_default() {
+        let body = start_upload_body("a.bin", "hash-1", 1234, true, &HashMap::new()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["fileName"], "a.bin");
+        assert_eq!(json["fileHash"], "hash-1");
+        assert_eq!(json["fileSize"], 1234);
+    }
+
+    #[test]
+    fn start_upload_body_can_omit_the_file_hash() {
+        let body = start_upload_body("a.bin", "hash-1", 1234, false, &HashMap::new()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["fileName"], "a.bin");
+        assert!(
+            json.get("fileHash").is_none(),
+            "fileHash must not be sent when disabled: {body}"
+        );
+        assert_eq!(json["fileSize"], 1234);
+    }
+
+    #[test]
+    fn start_upload_body_does_not_let_user_params_override_sizes() {
+        let mut params = HashMap::new();
+        params.insert("fileSize".to_string(), "1".to_string());
+        params.insert("fileHash".to_string(), "wrong".to_string());
+        params.insert("userId".to_string(), "42".to_string());
+        let body = start_upload_body("a.bin", "right", 999, true, &params).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["fileHash"], "right");
+        assert_eq!(json["fileSize"], 999);
+        assert_eq!(json["userId"], "42");
+    }
+
+    #[test]
+    fn start_upload_body_keeps_file_hash_in_user_params_out_when_disabled() {
+        let mut params = HashMap::new();
+        params.insert("fileHash".to_string(), "wrong".to_string());
+        let body = start_upload_body("a.bin", "right", 999, false, &params).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json.get("fileHash").is_none());
+    }
 }

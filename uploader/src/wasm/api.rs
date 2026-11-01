@@ -23,7 +23,8 @@ impl ApiClient for WasmApiClient {
         user_params: &HashMap<String, String>,
     ) -> Result<StartUploadResponse, String> {
         let url = get_config().start_upload_api.clone();
-        let body = start_upload_body(file_name, file_hash, file_size, user_params)?;
+        let send_file_hash = get_config().send_file_hash;
+        let body = start_upload_body(file_name, file_hash, file_size, send_file_hash, user_params)?;
         fetch_json::<StartUploadResponse>(&url, "POST", Some(&body)).await
     }
 

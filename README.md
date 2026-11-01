@@ -135,6 +135,29 @@ the intended recipient without exposing them to the upload backend or storage
 provider. The uploader encrypts uploads; it does not manage key exchange or
 automatically decrypt downloaded objects.
 
+### Sizes and hashes for encrypted uploads
+
+Encryption changes the size of the object that is stored, so the uploader reports
+wire sizes rather than local file sizes:
+
+- `fileHash` is always computed over the **unencrypted** file, so duplicate
+detection and resume behave exactly the same for `uploadFile()` and
+`encryptAndUploadFile()`. `setConfig(startUploadApi, getUploadUrlsApi,
+completeApi, sendFileHash)` defaults to `true`; pass `false` to keep the hash
+local and omit it from the `startUpload()` request body.
+- `startUpload()` receives the size of the object that will be stored: the
+plaintext size for `uploadFile()` and the ciphertext size for
+`encryptAndUploadFile()` (plaintext + the scheme's per-part overhead + its
+descriptor when one is appended to the final part). The exact ciphertext size
+depends on the part size the backend returns, which is not known before this
+request; the uploader computes it from S3's minimum part size (5 MiB), which is
+exact for a backend that returns the minimum part size and a small upper bound
+otherwise.
+- Progress callbacks report `totalBytes` and `uploadedBytes` in bytes of the
+uploaded object, and `percentage` relative to it. For encrypted uploads that is
+the real ciphertext size, so a paused or resumed upload reports the same totals
+as a completed one.
+
 ### Custom encryptors
 
 A host app can plug in its own chunk-encryption scheme without rebuilding this package, by

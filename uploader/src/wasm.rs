@@ -192,6 +192,16 @@ pub(crate) fn process_pending_files() {
         let file_opt = PENDING_WASM_FILES.with(|m| m.borrow().get(&file_hash).cloned());
         let Some(file) = file_opt else { continue };
         let enc_opt = PENDING_WASM_ENCRYPTION.with(|m| m.borrow().get(&file_hash).cloned());
+        // A registered JavaScript encryptor may use format numbers other than the
+        // built-in cipher's, so size the object with the instance that will actually
+        // encrypt this file.
+        let cipher_params = crate::wasm::js_encryptor::instance(&file_hash).map(|js| {
+            crate::core::upload::CipherParams {
+                overhead: js.overhead as u64,
+                has_footer: js.has_footer,
+                footer_len: js.footer_len as u64,
+            }
+        });
         spawn_local(async move {
             let result = crate::core::upload::start_and_register(
                 file_hash.clone(),
@@ -201,6 +211,7 @@ pub(crate) fn process_pending_files() {
                 file_size,
                 user_params,
                 enc_opt,
+                cipher_params,
                 &WasmApiClient,
             )
             .await;

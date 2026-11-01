@@ -138,6 +138,7 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
         Err(e) => return UploadOutcome::Failed(e),
     };
 
+    session::session().set_file_sizes(&file_key, prepared.total_ciphertext_bytes, total_bytes);
     session::session().set_file_uploaded_bytes(&file_key, prepared.committed_bytes);
 
     if prepared.remaining_parts.is_empty() {
@@ -156,7 +157,7 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
     runtime::init_progress(
         backend.progress_manager(),
         &file_key,
-        total_bytes,
+        prepared.total_ciphertext_bytes,
         prepared.total_parts,
         prepared.committed_bytes,
         prepared.done_parts.len() as u32,

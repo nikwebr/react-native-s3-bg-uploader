@@ -42,9 +42,10 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         startUploadApi: String,
         getUploadUrlsApi: String,
         completeApi: String,
+        sendFileHash: Boolean?,
     ): Unit {
         appContext()?.let { StoragePathInit.ensureInit(it) }
-        nativeSetConfig(startUploadApi, getUploadUrlsApi, completeApi)
+        nativeSetConfig(startUploadApi, getUploadUrlsApi, completeApi, sendFileHash ?: true)
     }
 
     // -------------------------------------------------------------------------
@@ -356,6 +357,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             startUploadApi: String,
             getUploadUrlsApi: String,
             completeApi: String,
+            sendFileHash: Boolean,
         )
 
         @JvmStatic external fun nativeSetStoragePath(path: String)

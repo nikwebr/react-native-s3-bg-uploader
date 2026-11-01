@@ -72,7 +72,14 @@ pub struct FileEntry {
     pub file_path: String,
     pub file_name: String,
     pub state: UploadState,
+    /// Size of the object in S3 in bytes. For encrypted uploads this is the
+    /// ciphertext size; progress percentages are relative to it.
     pub total_bytes: u64,
+    /// Size of the local (plaintext) file in bytes — the bytes the engine reads
+    /// from disk and encrypts per chunk. Persisted separately so a resumed upload
+    /// keeps reporting the real encrypted size.
+    #[serde(default)]
+    pub plaintext_bytes: u64,
     pub uploaded_bytes: u64,
     pub completed_parts: u32,
     pub total_parts: u32,
@@ -125,6 +132,7 @@ impl FileEntry {
             file_name,
             state: UploadState::Initialized,
             total_bytes,
+            plaintext_bytes: total_bytes,
             uploaded_bytes: 0,
             completed_parts: 0,
             total_parts: 0,
@@ -258,6 +266,23 @@ pub struct PendingFileEntry {
     pub user_params: HashMap<String, String>,
     /// Encryptor to apply per chunk — not persisted.
     pub encryption_config: Option<ArcEncryptor>,
+}
+
+impl PendingFileEntry {
+    /// Size this file will occupy in S3 once startUpload answered.
+    /// Encrypted entries are predicted from the smallest legal part size because
+    /// the backend's part size is not known before the startUpload call.
+    pub fn reported_size(&self) -> u64 {
+        match self.encryption_config.as_ref() {
+            Some(enc) => crate::core::upload::predicted_ciphertext_bytes(
+                self.file_size,
+                enc.ciphertext_overhead() as u64,
+                enc.has_footer(),
+                enc.footer_len() as u64,
+            ),
+            None => self.file_size,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +479,17 @@ impl Session {
         entry.part_size = Some(part_size);
         entry.total_parts = total_parts;
         if let Some(config) = pending.encryption_config {
+            // Report the ciphertext size, exactly like the production registration path.
+            if let Some(layout) = crate::core::upload::ciphertext_layout(
+                pending.file_size,
+                part_size,
+                config.ciphertext_overhead() as u64,
+                config.has_footer(),
+                config.footer_len() as u64,
+            ) {
+                entry.total_bytes = layout.total_bytes;
+                entry.total_parts = layout.data_parts;
+            }
             entry.encrypted = true;
             entry.encryption_config = Some(config);
         }
@@ -549,6 +585,17 @@ impl Session {
     pub fn set_file_uploaded_bytes(&mut self, file_key: &str, uploaded_bytes: u64) {
         if let Some(entry) = self.files.get_mut(file_key) {
             entry.uploaded_bytes = uploaded_bytes.min(entry.total_bytes);
+        }
+    }
+
+    /// Set the wire size (object size in S3) and the local plaintext size together.
+    /// Encrypted files report ciphertext sizes to progress callbacks while the
+    /// engine keeps reading `plaintext_bytes` from disk.
+    pub fn set_file_sizes(&mut self, file_key: &str, total_bytes: u64, plaintext_bytes: u64) {
+        if let Some(entry) = self.files.get_mut(file_key) {
+            entry.total_bytes = total_bytes;
+            entry.plaintext_bytes = plaintext_bytes;
+            entry.uploaded_bytes = entry.uploaded_bytes.min(total_bytes);
         }
     }
 
@@ -712,7 +759,7 @@ impl Session {
                         file_name: p.file_name.clone(),
                         file_hash: p.file_hash.clone(),
                         transfer_id: p.transfer_id.clone(),
-                        total_bytes: p.file_size,
+                        total_bytes: p.reported_size(),
                         uploaded_bytes: 0,
                         completed_parts: 0,
                         total_parts: 0,
@@ -740,7 +787,10 @@ impl Session {
             .collect();
 
         let total_size: u64 = entries.iter().map(|e| e.total_bytes).sum::<u64>()
-            + pending_entries.iter().map(|p| p.file_size).sum::<u64>();
+            + pending_entries
+                .iter()
+                .map(|p| p.reported_size())
+                .sum::<u64>();
         let raw_uploaded_size: u64 = entries.iter().map(|e| e.uploaded_bytes).sum();
         let total_files = entries.len() as u32 + pending_entries.len() as u32;
         let completed_files = entries

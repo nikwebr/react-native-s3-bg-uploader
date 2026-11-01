@@ -104,6 +104,7 @@ pub(super) fn initialize_and_enqueue(file_hash: &str, transfer_id: &str) -> Resu
         pending.file_size,
         pending.user_params.clone(),
         pending.encryption_config.clone(),
+        None,
         &api,
     ))?;
     // Check if cancel_all fired while we were blocked on the network call.
