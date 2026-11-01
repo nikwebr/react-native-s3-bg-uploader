@@ -43,12 +43,19 @@ export interface UploadProgress {
   completedParts: number
   /** Total count of parts for this file */
   totalParts: number
-  /** Percentage for this individual file (0–100). */
+  /**
+   * Percentage for this individual file (0–100). `100` is reported only together with
+   * the `COMPLETED` state: bytes handed to the transport but not yet acknowledged by
+   * the backend are counted in `uploadedBytes`, and a part can still fail and be
+   * retried after all of its bytes were sent. Progress never moves backwards while a
+   * file is running, so a retried part does not rewind the bar.
+   */
   percentage: number
   state: UploadState
 }
 
 export interface AggregateProgress {
+  /** `100` only while the aggregate is `COMPLETED`; running aggregates stay just below. */
   percentage: number
   totalSize: number
   uploadedSize: number
