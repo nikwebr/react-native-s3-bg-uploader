@@ -53,6 +53,16 @@ class Upload:
     completed_after_ms: float | None = None
     # Size derived from the startUpload declaration (or the scheme default).
     declared_size: int = 0
+    # Part whose PUT is dropped once, after its body arrived (injected network error).
+    fault_part: int | None = None
+    fault_injected: bool = False
+    # Progress evidence the test app reports alongside the completion timing.
+    progress_regressions: int | None = None
+    premature_hundreds: int | None = None
+
+    def fault_retried(self) -> bool:
+        return (self.fault_injected and self.fault_part is not None
+                and self.put_requests[self.fault_part] >= 2)
 
 
 class Backend:
@@ -182,12 +192,30 @@ class Backend:
             upload.resumed = True
         elif path == "/verify":
             self.verify(body["mode"])
+        elif path == "/fault":
+            part = body.get("part")
+            require(upload.paused, "A network fault needs a paused upload")
+            require(not upload.resumed, "A network fault must be armed before resuming")
+            require(not upload.completed, "A network fault needs an upload that is not complete")
+            require(type(part) is int and part > 1,
+                    "A network fault must target a pending part after the first one")
+            require(upload.fault_part is None and not upload.fault_injected,
+                    "A network fault was already armed")
+            upload.fault_part = part
         elif path == "/completion-timing":
             elapsed = body.get("completedAfterMs")
+            regressions = body.get("progressRegressions")
+            premature = body.get("prematureHundreds")
             require(upload.completed, "Timing evidence requires a completed upload")
             require(type(elapsed) in (int, float) and 0 <= elapsed <= 20000,
                     "Missing or invalid completion timing: must be within 20 seconds of 100%")
+            require(regressions == 0,
+                    f"Progress went backwards {regressions!r} time(s) before completion")
+            require(premature == 0,
+                    f"Progress reported 100% {premature!r} time(s) before completion")
             upload.completed_after_ms = elapsed
+            upload.progress_regressions = regressions
+            upload.premature_hundreds = premature
         else:
             raise ValueError(f"Unknown control endpoint {path}")
         return {}
@@ -249,6 +277,11 @@ class Backend:
             "paused": upload.paused, "resumed": upload.resumed,
             "completed": upload.completed, "verified": upload.verified,
             "completedAfter100PercentMs": upload.completed_after_ms,
+            "networkErrorInjected": upload.fault_injected,
+            "networkErrorRetriedPart": upload.fault_part if upload.fault_injected else None,
+            "networkErrorRetried": upload.fault_retried(),
+            "progressRegressionsBeforeCompletion": upload.progress_regressions,
+            "prematureHundredPercent": upload.premature_hundreds,
             "partUrlRequests": dict(upload.requested),
             "partPutRequests": dict(upload.put_requests),
         } for mode, upload in self.uploads.items()}
@@ -259,6 +292,14 @@ class Backend:
                         for u in report.values()), "Missing upload/download/pause/resume evidence")
             require(all(u["completedAfter100PercentMs"] is not None for u in report.values()),
                     "Missing 100%-to-completion timing evidence")
+            require(all(u["networkErrorInjected"] for u in report.values()),
+                    "Missing injected network error: the part retry path never ran")
+            require(all(u["networkErrorRetried"] for u in report.values()),
+                    "The dropped part was never retried")
+            require(all(u["progressRegressionsBeforeCompletion"] == 0 for u in report.values()),
+                    "Upload progress went backwards before completion")
+            require(all(u["prematureHundredPercent"] == 0 for u in report.values()),
+                    "Upload reported 100% before completion")
         return report
 
 
@@ -332,6 +373,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if RELEASE_STAGGER_MS:
                 time.sleep(RELEASE_STAGGER_MS * (part - 2) / 1000)
+        if upload.fault_part == part and not upload.fault_injected:
+            # The whole body arrived, then the link dies before the response: the
+            # uploader already counted these bytes but never learns an ETag, so it has
+            # to retry the part. This is the connection-error path from the bug report.
+            # Nothing is forwarded to S3 and nothing is answered; the server closes the
+            # connection, which every client reports as a network error.
+            upload.fault_injected = True
+            self.log_message("Injected network error for part %s after its body", part)
+            self.close_connection = True
+            return
         storage = self.server.backend.storage
         connection = http.client.HTTPConnection(storage.hostname, storage.port, timeout=30)
         try:

@@ -30,6 +30,8 @@ export default function TestApp({ initializeEncryptor }: {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<UploadProgress>();
   const [completionAfterMs, setCompletionAfterMs] = useState<number>();
+  const [networkRetryVerified, setNetworkRetryVerified] = useState(false);
+  const [networkFaultArmed, setNetworkFaultArmed] = useState(false);
   const current = useRef<{ hash: string; mode: string } | undefined>(undefined);
   const completionTiming = useRef(new CompletionTiming());
   const completionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -41,6 +43,12 @@ export default function TestApp({ initializeEncryptor }: {
     const timing = completionTiming.current;
     try {
       timing.observe(file, performance.now());
+      if (file.state === 'COMPLETED') {
+        // The server drops one part PUT after receiving its body, so completion can
+        // only be reached by retrying a part whose bytes were already counted.
+        timing.assertClean();
+        setNetworkRetryVerified(true);
+      }
       if (timing.completedAfterMs !== undefined) {
         clearTimeout(completionTimer.current);
         setCompletionAfterMs(timing.assertComplete());
@@ -85,6 +93,8 @@ export default function TestApp({ initializeEncryptor }: {
     completionTiming.current = new CompletionTiming();
     current.current = undefined;
     setCompletionAfterMs(undefined);
+    setNetworkRetryVerified(false);
+    setNetworkFaultArmed(false);
     await initializeEncryptor?.();
     S3BgUploader.cancel();
     // A query also fences the worker's asynchronous cancel() on web.
@@ -188,11 +198,22 @@ export default function TestApp({ initializeEncryptor }: {
       throw new Error('Uploader left PAUSED while paused');
     }
     await api('/paused', { mode: current.current?.mode, before, after });
+    // The paused snapshot counts committed parts only, so the resumed run starts there.
+    completionTiming.current.resetProgressBaseline(after.uploadedBytes);
     setStatus('Pause verified');
   };
 
   const resume = async () => {
-    await api('/resumed', { mode: current.current?.mode });
+    const mode = current.current?.mode;
+    const { totalParts, completedParts } = await snapshot();
+    if (!(totalParts > 1) || completedParts >= totalParts) {
+      throw new Error('Cannot arm a network error without a pending part');
+    }
+    // Drop the last pending part's PUT once, after its body was delivered: the
+    // uploader counted those bytes but never got an ETag, so it has to retry.
+    await api('/fault', { mode, part: totalParts });
+    setNetworkFaultArmed(true);
+    await api('/resumed', { mode });
     await S3BgUploader.resume();
     setStatus('Resume requested');
   };
@@ -202,9 +223,13 @@ export default function TestApp({ initializeEncryptor }: {
     if (progress?.state !== 'COMPLETED' || progress.fileHash !== current.current?.hash) {
       throw new Error('Upload is not complete');
     }
+    const timing = completionTiming.current;
+    timing.assertClean();
     await api('/completion-timing', {
       mode: current.current?.mode,
-      completedAfterMs: completionTiming.current.assertComplete(),
+      completedAfterMs: timing.assertComplete(),
+      progressRegressions: timing.progressRegressions,
+      prematureHundreds: timing.prematureHundreds,
     });
     await api('/verify', { mode: current.current?.mode });
     setStatus(current.current?.mode === 'encrypted'
@@ -241,6 +266,9 @@ export default function TestApp({ initializeEncryptor }: {
         : `Completed parts: ${progress?.completedParts ?? 0}`}</Text>
       {completionAfterMs !== undefined && (
         <Text>Completion within 20 seconds verified</Text>
+      )}
+      {networkFaultArmed && networkRetryVerified && (
+        <Text>Network error retried without losing progress</Text>
       )}
       {busy && <Text>Working</Text>}
       {!!error && <Text accessibilityRole="alert">E2E error: {error}</Text>}

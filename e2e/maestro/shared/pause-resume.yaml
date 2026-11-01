@@ -17,3 +17,9 @@ appId: ${APP_ID}
     timeout: 120000
 - assertNotVisible: "E2E error:.*"
 - assertVisible: Completion within 20 seconds verified
+# The resumed run drops one part PUT after its body arrived, so completion needs a
+# retry of a part whose bytes were already counted. The app only shows this when the
+# bar never went backwards and never claimed 100% before COMPLETED.
+- extendedWaitUntil:
+    visible: Network error retried without losing progress
+    timeout: 30000
