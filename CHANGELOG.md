@@ -1,3 +1,13 @@
+## [1.3.0](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.2.0...v1.3.0) (2026-11-01)
+
+### ✨ Features
+
+* **ci:** allow manual docs checks for merged PRs ([6ab371e](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/6ab371e3e3f781a3a5bda2237ab446962db6511d))
+
+### 🐛 Bug Fixes
+
+* **ci:** use GH_TOKEN consistently for docs workflow ([f75ccd8](https://github.com/nikwebr/react-native-s3-bg-uploader/commit/f75ccd84147d9a54d75ff740f97037cfa440aae0))
+
 ## [1.2.0](https://github.com/nikwebr/react-native-s3-bg-uploader/compare/v1.1.3...v1.2.0) (2026-10-31)
 
 ### ✨ Features
