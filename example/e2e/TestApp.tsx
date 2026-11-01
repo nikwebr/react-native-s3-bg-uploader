@@ -44,9 +44,8 @@ export default function TestApp({ initializeEncryptor }: {
     try {
       timing.observe(file, performance.now());
       if (file.state === 'COMPLETED') {
-        // The server drops one part PUT after receiving its body. Because only
-        // acknowledged parts count, completion can still be reached without the bar
-        // ever claiming 100% for the unacknowledged part.
+        // The server drops one part PUT after receiving its body, so completion can only
+        // be reached by retrying a part whose bytes the transport already reported.
         timing.assertClean();
         setNetworkRetryVerified(true);
       }
@@ -199,8 +198,9 @@ export default function TestApp({ initializeEncryptor }: {
       throw new Error('Uploader left PAUSED while paused');
     }
     await api('/paused', { mode: current.current?.mode, before, after });
-    // Paused and resumed runs both report committed bytes only, so the monotonic
-    // check spans the pause: a resumed run that dropped back would be caught.
+    // The paused snapshot counts acknowledged parts only, so the resumed run has to
+    // continue from it instead of rewinding.
+    completionTiming.current.recordPausedSnapshot(after.uploadedBytes);
     setStatus('Pause verified');
   };
 
@@ -211,10 +211,16 @@ export default function TestApp({ initializeEncryptor }: {
       throw new Error('Cannot arm a network error without a pending part');
     }
     // Drop the last pending part's PUT once, after its body was delivered: the
-    // uploader counted those bytes but never got an ETag, so it has to retry.
+    // transport reported those bytes but no ETag arrived, so the part has to be sent
+    // again. Its bytes must not be reported as 100% and the retry must be visible.
     await api('/fault', { mode, part: totalParts });
     setNetworkFaultArmed(true);
     await api('/resumed', { mode });
+    // The completion budget is measured for the run the user just resumed, so drop a
+    // watchdog armed by the previous run's maxed-out bar.
+    completionTiming.current.markResumed(performance.now());
+    clearTimeout(completionTimer.current);
+    completionTimer.current = undefined;
     await S3BgUploader.resume();
     setStatus('Resume requested');
   };
@@ -229,8 +235,10 @@ export default function TestApp({ initializeEncryptor }: {
     await api('/completion-timing', {
       mode: current.current?.mode,
       completedAfterMs: timing.assertComplete(),
-      progressRegressions: timing.progressRegressions,
+      networkProgressReports: timing.networkProgressReports,
       prematureHundreds: timing.prematureHundreds,
+      committedRegressions: timing.committedRegressions,
+      resumeRegressions: timing.resumeRegressions,
     });
     await api('/verify', { mode: current.current?.mode });
     setStatus(current.current?.mode === 'encrypted'

@@ -87,8 +87,8 @@ class BackendTests(unittest.TestCase):
         return started
 
     def timing(self, mode, **evidence):
-        payload = {"mode": mode, "completedAfterMs": 0,
-                   "progressRegressions": 0, "prematureHundreds": 0}
+        payload = {"mode": mode, "completedAfterMs": 0, "networkProgressReports": 12,
+                   "prematureHundreds": 0, "committedRegressions": 0, "resumeRegressions": 0}
         payload.update(evidence)
         return self.backend.control("/completion-timing", payload)
 
@@ -115,10 +115,14 @@ class BackendTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "within 20 seconds"):
                     self.timing("plain", completedAfterMs=elapsed)
         for evidence, expected in (
-            ({"progressRegressions": 1}, "Progress went backwards"),
+            ({"networkProgressReports": 0}, "Missing network progress"),
+            ({"networkProgressReports": None}, "Missing network progress"),
             ({"prematureHundreds": 1}, "Progress reported 100%"),
-            ({"progressRegressions": None}, "Progress went backwards"),
             ({"prematureHundreds": None}, "Progress reported 100%"),
+            ({"committedRegressions": 1}, "fewer acknowledged parts"),
+            ({"committedRegressions": None}, "fewer acknowledged parts"),
+            ({"resumeRegressions": 1}, "fewer bytes than the paused snapshot"),
+            ({"resumeRegressions": None}, "fewer bytes than the paused snapshot"),
         ):
             with self.subTest(evidence=evidence):
                 with self.assertRaisesRegex(AssertionError, expected):

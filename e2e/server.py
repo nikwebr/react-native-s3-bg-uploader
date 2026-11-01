@@ -57,8 +57,10 @@ class Upload:
     fault_part: int | None = None
     fault_injected: bool = False
     # Progress evidence the test app reports alongside the completion timing.
-    progress_regressions: int | None = None
+    network_progress_reports: int | None = None
     premature_hundreds: int | None = None
+    committed_regressions: int | None = None
+    resume_regressions: int | None = None
 
     def fault_retried(self) -> bool:
         return (self.fault_injected and self.fault_part is not None
@@ -204,18 +206,26 @@ class Backend:
             upload.fault_part = part
         elif path == "/completion-timing":
             elapsed = body.get("completedAfterMs")
-            regressions = body.get("progressRegressions")
+            network_progress = body.get("networkProgressReports")
             premature = body.get("prematureHundreds")
+            committed = body.get("committedRegressions")
+            resume = body.get("resumeRegressions")
             require(upload.completed, "Timing evidence requires a completed upload")
             require(type(elapsed) in (int, float) and 0 <= elapsed <= 20000,
                     "Missing or invalid completion timing: must be within 20 seconds of 100%")
-            require(regressions == 0,
-                    f"Progress went backwards {regressions!r} time(s) before completion")
+            require(type(network_progress) is int and network_progress > 0,
+                    "Missing network progress: the bar never moved while a part was uploaded")
             require(premature == 0,
-                    f"Progress reported 100% {premature!r} time(s) while parts were unacknowledged")
+                    f"Progress reported 100% {premature!r} time(s) before completion")
+            require(committed == 0,
+                    f"Progress reported fewer acknowledged parts {committed!r} time(s)")
+            require(resume == 0,
+                    f"Resumed upload reported fewer bytes than the paused snapshot {resume!r} time(s)")
             upload.completed_after_ms = elapsed
-            upload.progress_regressions = regressions
+            upload.network_progress_reports = network_progress
             upload.premature_hundreds = premature
+            upload.committed_regressions = committed
+            upload.resume_regressions = resume
         else:
             raise ValueError(f"Unknown control endpoint {path}")
         return {}
@@ -280,8 +290,10 @@ class Backend:
             "networkErrorInjected": upload.fault_injected,
             "networkErrorRetriedPart": upload.fault_part if upload.fault_injected else None,
             "networkErrorRetried": upload.fault_retried(),
-            "progressRegressionsBeforeCompletion": upload.progress_regressions,
+            "networkProgressReports": upload.network_progress_reports,
             "prematureHundredPercent": upload.premature_hundreds,
+            "committedProgressRegressionsBeforeCompletion": upload.committed_regressions,
+            "resumeProgressRegressions": upload.resume_regressions,
             "partUrlRequests": dict(upload.requested),
             "partPutRequests": dict(upload.put_requests),
         } for mode, upload in self.uploads.items()}
@@ -296,10 +308,15 @@ class Backend:
                     "Missing injected network error: the part retry path never ran")
             require(all(u["networkErrorRetried"] for u in report.values()),
                     "The dropped part was never retried")
-            require(all(u["progressRegressionsBeforeCompletion"] == 0 for u in report.values()),
-                    "Upload progress went backwards before completion")
+            require(all(u["networkProgressReports"] for u in report.values()),
+                    "Missing network progress while parts were uploaded")
             require(all(u["prematureHundredPercent"] == 0 for u in report.values()),
-                    "Upload reported 100% while parts were still unacknowledged")
+                    "Upload reported 100% before completion")
+            require(all(u["committedProgressRegressionsBeforeCompletion"] == 0
+                        for u in report.values()),
+                    "Upload reported fewer acknowledged parts before completion")
+            require(all(u["resumeProgressRegressions"] == 0 for u in report.values()),
+                    "Resumed upload reported fewer bytes than the paused snapshot")
         return report
 
 
