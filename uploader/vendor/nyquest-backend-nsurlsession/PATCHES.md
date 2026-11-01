@@ -45,6 +45,10 @@ the producer updates the stream. The delegate must always observe `AtEnd`.
 The unpatched implementation reproduces `Open` during an EOF callback.
 The buffered-tail case also checks the bytes read and reproduces a missing EOF
 notification before the consumer-side fix.
+Reverting only these two hunks in an otherwise fixed tree reproduces the iOS end
+to end stall (`"Upload completed" is visible` after three minutes, with the
+worker blocked inside the backend request) in about one of two runs, which is
+why this override is carried rather than relying on the uploader's timeouts.
 Run it with the uploader's existing lockfile:
 
 ```sh

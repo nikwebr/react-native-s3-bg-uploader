@@ -4,9 +4,11 @@ appId: ${APP_ID}
     visible: "Completed parts: 1"
     timeout: 60000
 - tapOn: Pause upload
+# The app verifies the pause itself: up to 10s to reach PAUSED, then a 5s quiet
+# window (in-flight parts are allowed to finish) with a 45s ceiling.
 - extendedWaitUntil:
     visible: Pause verified
-    timeout: 20000
+    timeout: 90000
 - assertNotVisible: Upload completed
 - assertNotVisible: "E2E error:.*"
 - tapOn: Resume upload

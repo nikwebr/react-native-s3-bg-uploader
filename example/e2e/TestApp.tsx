@@ -123,11 +123,14 @@ export default function TestApp({ initializeEncryptor }: {
   // Parts already sent when pause arrives are allowed to finish. Wait until progress
   // has been unchanged for a full window, so a slow runner cannot report those
   // permitted completions as progress that happened "while paused".
+  // A no-op pause keeps dispatching, so the quiet window can then never be reached
+  // before the deadline: the check still fails if pause does not actually stop work.
+  const SETTLE_QUIET_MS = 5000;
   const settle = async (): Promise<UploadProgress> => {
-    const deadline = Date.now() + 30000;
+    const deadline = Date.now() + 45000;
     let stable = await snapshot();
     let stableSince = Date.now();
-    while (Date.now() - stableSince < 2000) {
+    while (Date.now() - stableSince < SETTLE_QUIET_MS) {
       if (Date.now() > deadline) throw new Error('Upload did not settle while paused');
       await sleep(200);
       const next = await snapshot().catch(() => {
@@ -162,12 +165,21 @@ export default function TestApp({ initializeEncryptor }: {
     // Already-sent parts may finish after a pause. Wait for progress to stop moving
     // instead of sleeping a fixed time: a fixed window made the check depend on how
     // fast the runner completed those in-flight parts.
-    const before = await settle();
+    // A straggler that was already in flight can still land right after a quiet
+    // window. Re-settle instead of failing: the contract allows those completions,
+    // and only an upload that keeps moving (pause did not stop dispatch) can never
+    // reach a second quiet window.
+    let before = await settle();
+    let after = await snapshot();
+    for (let attempt = 0; attempt < 3 && before.completedParts < before.totalParts &&
+         (after.completedParts !== before.completedParts ||
+          after.uploadedBytes !== before.uploadedBytes); attempt++) {
+      before = await settle();
+      after = await snapshot();
+    }
     if (before.completedParts >= before.totalParts) {
       throw new Error('All parts uploaded while paused');
     }
-    // confirm nothing moves again for a full window
-    const after = await settle();
     if (after.completedParts !== before.completedParts ||
         after.uploadedBytes !== before.uploadedBytes) {
       throw new Error('Upload advanced while paused');
