@@ -46,12 +46,12 @@ pub fn pause_all<N: ProgressNotifier>(manager: &ProgressManager<N>) {
 
 /// Call `session::resume_all()` and fire progress callbacks so the UI reflects the
 /// resumed state immediately, without waiting for the next upload event.
-/// Paused files show Running (the upload may still be active on fast pause+resume).
-/// Failed files show Initialized (they will restart from scratch).
+/// Resumed files show Initialized until the new worker initializes its tracking.
+/// Discard in-flight bytes and never accept old workers' updates.
 /// Does NOT touch platform pause flags — the caller is responsible for clearing those.
 /// Returns an error if any session file still needs a fresh local file reference.
 pub fn resume_all<N: ProgressNotifier>(manager: &ProgressManager<N>) -> Result<(), String> {
-    let resumed_info: Vec<(String, UploadState)> = {
+    let resumed_keys: Vec<String> = {
         let sess = session::session();
         let missing = sess.files_needing_provision.len();
         if missing > 0 {
@@ -62,17 +62,12 @@ pub fn resume_all<N: ProgressNotifier>(manager: &ProgressManager<N>) -> Result<(
         sess.files
             .values()
             .filter(|e| e.state == UploadState::Paused || e.state == UploadState::Failed)
-            .map(|e| (e.file_key.clone(), e.state.clone()))
+            .map(|e| e.file_key.clone())
             .collect()
     };
     session::resume_all();
-    for (key, original_state) in &resumed_info {
-        let new_status = if *original_state == UploadState::Paused {
-            UploadState::Running
-        } else {
-            UploadState::Initialized
-        };
-        set_status(manager, &key, new_status);
+    for key in &resumed_keys {
+        set_status(manager, key, UploadState::Initialized);
     }
     Ok(())
 }
@@ -100,6 +95,16 @@ pub fn init_progress<N: ProgressNotifier>(
             e.map(|e| e.state == UploadState::Paused).unwrap_or(false),
         )
     };
+    let completed_part_numbers = session::session()
+        .files
+        .get(file_key)
+        .map(|e| {
+            e.completed_chunk_etags
+                .iter()
+                .map(|(part, _)| *part)
+                .collect()
+        })
+        .unwrap_or_default();
     manager.init(
         file_key.to_string(),
         file_name,
@@ -109,6 +114,8 @@ pub fn init_progress<N: ProgressNotifier>(
         total_parts,
         committed_bytes,
         completed_parts,
+        completed_part_numbers,
+        session::file_run_version(file_key).unwrap_or(0),
         session_agg,
         transfer_agg,
     );
@@ -134,12 +141,17 @@ pub fn update_in_flight<N: ProgressNotifier>(
     file_key: &str,
     part_number: u32,
     bytes_uploaded: u64,
+    run_version: u64,
 ) {
+    if !session::is_current_run(file_key, run_version) {
+        return;
+    }
     let (_, session_agg, transfer_agg) = aggregate_snapshot_for_file(file_key);
-    manager.update_in_flight(
+    manager.update_in_flight_for_run(
         file_key,
         part_number,
         bytes_uploaded,
+        Some(run_version),
         session_agg,
         transfer_agg,
     );
@@ -151,11 +163,21 @@ pub fn complete_chunk<N: ProgressNotifier>(
     part_number: u32,
     etag: String,
     chunk_size: u64,
-) {
-    session::session().complete_chunk(file_key, part_number, etag, chunk_size);
+    run_version: u64,
+) -> bool {
+    {
+        let mut sess = session::session();
+        if !sess.files.get(file_key).is_some_and(|entry| {
+            entry.run_version == run_version && entry.state == UploadState::Running
+        }) {
+            return false;
+        }
+        sess.complete_chunk(file_key, part_number, etag, chunk_size);
+    }
     session::persist_session();
     let (_, session_agg, transfer_agg) = aggregate_snapshot_for_file(file_key);
     manager.complete_chunk(file_key, part_number, chunk_size, session_agg, transfer_agg);
+    true
 }
 
 /// Fire a progress callback announcing that a file was cancelled.

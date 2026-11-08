@@ -271,7 +271,13 @@ pub(crate) fn process_pending_files() {
 }
 
 pub(crate) fn enqueue_file(file_key: String, file: web_sys::File) {
-    FILE_QUEUE.with(|q| q.borrow_mut().push_back(FileQueueEntry { file_key, file }));
+    FILE_QUEUE.with(|q| {
+        let mut queue = q.borrow_mut();
+        // Re-provisioning a failed/paused file replaces its retained File, not
+        // its multipart session and not a second queue entry for the same key.
+        queue.retain(|entry| entry.file_key != file_key);
+        queue.push_back(FileQueueEntry { file_key, file });
+    });
     maybe_start_next();
 }
 
@@ -296,7 +302,12 @@ fn maybe_start_next() {
         QUEUE_RUNNING.with(|r| *r.borrow_mut() = true);
         spawn_local(async move {
             let outcome = upload::run_upload(&entry.file_key, entry.file.clone()).await;
-            if matches!(outcome, UploadOutcome::Paused) {
+            if matches!(outcome, UploadOutcome::Failed(_)) {
+                // Keep the File alive for an explicit resume, just as native
+                // retains its path/fd. Do not immediately loop through failures.
+                PAUSE_REQUESTED.with(|p| *p.borrow_mut() = true);
+            }
+            if matches!(outcome, UploadOutcome::Paused | UploadOutcome::Failed(_)) {
                 FILE_QUEUE.with(|q| q.borrow_mut().push_front(entry));
             }
             QUEUE_RUNNING.with(|r| *r.borrow_mut() = false);

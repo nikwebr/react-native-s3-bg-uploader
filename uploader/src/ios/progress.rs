@@ -116,6 +116,7 @@ impl Read for ProgressReader {
                     &self.file_key,
                     self.part_number,
                     self.bytes_read,
+                    self.run_version,
                 );
             }
         }

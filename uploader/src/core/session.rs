@@ -716,6 +716,8 @@ impl Session {
         for entry in self.files.values_mut() {
             if entry.state == UploadState::Running {
                 entry.state = UploadState::Paused;
+                // Fence old requests at pause, not only when resume is called.
+                entry.run_version = entry.run_version.saturating_add(1);
             }
         }
         self.recompute_global_state();

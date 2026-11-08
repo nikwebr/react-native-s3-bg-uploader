@@ -22,9 +22,224 @@ pub struct UploadProgress {
     pub in_flight_progress: HashMap<u32, u64>,
     pub completed_parts: u32,
     pub status: UploadState,
+    run_version: u64,
     /// Guards against double-counting when stale workers from a previous run
     /// call complete_chunk after a pause+resume starts a new run.
     completed_part_set: HashSet<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::session::Session;
+
+    #[test]
+    fn retries_discard_unconfirmed_bytes_and_never_report_100_before_acknowledgement() {
+        let mut p = UploadProgress::new(
+            "key".into(),
+            "file".into(),
+            "hash".into(),
+            "transfer".into(),
+            1000,
+            2,
+        );
+        p.complete_chunk(1, 500);
+        for _ in 0..5 {
+            p.update_in_flight(2, 500);
+            assert_eq!(p.uploaded_bytes(), 990);
+            p.update_in_flight(2, 0);
+            assert_eq!(p.percentage(), 50.0);
+        }
+        p.complete_chunk(2, 500);
+        assert_eq!(p.percentage(), 100.0);
+        p.update_in_flight(2, 1);
+        p.complete_chunk(2, 1);
+        assert_eq!(p.uploaded_bytes(), 1000);
+        assert_eq!(p.completed_parts, 2);
+    }
+
+    #[test]
+    fn pause_failure_and_resume_use_only_confirmed_parts() {
+        let manager = ProgressManager::new(NoOpNotifier);
+        let mut session = Session::new();
+        session.register_file(
+            "key".into(),
+            "hash".into(),
+            "transfer".into(),
+            "".into(),
+            "file".into(),
+            1000,
+            HashMap::new(),
+        );
+        session.complete_chunk("key", 1, "etag".into(), 500);
+        let s = session.get_aggregate_progress(None);
+        let t = session.get_aggregate_progress(Some("transfer"));
+        manager.init(
+            "key".into(),
+            "file".into(),
+            "hash".into(),
+            "transfer".into(),
+            1000,
+            2,
+            500,
+            1,
+            HashSet::from([1]),
+            0,
+            s.clone(),
+            t.clone(),
+        );
+        manager.update_in_flight("key", 2, 400, s.clone(), t.clone());
+        for state in [UploadState::Failed, UploadState::Paused] {
+            manager.set_status("key", state, s.clone(), t.clone());
+            assert_eq!(manager.get_live_progress(None, None)[0].uploaded_bytes, 500);
+            manager.set_status("key", UploadState::Initialized, s.clone(), t.clone());
+            manager.update_in_flight("key", 2, 500, s.clone(), t.clone());
+            manager.init(
+                "key".into(),
+                "file".into(),
+                "hash".into(),
+                "transfer".into(),
+                1000,
+                2,
+                500,
+                1,
+                HashSet::from([1]),
+                0,
+                s.clone(),
+                t.clone(),
+            );
+            manager.update_in_flight("key", 2, 0, s.clone(), t.clone());
+            // A late completion for a resumed, already-confirmed part is ignored.
+            manager.complete_chunk("key", 1, 500, s.clone(), t.clone());
+            let live = manager.get_live_progress(None, None).remove(0);
+            assert_eq!(live.uploaded_bytes, 500);
+            assert_eq!(live.completed_parts, 1);
+            let (sa, ta) = manager.get_live_aggregate(s.clone(), t.clone(), "transfer");
+            assert_eq!(sa.uploaded_size, 500);
+            assert_eq!(ta.percentage, 50.0);
+        }
+        session.complete_chunk("key", 2, "etag2".into(), 500);
+        manager.complete_chunk(
+            "key",
+            2,
+            500,
+            session.get_aggregate_progress(None),
+            session.get_aggregate_progress(Some("transfer")),
+        );
+        assert_eq!(manager.get_live_progress(None, None)[0].percentage, 100.0);
+    }
+
+    #[test]
+    fn an_old_request_cannot_repopulate_a_resumed_runs_in_flight_bytes() {
+        let manager = ProgressManager::new(NoOpNotifier);
+        let aggregate = Session::new().get_aggregate_progress(None);
+        manager.init(
+            "key".into(),
+            "file".into(),
+            "hash".into(),
+            "transfer".into(),
+            1000,
+            2,
+            500,
+            1,
+            HashSet::from([1]),
+            2,
+            aggregate.clone(),
+            aggregate.clone(),
+        );
+        manager.update_in_flight_for_run(
+            "key",
+            2,
+            400,
+            Some(1),
+            aggregate.clone(),
+            aggregate.clone(),
+        );
+        assert_eq!(manager.get_live_progress(None, None)[0].uploaded_bytes, 500);
+        manager.update_in_flight_for_run("key", 2, 400, Some(2), aggregate.clone(), aggregate);
+        assert_eq!(manager.get_live_progress(None, None)[0].uploaded_bytes, 900);
+    }
+
+    #[test]
+    fn concurrent_workers_deliver_snapshots_in_progress_order() {
+        use std::sync::{mpsc, Arc, Condvar};
+        use std::thread;
+        use std::time::Duration;
+
+        struct GatedNotifier {
+            entered: mpsc::Sender<()>,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+            seen: Arc<Mutex<Vec<u64>>>,
+        }
+        impl ProgressNotifier for GatedNotifier {
+            fn notify(&self, fp: &FileProgress, _: &AggregateProgress, _: &AggregateProgress) {
+                self.seen.lock().unwrap().push(fp.uploaded_bytes);
+                if fp.uploaded_bytes == 100 {
+                    self.entered.send(()).unwrap();
+                    let (lock, signal) = &*self.gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = signal.wait(released).unwrap();
+                    }
+                }
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let manager = Arc::new(ProgressManager::new(GatedNotifier {
+            entered: entered_tx,
+            gate: gate.clone(),
+            seen: seen.clone(),
+        }));
+        let aggregate = Session::new().get_aggregate_progress(None);
+        manager.init(
+            "key".into(),
+            "file".into(),
+            "hash".into(),
+            "transfer".into(),
+            1000,
+            2,
+            0,
+            0,
+            HashSet::new(),
+            0,
+            aggregate.clone(),
+            aggregate.clone(),
+        );
+        let first = {
+            let manager = manager.clone();
+            let aggregate = aggregate.clone();
+            thread::spawn(move || {
+                manager.update_in_flight("key", 1, 100, aggregate.clone(), aggregate)
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let second = {
+            let manager = manager.clone();
+            thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                manager.update_in_flight("key", 2, 100, aggregate.clone(), aggregate);
+                finished_tx.send(()).unwrap();
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let returned_early = finished_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        // Polling must remain available while delivery is blocked.
+        let polled = manager.get_live_progress(None, None)[0].uploaded_bytes;
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(
+            !returned_early,
+            "A newer snapshot overtook the blocked callback"
+        );
+        assert_eq!(polled, 100);
+        assert_eq!(*seen.lock().unwrap(), vec![0, 100, 200]);
+    }
 }
 
 impl UploadProgress {
@@ -47,13 +262,28 @@ impl UploadProgress {
             in_flight_progress: HashMap::new(),
             completed_parts: 0,
             status: UploadState::Running,
+            run_version: 0,
             completed_part_set: HashSet::new(),
         }
     }
 
     pub fn uploaded_bytes(&self) -> u64 {
+        if self.status != UploadState::Running {
+            return self.completed_bytes.min(self.total_bytes);
+        }
         let in_flight_sum: u64 = self.in_flight_progress.values().sum();
-        self.completed_bytes + in_flight_sum
+        self.completed_bytes
+            .saturating_add(in_flight_sum)
+            .min(self.progress_ceiling())
+    }
+
+    fn progress_ceiling(&self) -> u64 {
+        if self.completed_bytes >= self.total_bytes {
+            self.total_bytes
+        } else {
+            self.total_bytes
+                .saturating_sub(self.total_bytes.div_ceil(100))
+        }
     }
 
     pub fn percentage(&self) -> f64 {
@@ -67,6 +297,9 @@ impl UploadProgress {
     }
 
     pub fn update_in_flight(&mut self, part_number: u32, bytes_uploaded: u64) {
+        if self.completed_part_set.contains(&part_number) {
+            return;
+        }
         self.in_flight_progress.insert(part_number, bytes_uploaded);
     }
 
@@ -123,6 +356,10 @@ impl ProgressNotifier for NoOpNotifier {
 
 pub struct ProgressManager<N: ProgressNotifier> {
     notifier: N,
+    /// Serialize snapshot construction and delivery across native part workers.
+    /// The progress lock is still released before invoking a notifier, so a
+    /// callback can safely query progress without seeing out-of-order snapshots.
+    notification: Mutex<()>,
     progress: Mutex<HashMap<String, UploadProgress>>,
 }
 
@@ -130,6 +367,7 @@ impl<N: ProgressNotifier> ProgressManager<N> {
     pub fn new(notifier: N) -> Self {
         Self {
             notifier,
+            notification: Mutex::new(()),
             progress: Mutex::new(HashMap::new()),
         }
     }
@@ -167,6 +405,37 @@ impl<N: ProgressNotifier> ProgressManager<N> {
                 }
             }
         }
+        // Apply the same acknowledgement ceiling to aggregate callbacks/polls,
+        // including when the committed session baseline alone exceeds 99%.
+        if lock
+            .values()
+            .any(|p| p.status == UploadState::Running && p.completed_bytes < p.total_bytes)
+        {
+            session_agg.uploaded_size = session_agg.uploaded_size.min(
+                session_agg
+                    .total_size
+                    .saturating_sub(session_agg.total_size.div_ceil(100)),
+            );
+            if session_agg.total_size > 0 {
+                session_agg.percentage =
+                    session_agg.uploaded_size as f64 / session_agg.total_size as f64 * 100.0;
+            }
+        }
+        if lock.values().any(|p| {
+            p.status == UploadState::Running
+                && p.transfer_id == current_transfer_id
+                && p.completed_bytes < p.total_bytes
+        }) {
+            transfer_agg.uploaded_size = transfer_agg.uploaded_size.min(
+                transfer_agg
+                    .total_size
+                    .saturating_sub(transfer_agg.total_size.div_ceil(100)),
+            );
+            if transfer_agg.total_size > 0 {
+                transfer_agg.percentage =
+                    transfer_agg.uploaded_size as f64 / transfer_agg.total_size as f64 * 100.0;
+            }
+        }
         (session_agg, transfer_agg)
     }
 
@@ -180,9 +449,12 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         total_parts: u32,
         already_completed_bytes: u64,
         already_completed_parts: u32,
+        completed_part_numbers: HashSet<u32>,
+        run_version: u64,
         session_agg: AggregateProgress,
         transfer_agg: AggregateProgress,
     ) {
+        let _notification = self.notification.lock().unwrap();
         let mut p = UploadProgress::new(
             file_key.clone(),
             file_name,
@@ -193,9 +465,15 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         );
         p.completed_bytes = already_completed_bytes;
         p.completed_parts = already_completed_parts;
+        p.completed_part_set = completed_part_numbers;
+        p.run_version = run_version;
+        let mut lock = self.progress.lock().unwrap();
         let fp = p.to_file_progress();
-        self.progress.lock().unwrap().insert(file_key, p);
-        self.notifier.notify(&fp, &session_agg, &transfer_agg);
+        let tid = p.transfer_id.clone();
+        lock.insert(file_key, p);
+        let (s, t) = Self::build_aggregates(&lock, session_agg, transfer_agg, &tid);
+        drop(lock);
+        self.notifier.notify(&fp, &s, &t);
     }
 
     pub fn tracked_file_keys(&self) -> Vec<String> {
@@ -214,9 +492,31 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         session_agg: AggregateProgress,
         transfer_agg: AggregateProgress,
     ) {
+        self.update_in_flight_for_run(
+            file_key,
+            part_number,
+            bytes_uploaded,
+            None,
+            session_agg,
+            transfer_agg,
+        );
+    }
+
+    pub fn update_in_flight_for_run(
+        &self,
+        file_key: &str,
+        part_number: u32,
+        bytes_uploaded: u64,
+        run_version: Option<u64>,
+        session_agg: AggregateProgress,
+        transfer_agg: AggregateProgress,
+    ) {
+        let _notification = self.notification.lock().unwrap();
         let mut lock = self.progress.lock().unwrap();
         if let Some(p) = lock.get_mut(file_key) {
-            if p.status != UploadState::Running {
+            if p.status != UploadState::Running
+                || run_version.is_some_and(|version| p.run_version != version)
+            {
                 // Don't re-populate in_flight after pause; stale bytes would inflate
                 // progress reported by polls and aggregate calculations.
                 return;
@@ -238,6 +538,7 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         session_agg: AggregateProgress,
         transfer_agg: AggregateProgress,
     ) {
+        let _notification = self.notification.lock().unwrap();
         let mut lock = self.progress.lock().unwrap();
         if let Some(p) = lock.get_mut(file_key) {
             p.complete_chunk(part_number, chunk_size);
@@ -256,10 +557,11 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         session_agg: AggregateProgress,
         transfer_agg: AggregateProgress,
     ) {
+        let _notification = self.notification.lock().unwrap();
         let mut lock = self.progress.lock().unwrap();
         if let Some(p) = lock.get_mut(file_key) {
             p.status = status.clone();
-            if status == UploadState::Paused {
+            if status != UploadState::Running {
                 p.in_flight_progress.clear();
             }
             let fp = p.to_file_progress();
@@ -292,6 +594,7 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         session_agg: AggregateProgress,
         transfer_agg: AggregateProgress,
     ) {
+        let _notification = self.notification.lock().unwrap();
         let mut lock = self.progress.lock().unwrap();
         if let Some(existing) = lock.get(&file_key) {
             // Worker already started — notify with the live state, don't overwrite.
@@ -325,6 +628,7 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         session_agg: &AggregateProgress,
         transfer_agg: &AggregateProgress,
     ) {
+        let _notification = self.notification.lock().unwrap();
         self.notifier.notify(fp, session_agg, transfer_agg);
     }
 

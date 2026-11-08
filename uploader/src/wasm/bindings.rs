@@ -272,6 +272,7 @@ pub fn wasm_cancel_all() {
 pub fn wasm_pause_all() {
     PAUSE_REQUESTED.with(|p| *p.borrow_mut() = true);
     crate::core::runtime::pause_all(wasmProgress::progress_manager());
+    crate::wasm::upload::abort_upload_requests(None);
 }
 
 #[wasm_bindgen]

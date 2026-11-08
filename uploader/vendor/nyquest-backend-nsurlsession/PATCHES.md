@@ -1,5 +1,14 @@
 # Local patches to nyquest-backend-nsurlsession 0.3.1
 
+## blocking.rs — cancellation while waiting for response headers
+
+`with_request_cancellation` installs a thread-scoped cancellation predicate for
+the uploader's blocking PUT. The request loop checks it at most every 20ms and
+calls `NSURLSessionTask.cancel()` on cancellation. Without this, a fully buffered
+request never reads `ProgressReader` again and pausing (or a sibling failing)
+cannot cancel it until a response or the network timeout arrives. Ordinary
+requests without the scoped predicate retain the upstream blocking behavior.
+
 ## blocking.rs — explicit task.cancel() on stream body error
 
 **File:** `src/blocking.rs`, in `NSUrlSessionBlockingClient::request()`

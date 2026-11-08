@@ -487,25 +487,11 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeResumeAll(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    // Collect paused keys before clearing state so we can remove their ProgressManager
-    // entries after resume. This matches iOS behaviour: old worker threads that are still
-    // running after a rapid pause→resume cannot add stale in-flight bytes to the new
-    // run's tracking because the entry no longer exists. init_progress() will create
-    // a fresh entry when the new run starts.
-    let paused_keys: Vec<String> = {
-        let sess = session::session();
-        sess.files
-            .values()
-            .filter(|e| e.state == UploadState::Paused || e.state == UploadState::Failed)
-            .map(|e| e.file_key.clone())
-            .collect()
-    };
+    // resume_all resets to confirmed bytes in INITIALIZED state until the new
+    // run starts. Cancelled workers are fenced by run_version.
     PAUSE_FLAG.store(false, Ordering::Relaxed);
     match runtime::resume_all(androidProgress::progress_manager()) {
         Ok(()) => {
-            for key in &paused_keys {
-                androidProgress::progress_manager().remove(key);
-            }
             // Re-enqueue any files that previously failed so they can retry.
             let failed_fds: Vec<(String, RawFd)> = {
                 let mut map = crate::android::FAILED_FDS.lock().unwrap();

@@ -40,7 +40,10 @@ pub trait BlockingPlatformAdapter: Send + Sync + 'static {
 
     fn fetch_urls(&self, parts: &[u32]) -> Result<HashMap<u32, String>, String>;
 
-    fn make_worker(&self) -> Result<Box<dyn BlockingWorker>, String>;
+    fn make_worker(
+        &self,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Box<dyn BlockingWorker>, String>;
 
     fn on_missing_url(&self, _part_number: u32) {}
 
@@ -98,7 +101,7 @@ pub fn run_blocking_upload(
         let file_key_str = file_key_owned.clone();
 
         let handle = thread::spawn(move || {
-            let worker = match adapter.make_worker() {
+            let worker = match adapter.make_worker(abort.clone()) {
                 Ok(worker) => worker,
                 Err(error) => {
                     error_abort.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -114,7 +117,10 @@ pub fn run_blocking_upload(
                     Err(_) => break,
                 };
 
-                if adapter.is_paused() || !adapter.is_current_run() {
+                if abort.load(std::sync::atomic::Ordering::Relaxed)
+                    || adapter.is_paused()
+                    || !adapter.is_current_run()
+                {
                     abort.store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
@@ -221,6 +227,7 @@ pub fn run_blocking_upload(
         || (abort.load(std::sync::atomic::Ordering::Relaxed)
             && !error_abort.load(std::sync::atomic::Ordering::Relaxed));
     if should_return_early_for_pause {
+        abort.store(true, std::sync::atomic::Ordering::Relaxed);
         return Err("Upload paused".to_string());
     }
 
@@ -232,6 +239,7 @@ pub fn run_blocking_upload(
             || (abort.load(std::sync::atomic::Ordering::Relaxed)
                 && !error_abort.load(std::sync::atomic::Ordering::Relaxed))
         {
+            abort.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err("Upload paused".to_string());
         }
         thread::sleep(std::time::Duration::from_millis(10));
@@ -267,6 +275,78 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::Condvar;
     use std::time::Duration;
+
+    #[test]
+    fn exhausted_part_cancels_its_blocked_sibling() {
+        struct Adapter(Arc<AtomicBool>);
+        struct Worker {
+            started: Arc<AtomicBool>,
+            cancelled: Arc<AtomicBool>,
+        }
+        impl BlockingPlatformAdapter for Adapter {
+            fn fetch_urls(&self, parts: &[u32]) -> Result<HashMap<u32, String>, String> {
+                Ok(parts
+                    .iter()
+                    .map(|part| (*part, "test://part".into()))
+                    .collect())
+            }
+            fn make_worker(
+                &self,
+                cancelled: Arc<AtomicBool>,
+            ) -> Result<Box<dyn BlockingWorker>, String> {
+                Ok(Box::new(Worker {
+                    started: self.0.clone(),
+                    cancelled,
+                }))
+            }
+        }
+        impl BlockingWorker for Worker {
+            fn read_chunk(&self, _: &ChunkInfo) -> Result<Vec<u8>, String> {
+                Ok(vec![1])
+            }
+            fn upload_chunk(
+                &self,
+                _: &str,
+                _: &[u8],
+                part: u32,
+                _: &str,
+            ) -> Result<String, String> {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                if part == 1 {
+                    while !self.started.load(Ordering::SeqCst)
+                        && std::time::Instant::now() < deadline
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    return Err("network retries exhausted".into());
+                }
+                self.started.store(true, Ordering::SeqCst);
+                while !self.cancelled.load(Ordering::SeqCst) && std::time::Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(
+                    self.cancelled.load(Ordering::SeqCst),
+                    "Sibling waited for the network timeout"
+                );
+                Err("Upload aborted".into())
+            }
+        }
+        let started = std::time::Instant::now();
+        let result = run_blocking_upload(
+            Arc::new(Adapter(Arc::new(AtomicBool::new(false)))),
+            BlockingEngineConfig {
+                prefetch: BlockingPrefetch::Rolling,
+                fail_fast: true,
+            },
+            "file",
+            1,
+            2,
+            vec![1, 2],
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     struct WorkerGate {
         released: Mutex<bool>,
@@ -313,7 +393,7 @@ mod tests {
                 .collect())
         }
 
-        fn make_worker(&self) -> Result<Box<dyn BlockingWorker>, String> {
+        fn make_worker(&self, _: Arc<AtomicBool>) -> Result<Box<dyn BlockingWorker>, String> {
             Ok(Box::new(TestWorker(self.gate.clone())))
         }
     }

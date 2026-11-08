@@ -275,7 +275,11 @@ pub extern "C" fn resume_all() -> *mut c_char {
     };
     session::resume_all();
     for key in &resumed_keys {
-        iosProgress::progress_manager().remove(key);
+        runtime::set_status(
+            iosProgress::progress_manager(),
+            key,
+            UploadState::Initialized,
+        );
     }
     let mut queue = QUEUE.lock().unwrap();
     queue.pending.clear();

@@ -10,6 +10,7 @@ use crate::core::{ChunkUploadResult, MAX_CONCURRENT_UPLOADS};
 
 pub trait AsyncPlatformAdapter: 'static {
     fn is_paused(&self) -> bool;
+    fn abort_requests(&self) {}
 
     fn fetch_urls(
         &self,
@@ -57,7 +58,7 @@ async fn push_chunk<A: AsyncPlatformAdapter>(
 ) -> Result<bool, String> {
     let part_number = parts_to_upload[idx];
     let Some(url) = url_pool.remove(&part_number) else {
-        return Ok(false);
+        return Err(format!("Missing upload URL for part {}", part_number));
     };
 
     let chunk_info = ChunkInfo {
@@ -121,6 +122,7 @@ where
         match result {
             Ok(result) => completed_parts.push(result),
             Err(error) => {
+                adapter.abort_requests();
                 while in_flight.next().await.is_some() {}
                 if adapter.is_paused() {
                     return Err("Upload paused".to_string());
@@ -130,6 +132,7 @@ where
         }
 
         if adapter.is_paused() {
+            adapter.abort_requests();
             while in_flight.next().await.is_some() {}
             return Err("Upload paused".to_string());
         }
@@ -143,7 +146,7 @@ where
                     .cloned()
                     .collect();
                 if !prefetch_parts.is_empty() {
-                    url_pool.extend(adapter.fetch_urls(prefetch_parts).await.unwrap_or_default());
+                    url_pool.extend(adapter.fetch_urls(prefetch_parts).await?);
                 }
             }
 

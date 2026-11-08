@@ -8,7 +8,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 ios = ["nyquest"]
-android = ["jni", "reqwest", "reqwest/blocking", "reqwest/rustls-tls-webpki-roots", "android_logger", "libc"]
+android = ["jni", "reqwest", "reqwest/blocking", "reqwest/stream", "reqwest/rustls-tls-webpki-roots", "android_logger", "libc", "futures", "tokio"]
 wasm = ["wasm-bindgen", "wasm-bindgen-file-reader", "web-sys", "wasm-bindgen-futures", "js-sys", "futures", "console_error_panic_hook", "rexie"]
 
 [dependencies]
@@ -40,6 +40,7 @@ serde_json = "1.0"
 
 # For parallel futures execution in WASM
 futures = { version = "0.3", optional = true }
+tokio = { version = "1", optional = true, features = ["rt", "time"] }
 
 # For iOS native networking
 nyquest = { version = "0.3", optional = true, features = ["blocking"] }

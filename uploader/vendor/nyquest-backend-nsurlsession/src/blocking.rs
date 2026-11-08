@@ -16,6 +16,27 @@ use crate::error::IntoNyquestResult;
 use crate::response::NSUrlSessionResponse;
 use crate::NSUrlSessionBackend;
 
+thread_local! {
+    static REQUEST_CANCELLATION: std::cell::RefCell<Option<Arc<dyn Fn() -> bool + Send + Sync>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Scope cancellation to a blocking request on this thread. Checking it while
+/// waiting for a response also cancels tasks whose entire body was already sent.
+pub fn with_request_cancellation<T>(
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<dyn Fn() -> bool + Send + Sync>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REQUEST_CANCELLATION.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(REQUEST_CANCELLATION.with(|slot| slot.replace(Some(cancelled))));
+    operation()
+}
+
 #[derive(Clone)]
 pub struct NSUrlSessionBlockingClient {
     inner: NSUrlSessionClient,
@@ -87,6 +108,7 @@ impl BlockingClient for NSUrlSessionBlockingClient {
     type Response = NSUrlSessionBlockingResponse;
 
     fn request(&self, req: Request) -> nyquest_interface::Result<Self::Response> {
+        let cancelled = REQUEST_CANCELLATION.with(|slot| slot.borrow().clone());
         let waker = GenericWaker::Blocking(Arc::new(BlockingWaker::new_from_current_thread()));
         let (task, mut writer) = self.inner.build_data_task(req, &waker, |s| match &s {
             BoxedStream::Sized { content_length, .. } => Some(*content_length),
@@ -100,6 +122,14 @@ impl BlockingClient for NSUrlSessionBlockingClient {
         };
         loop {
             use std::io::Read as _;
+
+            if cancelled.as_ref().is_some_and(|check| check()) {
+                task.cancel();
+                return Err(nyquest_interface::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Upload interrupted",
+                )));
+            }
 
             if let Some(response) = shared.try_take_response().into_nyquest_result()? {
                 return Ok(NSUrlSessionBlockingResponse {
@@ -130,7 +160,11 @@ impl BlockingClient for NSUrlSessionBlockingClient {
                     }
                 }
             }
-            std::thread::park();
+            if cancelled.is_some() {
+                std::thread::park_timeout(std::time::Duration::from_millis(20));
+            } else {
+                std::thread::park();
+            }
         }
     }
 }

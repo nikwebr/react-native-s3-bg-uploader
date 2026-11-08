@@ -2,12 +2,15 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
+import http.client
+import socket
 import struct
 import tempfile
 import threading
 import time
 import unittest
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 from moto.server import ThreadedMotoServer
 from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_encrypt
@@ -54,6 +57,7 @@ class BackendTests(unittest.TestCase):
             scheme=self.scheme,
         )
         self.server.backend = self.backend
+        self.backend.network_failure_delay_secs = 0
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
 
@@ -74,7 +78,27 @@ class BackendTests(unittest.TestCase):
         self.backend.control("/paused", {"mode": mode, "before": snapshot, "after": snapshot})
         self.backend.control("/resumed", {"mode": mode})
         parts = []
+        buffered = None
+        if mode == 'encrypted-network':
+            parsed = urlsplit(urls['3'])
+            buffered = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+            buffered.request('PUT', parsed.path + '?' + parsed.query, body=chunks[2])
+            self.assertTrue(self.backend.upload(mode).blocked_part_started.wait(timeout=5))
         for number, chunk in enumerate(chunks, 1):
+            failed_part = 2 if mode == 'encrypted-network' else len(chunks)
+            if mode.endswith('-network') and number == failed_part:
+                failures = 1 if mode == 'plain-network' else 5
+                for _ in range(failures):
+                    with self.assertRaises(http.client.RemoteDisconnected):
+                        urlopen(Request(urls[str(number)], data=chunk, method='PUT'), timeout=10)
+                if mode == 'encrypted-network':
+                    buffered.sock.shutdown(socket.SHUT_RDWR)
+                    buffered.close()
+                    confirmed = self.backend.s3.list_parts(Bucket=BUCKET, Key=started['key'], UploadId=started['uploadId']).get('Parts', [])
+                    self.backend.control('/recover', {'mode': mode, 'before': {
+                        'uploadedBytes': sum(part['Size'] for part in confirmed),
+                        'completedParts': len(confirmed),
+                    }})
             with urlopen(Request(urls[str(number)], data=chunk, method="PUT"), timeout=10) as result:
                 parts.append({"PartNumber": number, "ETag": result.headers["ETag"]})
         self.backend.complete(f"/complete/{started['uploadId']}/{started['key']}", {"parts": parts})
@@ -86,9 +110,13 @@ class BackendTests(unittest.TestCase):
         self.backend.verify("plain")
         self.upload("encrypted", encrypted_fixture(self.scheme))
         self.backend.verify("encrypted")
+        self.upload('plain-network', chunks)
+        self.backend.verify('plain-network')
+        self.upload('encrypted-network', encrypted_fixture(self.scheme))
+        self.backend.verify('encrypted-network')
         with self.assertRaisesRegex(AssertionError, "Missing 100%-to-completion"):
             self.backend.report(final=True)
-        for mode in ("plain", "encrypted"):
+        for mode in ("plain", "encrypted", "plain-network", "encrypted-network"):
             self.backend.control("/completion-timing", {"mode": mode, "completedAfterMs": 20000})
         self.backend.report(final=True)
 

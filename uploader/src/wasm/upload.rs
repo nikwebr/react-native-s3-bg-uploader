@@ -17,6 +17,49 @@ use crate::wasm::is_pause_requested;
 use crate::wasm::progress::{self as wasmProgress, WasmProgressNotifier};
 use crate::wasm::upload_engine::{self, AsyncPlatformAdapter};
 
+thread_local! {
+    static ACTIVE_XHRS: std::cell::RefCell<std::collections::HashMap<(String, u64, u32), web_sys::XmlHttpRequest>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub(crate) fn abort_upload_requests(file_key: Option<&str>) {
+    let requests: Vec<_> = ACTIVE_XHRS.with(|active| {
+        active
+            .borrow()
+            .iter()
+            .filter(|((key, _, _), _)| file_key.map_or(true, |filter| key == filter))
+            .map(|(_, xhr)| xhr.clone())
+            .collect()
+    });
+    for xhr in requests {
+        let _ = xhr.abort();
+    }
+}
+
+struct XhrGuard {
+    xhr: web_sys::XmlHttpRequest,
+    key: (String, u64, u32),
+    _callbacks: (
+        wasm_bindgen::closure::Closure<dyn FnMut(web_sys::ProgressEvent)>,
+        wasm_bindgen::closure::Closure<dyn FnMut()>,
+        wasm_bindgen::closure::Closure<dyn FnMut()>,
+        wasm_bindgen::closure::Closure<dyn FnMut()>,
+    ),
+}
+
+impl Drop for XhrGuard {
+    fn drop(&mut self) {
+        ACTIVE_XHRS.with(|active| active.borrow_mut().remove(&self.key));
+        if let Ok(upload) = self.xhr.upload() {
+            upload.set_onprogress(None);
+        }
+        self.xhr.set_onload(None);
+        self.xhr.set_onerror(None);
+        self.xhr.set_onabort(None);
+        let _ = self.xhr.abort();
+    }
+}
+
 pub(super) async fn run_upload(file_key: &str, file: web_sys::File) -> UploadOutcome {
     let encryption_config = crate::core::session::session()
         .files
@@ -33,6 +76,7 @@ pub(super) async fn run_upload(file_key: &str, file: web_sys::File) -> UploadOut
         encryption_config,
         js_encryptor,
         api: WasmApiClient,
+        run_version: crate::core::session::file_run_version(file_key).unwrap_or(0),
     };
     let outcome = upload_orchestrator::run_upload(&backend).await;
     if matches!(outcome, UploadOutcome::Completed) {
@@ -54,6 +98,7 @@ struct WasmUploadBackend {
     encryption_config: Option<ArcEncryptor>,
     js_encryptor: Option<std::rc::Rc<crate::wasm::js_encryptor::JsEncryptor>>,
     api: WasmApiClient,
+    run_version: u64,
 }
 
 #[async_trait(?Send)]
@@ -74,6 +119,10 @@ impl UploadBackend for WasmUploadBackend {
 
     fn is_paused(&self) -> bool {
         is_pause_requested()
+    }
+
+    fn is_current_run(&self) -> bool {
+        crate::core::session::is_current_run(&self.file_key, self.run_version)
     }
 
     fn ciphertext_overhead(&self) -> u64 {
@@ -125,6 +174,7 @@ impl UploadBackend for WasmUploadBackend {
             total_data_parts: prepared.total_parts,
             effective_part_size: prepared.part_size,
             has_footer: self.has_footer(),
+            run_version: self.run_version,
         });
         upload_engine::run_async_upload(
             adapter,
@@ -159,12 +209,15 @@ struct WasmAdapter {
     /// Whether the active encryptor's format ends with a descriptor (appended to the
     /// final data part — never an S3 part of its own).
     has_footer: bool,
+    run_version: u64,
 }
 
 /// The web-registered JS encryptor, but only for files the app marked as
 /// encrypted — the same gate `active_encryptor` uses, so a globally registered
 /// encryptor never silently encrypts a plain `uploadFile`.
-fn active_js_encryptor(file_key: &str) -> Option<std::rc::Rc<crate::wasm::js_encryptor::JsEncryptor>> {
+fn active_js_encryptor(
+    file_key: &str,
+) -> Option<std::rc::Rc<crate::wasm::js_encryptor::JsEncryptor>> {
     // Instances are created at pre-register time, when only the content hash is
     // known; `file_key` here is the object key returned by startUpload. Map back
     // through the session entry instead of assuming the two are equal.
@@ -188,6 +241,11 @@ fn active_encryptor<'a>(config: Option<&'a ArcEncryptor>) -> Option<&'a (dyn Chu
 impl AsyncPlatformAdapter for WasmAdapter {
     fn is_paused(&self) -> bool {
         is_pause_requested()
+            || !crate::core::session::is_current_run(&self.file_key, self.run_version)
+    }
+
+    fn abort_requests(&self) {
+        abort_upload_requests(Some(&self.file_key));
     }
 
     fn fetch_urls(
@@ -269,16 +327,24 @@ impl AsyncPlatformAdapter for WasmAdapter {
         part_number: u32,
         file_key: String,
     ) -> futures::future::LocalBoxFuture<'static, Result<String, String>> {
+        let run_version = self.run_version;
         async move {
             let chunk_size = data.len() as u64;
-            let etag = upload_chunk_with_retry(&url, &data, part_number, &file_key).await?;
-            runtime::complete_chunk(
+            let etag =
+                upload_chunk_with_retry(&url, &data, part_number, &file_key, run_version).await?;
+            if !crate::core::session::is_current_run(&file_key, run_version) {
+                return Err("stale run".to_string());
+            }
+            if !runtime::complete_chunk(
                 wasmProgress::progress_manager(),
                 &file_key,
                 part_number,
                 etag.clone(),
                 chunk_size,
-            );
+                run_version,
+            ) {
+                return Err("stale run".to_string());
+            }
             Ok(etag)
         }
         .boxed_local()
@@ -290,6 +356,7 @@ async fn upload_chunk_with_retry(
     data: &[u8],
     part_number: u32,
     file_key: &str,
+    run_version: u64,
 ) -> Result<String, String> {
     let policy = crate::core::retry::RetryPolicy::new(MAX_RETRIES);
     let file_key = file_key.to_string();
@@ -306,15 +373,40 @@ async fn upload_chunk_with_retry(
                 if is_pause_requested() {
                     return Err("paused".to_string());
                 }
-                runtime::update_in_flight(wasmProgress::progress_manager(), &fk, part_number, 0);
-                upload_chunk_xhr(&url, &data, part_number, &fk).await
+                if !crate::core::session::is_current_run(&fk, run_version) {
+                    return Err("stale run".to_string());
+                }
+                runtime::update_in_flight(
+                    wasmProgress::progress_manager(),
+                    &fk,
+                    part_number,
+                    0,
+                    run_version,
+                );
+                upload_chunk_xhr(&url, &data, part_number, &fk, run_version).await
             }
         },
         |_attempt, err, delay_ms| {
-            let paused = err == "paused" || is_pause_requested();
+            runtime::update_in_flight(
+                wasmProgress::progress_manager(),
+                &file_key,
+                part_number,
+                0,
+                run_version,
+            );
+            let fk = file_key.clone();
+            let paused = err.contains("paused") || is_pause_requested();
             async move {
                 if !paused {
-                    sleep(delay_ms).await;
+                    let mut remaining = delay_ms;
+                    while remaining > 0
+                        && !is_pause_requested()
+                        && crate::core::session::is_current_run(&fk, run_version)
+                    {
+                        let step = remaining.min(20);
+                        sleep(step).await;
+                        remaining -= step;
+                    }
                 }
             }
         },
@@ -327,6 +419,7 @@ async fn upload_chunk_xhr(
     data: &[u8],
     part_number: u32,
     file_key: &str,
+    run_version: u64,
 ) -> Result<String, String> {
     use wasm_bindgen::closure::Closure;
     use web_sys::XmlHttpRequest;
@@ -339,6 +432,7 @@ async fn upload_chunk_xhr(
     xhr.open("PUT", url).map_err(|e| format!("{:?}", e))?;
 
     let fk = file_key.to_string();
+    let mut callbacks = None;
     let promise = Promise::new(&mut |resolve, reject| {
         let resolve_clone = resolve.clone();
         let reject_clone = reject.clone();
@@ -348,7 +442,8 @@ async fn upload_chunk_xhr(
         let reject_for_abort = reject.clone();
 
         let onprogress = Closure::wrap(Box::new(move |event: web_sys::ProgressEvent| {
-            if is_pause_requested() {
+            if is_pause_requested() || !crate::core::session::is_current_run(&fk_clone, run_version)
+            {
                 let _ = xhr_for_progress.abort();
                 return;
             }
@@ -358,6 +453,7 @@ async fn upload_chunk_xhr(
                     &fk_clone,
                     part_number,
                     event.loaded() as u64,
+                    run_version,
                 );
             }
         }) as Box<dyn FnMut(_)>);
@@ -370,6 +466,12 @@ async fn upload_chunk_xhr(
                     .ok()
                     .flatten()
                     .unwrap_or_default();
+                if clean_etag(&etag).is_empty() {
+                    reject_clone
+                        .call1(&JsValue::NULL, &JsValue::from_str("No ETag in response"))
+                        .ok();
+                    return;
+                }
                 resolve_clone
                     .call1(&JsValue::NULL, &JsValue::from_str(&etag))
                     .ok();
@@ -401,11 +503,16 @@ async fn upload_chunk_xhr(
         xhr.set_onload(Some(onload.as_ref().unchecked_ref()));
         xhr.set_onerror(Some(onerror.as_ref().unchecked_ref()));
         xhr.set_onabort(Some(onabort.as_ref().unchecked_ref()));
-        onprogress.forget();
-        onload.forget();
-        onerror.forget();
-        onabort.forget();
+        callbacks = Some((onprogress, onload, onerror, onabort));
     });
+
+    let key = (fk, run_version, part_number);
+    ACTIVE_XHRS.with(|active| active.borrow_mut().insert(key.clone(), xhr.clone()));
+    let _guard = XhrGuard {
+        xhr: xhr.clone(),
+        key,
+        _callbacks: callbacks.unwrap(),
+    };
 
     let uint8_array = js_sys::Uint8Array::new_with_length(data.len() as u32);
     uint8_array.copy_from(data);

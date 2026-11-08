@@ -321,6 +321,24 @@ Both upload modes must report `COMPLETED` within **20 seconds of the first
 later progress drops do not reset the deadline. The elapsed time is saved as
 `completedAfter100PercentMs` in the verification artifacts.
 
+The shared flow drops a plain upload's final PUT connection after reading its
+entire body, with a 25-second response black hole, and verifies automatic retry.
+The encrypted case exhausts retries for one part while another part's entire
+body has been received but its response is blocked. The uploader must cancel that
+blocked connection without waiting for a network timeout, reset failed progress
+to confirmed parts, and restart both unconfirmed parts on reconnect/`resume()`.
+Both recovered objects are independently downloaded and verified, including
+correct/wrong-key checks. Resuming after reconnect must complete within 20 seconds.
+
+Live progress includes bytes sent while running. On pause or failure, in-flight
+requests are cancelled and progress rolls back to parts with confirmed ETags;
+resume retransmits unconfirmed parts using the same multipart ID. Progress may
+therefore decrease at a pause, failed request, or retry boundary. The final 1% is
+reserved until all multipart PUTs are acknowledged by S3. `COMPLETED` still means
+the backend's multipart completion call has succeeded.
+Native snapshot delivery is serialized across concurrent part workers so older
+callbacks cannot arrive after newer progress; callbacks can still query progress.
+
 Tests use a local Moto S3-compatible HTTP server and synthetic 31 MiB fixtures;
 no AWS credentials, external demo bucket, or Maestro Cloud subscription are
 needed. Encryption and uploading run through the real native/Rust or WASM
