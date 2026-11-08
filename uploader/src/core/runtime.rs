@@ -1,5 +1,61 @@
 use crate::core::progress::{ProgressManager, ProgressNotifier};
 use crate::core::session::{self, AggregateProgress, UploadState};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+pub struct ActiveRunGuard {
+    file_key: String,
+    pub cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        let mut sess = session::session();
+        if sess
+            .active_runs
+            .get(&self.file_key)
+            .is_some_and(|run| Arc::ptr_eq(&run.cancelled, &self.cancelled))
+        {
+            sess.active_runs.remove(&self.file_key);
+        }
+    }
+}
+
+pub fn begin_run(file_key: &str) -> ActiveRunGuard {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut sess = session::session();
+    if let Some(version) = sess.run_version(file_key) {
+        sess.active_runs.insert(
+            file_key.to_string(),
+            session::ActiveRun {
+                version,
+                cancelled: cancelled.clone(),
+            },
+        );
+    }
+    ActiveRunGuard {
+        file_key: file_key.to_string(),
+        cancelled,
+    }
+}
+
+pub fn run_cancellation(file_key: &str) -> Arc<AtomicBool> {
+    session::session()
+        .active_runs
+        .get(file_key)
+        .map(|run| run.cancelled.clone())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
+}
+
+pub fn is_run_paused(file_key: &str, version: u64) -> bool {
+    session::session()
+        .files
+        .get(file_key)
+        .is_some_and(|entry| entry.run_version == version && entry.state == UploadState::Paused)
+}
 
 pub fn transfer_id_for_file(file_key: &str) -> String {
     session::session()
@@ -26,6 +82,14 @@ pub fn aggregate_snapshot_for_file(
 }
 
 pub fn pause_all<N: ProgressNotifier>(manager: &ProgressManager<N>) {
+    pause_all_with_progress(manager, false);
+}
+
+pub fn pause_all_preserving_progress<N: ProgressNotifier>(manager: &ProgressManager<N>) {
+    pause_all_with_progress(manager, true);
+}
+
+fn pause_all_with_progress<N: ProgressNotifier>(manager: &ProgressManager<N>, preserve: bool) {
     session::pause_all();
     let paused_keys: Vec<String> = {
         let sess = session::session();
@@ -40,14 +104,42 @@ pub fn pause_all<N: ProgressNotifier>(manager: &ProgressManager<N>) {
             .collect()
     };
     for file_key in &paused_keys {
-        set_status(manager, file_key, UploadState::Paused);
+        let (_, session_agg, transfer_agg) = aggregate_snapshot_for_file(file_key);
+        manager.set_status_with_pause_progress(
+            file_key,
+            UploadState::Paused,
+            preserve,
+            session_agg,
+            transfer_agg,
+        );
     }
+}
+
+pub fn reset_failed_part<N: ProgressNotifier>(
+    manager: &ProgressManager<N>,
+    file_key: &str,
+    part: u32,
+    version: u64,
+    paused: bool,
+) {
+    if !session::is_current_run(file_key, version) {
+        return;
+    }
+    let (_, session_agg, transfer_agg) = aggregate_snapshot_for_file(file_key);
+    manager.reset_failed_part(
+        file_key,
+        part,
+        version,
+        paused || is_run_paused(file_key, version),
+        session_agg,
+        transfer_agg,
+    );
 }
 
 /// Call `session::resume_all()` and fire progress callbacks so the UI reflects the
 /// resumed state immediately, without waiting for the next upload event.
-/// Resumed files show Initialized until the new worker initializes its tracking.
-/// Discard in-flight bytes and never accept old workers' updates.
+/// Held runs return to Running without changing their generation. Failed or
+/// restored runs show Initialized until a new worker initializes their tracking.
 /// Does NOT touch platform pause flags — the caller is responsible for clearing those.
 /// Returns an error if any session file still needs a fresh local file reference.
 pub fn resume_all<N: ProgressNotifier>(manager: &ProgressManager<N>) -> Result<(), String> {
@@ -67,7 +159,19 @@ pub fn resume_all<N: ProgressNotifier>(manager: &ProgressManager<N>) -> Result<(
     };
     session::resume_all();
     for key in &resumed_keys {
-        set_status(manager, key, UploadState::Initialized);
+        let held = session::session()
+            .files
+            .get(key)
+            .is_some_and(|entry| entry.state == UploadState::Running);
+        set_status(
+            manager,
+            key,
+            if held {
+                UploadState::Running
+            } else {
+                UploadState::Initialized
+            },
+        );
     }
     Ok(())
 }

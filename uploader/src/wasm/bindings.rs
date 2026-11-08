@@ -164,14 +164,9 @@ pub async fn upload_file_encrypted(
     user_params_js: JsValue,
 ) -> Result<JsValue, JsValue> {
     let user_params = parse_user_params(user_params_js);
-    let hash = super::start_and_enqueue_encrypted(
-        file,
-        transfer_id,
-        user_params,
-        key_hex,
-        nonce_hex,
-    )
-    .await
+    let hash =
+        super::start_and_enqueue_encrypted(file, transfer_id, user_params, key_hex, nonce_hex)
+            .await
             .map_err(|e| JsValue::from_str(&format!("Upload failed: {}", e)))?;
 
     let is_running = QUEUE_RUNNING.with(|r| *r.borrow()) && !PAUSE_REQUESTED.with(|p| *p.borrow());
@@ -213,6 +208,7 @@ pub fn wasm_cancel_file(file_hash: String) {
     };
 
     if !file_key.is_empty() {
+        crate::wasm::upload::abort_upload_requests(Some(&file_key));
         FILE_QUEUE.with(|q| q.borrow_mut().retain(|e| e.file_key != file_key));
         wasmProgress::progress_manager().remove(&file_key);
     }
@@ -258,6 +254,11 @@ pub fn wasm_cancel_transfer(transfer_id: String) {
 
 #[wasm_bindgen]
 pub fn wasm_cancel_all() {
+    super::QUEUE_EPOCH.with(|epoch| {
+        let mut value = epoch.borrow_mut();
+        *value = value.wrapping_add(1);
+    });
+    crate::wasm::upload::abort_upload_requests(None);
     FILE_QUEUE.with(|q| q.borrow_mut().clear());
     PENDING_WASM_FILES.with(|m| m.borrow_mut().clear());
     PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().clear());
@@ -272,7 +273,6 @@ pub fn wasm_cancel_all() {
 pub fn wasm_pause_all() {
     PAUSE_REQUESTED.with(|p| *p.borrow_mut() = true);
     crate::core::runtime::pause_all(wasmProgress::progress_manager());
-    crate::wasm::upload::abort_upload_requests(None);
 }
 
 #[wasm_bindgen]

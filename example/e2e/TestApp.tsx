@@ -164,6 +164,7 @@ export default function TestApp({ initializeEncryptor }: {
   };
 
   const pause = async () => {
+    const beforePause = await snapshot();
     S3BgUploader.pause();
     const deadline = Date.now() + 10000;
     while ((await S3BgUploader.getAggregateProgress()).state !== 'PAUSED') {
@@ -171,6 +172,9 @@ export default function TestApp({ initializeEncryptor }: {
       await sleep(100);
     }
     const initial = await snapshot();
+    if (Platform.OS !== 'web' && initial.uploadedBytes < beforePause.uploadedBytes) {
+      throw new Error('Native pause discarded progress of a held request');
+    }
     if (initial.completedParts < 1 || initial.completedParts >= initial.totalParts) {
       throw new Error('Pause must occur after a completed part and before completion');
     }
@@ -206,8 +210,15 @@ export default function TestApp({ initializeEncryptor }: {
   };
 
   const resume = async () => {
+    const before = await snapshot();
     await api('/resumed', { mode: current.current?.mode });
     await S3BgUploader.resume();
+    if (Platform.OS !== 'web' && current.current) {
+      const after = (await S3BgUploader.getProgress(current.current.mode, current.current.hash))[0];
+      if (after && after.uploadedBytes < before.uploadedBytes) {
+        throw new Error('Native resume discarded progress of a viable held request');
+      }
+    }
     setStatus('Resume requested');
   };
 

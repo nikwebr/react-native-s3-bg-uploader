@@ -330,14 +330,26 @@ to confirmed parts, and restart both unconfirmed parts on reconnect/`resume()`.
 Both recovered objects are independently downloaded and verified, including
 correct/wrong-key checks. Resuming after reconnect must complete within 20 seconds.
 
-Live progress includes bytes sent while running. On pause or failure, in-flight
-requests are cancelled and progress rolls back to parts with confirmed ETags;
-resume retransmits unconfirmed parts using the same multipart ID. Progress may
-therefore decrease at a pause, failed request, or retry boundary. The final 1% is
+Live progress includes bytes sent while running. Manual pause holds the active
+upload run instead of cancelling its PUTs. Native progress stays at its last sent
+byte count during pause and viable resume; only failed/restarted parts roll back
+when resume/retry determines that their requests cannot continue. Web paused
+progress still reports confirmed parts only. Resume continues viable requests in
+that same run and multipart ID.
+No new parts are dispatched and acknowledgements/completion are deferred until
+resume. iOS suspends its NSURLSession tasks; Android gates further body reads.
+Browsers cannot suspend XHR: already-buffered traffic may finish on the wire, but
+its result is held until resume. Failed requests cannot be revived and still need
+retries; a failed upload or explicit cancel still aborts outstanding PUTs.
+Progress may decrease at a pause, failed request, or retry boundary. The final 1% is
 reserved until all multipart PUTs are acknowledged by S3. `COMPLETED` still means
 the backend's multipart completion call has succeeded.
 Native snapshot delivery is serialized across concurrent part workers so older
 callbacks cannot arrive after newer progress; callbacks can still query progress.
+Held runs are in-memory only. After process termination, resume still requires
+re-providing local files/keys and restarts unconfirmed parts. Neither pausing nor
+holding guarantees a TCP connection will survive loss of connectivity or a server
+timeout, and it does not eliminate a storage-provider completion wait.
 
 Tests use a local Moto S3-compatible HTTP server and synthetic 31 MiB fixtures;
 no AWS credentials, external demo bucket, or Maestro Cloud subscription are
@@ -385,9 +397,12 @@ Before launching either iOS example, the runner requests its test bundle from
 Metro with a separate ten-minute preparation limit. This keeps cold JavaScript
 bundling outside the screen-readiness wait; failures stop the run explicitly.
 Preparation timing is retained in `metro-warmup.log`.
-The iOS workflow also runs a native regression that pauses or replaces an upload
-while its old network worker is blocked. The upload queue must return promptly
-and allow a resumed run to finish without waiting for that old request.
+The iOS workflow also verifies that manual pause retains a blocked run and resumes
+it without replacing its requests. Replacing/cancelling that run must still release
+the queue promptly rather than wait for the retired network worker. A native
+NSURLSession regression sends a PUT body once, suspends while its response arrives,
+and receives that original response only after resume. Shared E2E flows require
+that PUTs already received at the pause boundary are not re-uploaded on resume.
 It also checks that native end-of-stream events expose `AtEnd` to their delegate,
 not the `Open` fallback produced when the stream buffer is still locked, and
 that EOF is delivered after the last buffered bytes are consumed.

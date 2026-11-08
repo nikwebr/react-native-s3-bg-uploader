@@ -2,12 +2,13 @@
 
 ## blocking.rs — cancellation while waiting for response headers
 
-`with_request_cancellation` installs a thread-scoped cancellation predicate for
-the uploader's blocking PUT. The request loop checks it at most every 20ms and
-calls `NSURLSessionTask.cancel()` on cancellation. Without this, a fully buffered
-request never reads `ProgressReader` again and pausing (or a sibling failing)
-cannot cancel it until a response or the network timeout arrives. Ordinary
-requests without the scoped predicate retain the upstream blocking behavior.
+`with_request_control` installs thread-scoped cancellation and pause predicates.
+It suspends/resumes the existing NSURLSession task during manual pause, retaining
+its body stream, and applies the same gate while consuming response bodies.
+Explicit cancellation, replacement or sibling failure still calls `task.cancel()`.
+The request loop checks control at most every 20ms, including after the full body
+has been sent. `with_request_cancellation` remains available for cancel-only callers.
+Ordinary requests without scoped control retain upstream blocking behavior.
 
 ## blocking.rs — explicit task.cancel() on stream body error
 

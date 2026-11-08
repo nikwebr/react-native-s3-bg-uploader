@@ -28,6 +28,7 @@ struct FileQueueEntry {
 thread_local! {
     pub(crate) static FILE_QUEUE: RefCell<VecDeque<FileQueueEntry>> = RefCell::new(VecDeque::new());
     pub(crate) static QUEUE_RUNNING: RefCell<bool> = RefCell::new(false);
+    pub(crate) static QUEUE_EPOCH: RefCell<u64> = RefCell::new(0);
     pub(crate) static PAUSE_REQUESTED: RefCell<bool> = RefCell::new(false);
     /// Stores the web_sys::File for each pending (hashed but not yet initialized) upload.
     /// Keyed by file_hash. Cleared when start_api succeeds or on cancel_all.
@@ -271,6 +272,14 @@ pub(crate) fn process_pending_files() {
 }
 
 pub(crate) fn enqueue_file(file_key: String, file: web_sys::File) {
+    // Re-provisioning a held file must not enqueue a second run behind it.
+    if crate::core::session::session()
+        .active_runs
+        .get(&file_key)
+        .is_some_and(|run| !run.cancelled.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return;
+    }
     FILE_QUEUE.with(|q| {
         let mut queue = q.borrow_mut();
         // Re-provisioning a failed/paused file replaces its retained File, not
@@ -299,16 +308,26 @@ fn maybe_start_next() {
     }
     let next = FILE_QUEUE.with(|q| q.borrow_mut().pop_front());
     if let Some(entry) = next {
+        let epoch = QUEUE_EPOCH.with(|value| *value.borrow());
         QUEUE_RUNNING.with(|r| *r.borrow_mut() = true);
         spawn_local(async move {
             let outcome = upload::run_upload(&entry.file_key, entry.file.clone()).await;
-            if matches!(outcome, UploadOutcome::Failed(_)) {
+            // A cancelled old loop must not reset the state of a newly started queue.
+            if QUEUE_EPOCH.with(|value| *value.borrow()) != epoch {
+                return;
+            }
+            let still_active = session::session().files.contains_key(&entry.file_key);
+            if still_active && matches!(outcome, UploadOutcome::Failed(_)) {
                 // Keep the File alive for an explicit resume, just as native
                 // retains its path/fd. Do not immediately loop through failures.
                 PAUSE_REQUESTED.with(|p| *p.borrow_mut() = true);
             }
-            if matches!(outcome, UploadOutcome::Paused | UploadOutcome::Failed(_)) {
-                FILE_QUEUE.with(|q| q.borrow_mut().push_front(entry));
+            if still_active && matches!(outcome, UploadOutcome::Paused | UploadOutcome::Failed(_)) {
+                FILE_QUEUE.with(|q| {
+                    let mut queue = q.borrow_mut();
+                    queue.retain(|queued| queued.file_key != entry.file_key);
+                    queue.push_front(entry);
+                });
             }
             QUEUE_RUNNING.with(|r| *r.borrow_mut() = false);
             if !is_pause_requested() {

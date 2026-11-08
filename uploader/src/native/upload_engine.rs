@@ -38,6 +38,21 @@ pub trait BlockingPlatformAdapter: Send + Sync + 'static {
         true
     }
 
+    fn wait_until_resumed(&self, cancelled: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+        loop {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("Upload aborted".into());
+            }
+            if !self.is_current_run() {
+                return Err("stale run".into());
+            }
+            if !self.is_paused() {
+                return Ok(());
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn fetch_urls(&self, parts: &[u32]) -> Result<HashMap<u32, String>, String>;
 
     fn make_worker(
@@ -52,6 +67,26 @@ pub trait BlockingPlatformAdapter: Send + Sync + 'static {
     fn on_upload_error(&self, _part_number: u32, _error: &str) {}
 }
 
+pub fn wait_while_paused(
+    file_key: &str,
+    version: u64,
+    cancelled: &std::sync::atomic::AtomicBool,
+    paused: impl Fn() -> bool,
+) -> Result<(), String> {
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Upload aborted".into());
+        }
+        if !crate::core::session::is_current_run(file_key, version) {
+            return Err("stale run".into());
+        }
+        if !paused() && !crate::core::runtime::is_run_paused(file_key, version) {
+            return Ok(());
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 pub fn run_blocking_upload(
     adapter: Arc<dyn BlockingPlatformAdapter>,
     config: BlockingEngineConfig,
@@ -64,6 +99,8 @@ pub fn run_blocking_upload(
     let url_pool: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let parts_arc = Arc::new(parts_to_upload);
     let parts_len = parts_arc.len();
+    let abort = crate::core::runtime::run_cancellation(file_key);
+    adapter.wait_until_resumed(&abort)?;
 
     match config.prefetch {
         BlockingPrefetch::AllUpfront => {
@@ -85,7 +122,6 @@ pub fn run_blocking_upload(
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(MAX_CONCURRENT_UPLOADS);
     let rx = Arc::new(Mutex::new(rx));
-    let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let error_abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let file_key_owned = file_key.to_string();
 
@@ -117,10 +153,11 @@ pub fn run_blocking_upload(
                     Err(_) => break,
                 };
 
-                if abort.load(std::sync::atomic::Ordering::Relaxed)
-                    || adapter.is_paused()
-                    || !adapter.is_current_run()
-                {
+                if abort.load(std::sync::atomic::Ordering::Relaxed) || !adapter.is_current_run() {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                if adapter.wait_until_resumed(&abort).is_err() {
                     abort.store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
@@ -199,6 +236,9 @@ pub fn run_blocking_upload(
     drop(rx);
 
     for (idx, _) in parts_arc.iter().enumerate() {
+        if adapter.wait_until_resumed(&abort).is_err() {
+            break;
+        }
         if let BlockingPrefetch::Rolling = config.prefetch {
             if idx > 0 && idx % MAX_CONCURRENT_UPLOADS == 0 && idx < parts_len {
                 let batch_end = (idx + MAX_CONCURRENT_UPLOADS).min(parts_len);
@@ -209,21 +249,16 @@ pub fn run_blocking_upload(
             }
         }
 
-        if adapter.is_paused()
-            || !adapter.is_current_run()
-            || abort.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if !adapter.is_current_run() || abort.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
         tx.send(idx).ok();
     }
     drop(tx);
 
-    // For pause/resume races we intentionally do not wait for old worker threads to finish.
-    // On iOS, in-flight NSURLSession requests can take a while to terminate even after pause.
-    // Waiting here would block the resumed run from starting and eventually calling complete.
-    let should_return_early_for_pause = adapter.is_paused()
-        || !adapter.is_current_run()
+    // Manual pause keeps this engine and its workers alive. Replacement/cancel
+    // still returns promptly, without waiting for retired network workers.
+    let should_return_early_for_pause = !adapter.is_current_run()
         || (abort.load(std::sync::atomic::Ordering::Relaxed)
             && !error_abort.load(std::sync::atomic::Ordering::Relaxed));
     if should_return_early_for_pause {
@@ -231,11 +266,9 @@ pub fn run_blocking_upload(
         return Err("Upload paused".to_string());
     }
 
-    // A pause can arrive after the check above, while a network worker is stuck.
-    // Do not let joining that worker block the queue from starting the resumed run.
+    // Keep waiting during pause; resume continues these same worker requests.
     while handles.iter().any(|handle| !handle.is_finished()) {
-        if adapter.is_paused()
-            || !adapter.is_current_run()
+        if !adapter.is_current_run()
             || (abort.load(std::sync::atomic::Ordering::Relaxed)
                 && !error_abort.load(std::sync::atomic::Ordering::Relaxed))
         {
@@ -249,13 +282,19 @@ pub fn run_blocking_upload(
         handle.join().ok();
     }
 
-    if adapter.is_paused()
-        || !adapter.is_current_run()
+    if !adapter.is_current_run()
         || (abort.load(std::sync::atomic::Ordering::Relaxed)
             && !error_abort.load(std::sync::atomic::Ordering::Relaxed))
     {
         return Err("Upload paused".to_string());
     }
+    adapter.wait_until_resumed(&abort).or_else(|error| {
+        if error_abort.load(std::sync::atomic::Ordering::Relaxed) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })?;
 
     let results = completed_parts.lock().unwrap().clone();
     if results.len() != parts_arc.len() {
@@ -271,7 +310,7 @@ pub fn run_blocking_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::Condvar;
     use std::time::Duration;
@@ -365,9 +404,6 @@ mod tests {
         gate: Arc<WorkerGate>,
         paused: AtomicBool,
         current: AtomicBool,
-        engine_thread: Mutex<Option<thread::ThreadId>>,
-        engine_checks: AtomicUsize,
-        before_join: Option<mpsc::Sender<()>>,
     }
 
     impl BlockingPlatformAdapter for TestAdapter {
@@ -376,14 +412,7 @@ mod tests {
         }
 
         fn is_current_run(&self) -> bool {
-            let current = self.current.load(Ordering::SeqCst);
-            if *self.engine_thread.lock().unwrap() == Some(thread::current().id())
-                && self.engine_checks.fetch_add(1, Ordering::SeqCst) == 1
-            {
-                // The producer checked once; this is the final check before joining.
-                self.before_join.as_ref().unwrap().send(()).unwrap();
-            }
-            current
+            self.current.load(Ordering::SeqCst)
         }
 
         fn fetch_urls(&self, parts: &[u32]) -> Result<HashMap<u32, String>, String> {
@@ -418,10 +447,9 @@ mod tests {
     }
 
     #[test]
-    fn pause_or_replaced_run_during_join_does_not_block_resume() {
+    fn pause_holds_the_same_run_but_replacement_releases_the_queue() {
         for pause in [true, false] {
             let (entered_tx, entered_rx) = mpsc::channel();
-            let (before_join_tx, before_join_rx) = mpsc::channel();
             let (result_tx, result_rx) = mpsc::channel();
             let gate = Arc::new(WorkerGate {
                 released: Mutex::new(false),
@@ -432,9 +460,6 @@ mod tests {
                 gate: gate.clone(),
                 paused: AtomicBool::new(false),
                 current: AtomicBool::new(true),
-                engine_thread: Mutex::new(None),
-                engine_checks: AtomicUsize::new(0),
-                before_join: Some(before_join_tx),
             });
             let config = BlockingEngineConfig {
                 prefetch: BlockingPrefetch::Rolling,
@@ -442,7 +467,6 @@ mod tests {
             };
             let engine_adapter = adapter.clone();
             let engine = thread::spawn(move || {
-                *engine_adapter.engine_thread.lock().unwrap() = Some(thread::current().id());
                 result_tx
                     .send(run_blocking_upload(
                         engine_adapter,
@@ -455,9 +479,22 @@ mod tests {
                     .unwrap();
             });
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            before_join_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             if pause {
                 adapter.paused.store(true, Ordering::SeqCst);
+                let early = result_rx.recv_timeout(Duration::from_millis(200));
+                // Even a mock request finishing while paused must not cause the
+                // held engine to finalize until resume.
+                gate.release();
+                let while_paused = result_rx.recv_timeout(Duration::from_millis(200));
+                adapter.paused.store(false, Ordering::SeqCst);
+                let resumed = result_rx.recv_timeout(Duration::from_secs(2));
+                engine.join().unwrap();
+                assert!(
+                    early.is_err() && while_paused.is_err(),
+                    "Manual pause discarded or finalized the active run"
+                );
+                assert_eq!(resumed.unwrap().unwrap().len(), 1);
+                continue;
             } else {
                 adapter.current.store(false, Ordering::SeqCst);
             }
@@ -465,7 +502,7 @@ mod tests {
             if paused_result.is_err() {
                 gate.release();
                 engine.join().unwrap();
-                panic!("The paused upload remained blocked on its old network worker");
+                panic!("The replaced upload remained blocked on its old network worker");
             }
             assert_eq!(paused_result.unwrap().unwrap_err(), "Upload paused");
             engine.join().unwrap();
@@ -479,9 +516,6 @@ mod tests {
                 }),
                 paused: AtomicBool::new(false),
                 current: AtomicBool::new(true),
-                engine_thread: Mutex::new(None),
-                engine_checks: AtomicUsize::new(0),
-                before_join: None,
             });
             let result = run_blocking_upload(resumed, config, "file", 1, 1, vec![1]);
             gate.release();

@@ -27,6 +27,10 @@ pub trait UploadBackend {
         true
     }
 
+    async fn wait_until_resumed(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn encryption_config(&self) -> Option<&ArcEncryptor> {
         None
     }
@@ -74,10 +78,26 @@ pub trait UploadBackend {
 
 pub async fn run_upload<B: UploadBackend>(backend: &B) -> UploadOutcome {
     let file_key = backend.file_key().to_string();
-
-    runtime::mark_state_persist(&file_key, UploadState::Running);
-
-    let outcome = run_upload_inner(backend).await;
+    let run = runtime::begin_run(&file_key);
+    runtime::mark_state_persist(
+        &file_key,
+        if backend.is_paused() {
+            UploadState::Paused
+        } else {
+            UploadState::Running
+        },
+    );
+    let mut outcome = run_upload_inner(backend).await;
+    if !backend.is_current_run() {
+        outcome = UploadOutcome::Paused;
+    }
+    if matches!(outcome, UploadOutcome::Failed(_)) {
+        run.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if backend.is_paused() && backend.wait_until_resumed().await.is_err() {
+        outcome = UploadOutcome::Paused;
+    }
 
     match &outcome {
         UploadOutcome::Completed => {

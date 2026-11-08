@@ -26,6 +26,8 @@ pub struct UploadProgress {
     /// Guards against double-counting when stale workers from a previous run
     /// call complete_chunk after a pause+resume starts a new run.
     completed_part_set: HashSet<u32>,
+    preserve_paused_progress: bool,
+    deferred_failed_parts: HashSet<u32>,
 }
 
 #[cfg(test)]
@@ -161,6 +163,124 @@ mod tests {
     }
 
     #[test]
+    fn native_pause_and_viable_resume_preserve_progress_and_aggregates() {
+        let manager = ProgressManager::new(NoOpNotifier);
+        let mut session = Session::new();
+        session.register_file(
+            "key".into(),
+            "hash".into(),
+            "transfer".into(),
+            "file".into(),
+            "file".into(),
+            1000,
+            HashMap::new(),
+        );
+        session.complete_chunk("key", 1, "etag".into(), 500);
+        let s = session.get_aggregate_progress(None);
+        let t = session.get_aggregate_progress(Some("transfer"));
+        manager.init(
+            "key".into(),
+            "file".into(),
+            "hash".into(),
+            "transfer".into(),
+            1000,
+            2,
+            500,
+            1,
+            HashSet::from([1]),
+            7,
+            s.clone(),
+            t.clone(),
+        );
+        manager.update_in_flight_for_run("key", 2, 400, Some(7), s.clone(), t.clone());
+        manager.set_status_with_pause_progress(
+            "key",
+            UploadState::Paused,
+            true,
+            s.clone(),
+            t.clone(),
+        );
+        manager.update_in_flight_for_run("key", 2, 500, Some(7), s.clone(), t.clone());
+        // A second pause notification must not discard the native snapshot.
+        manager.set_status("key", UploadState::Paused, s.clone(), t.clone());
+        assert_eq!(manager.get_live_progress(None, None)[0].uploaded_bytes, 900);
+        let (paused_s, paused_t) = manager.get_live_aggregate(s.clone(), t.clone(), "transfer");
+        assert_eq!(paused_s.uploaded_size, 900);
+        assert_eq!(paused_t.percentage, 90.0);
+        manager.set_status("key", UploadState::Running, s.clone(), t.clone());
+        assert_eq!(manager.get_live_progress(None, None)[0].uploaded_bytes, 900);
+        // Once a resumed attempt really fails, only that attempt is rolled back.
+        manager.reset_failed_part("key", 2, 7, false, s, t);
+        assert_eq!(manager.get_live_progress(None, None)[0].uploaded_bytes, 500);
+    }
+
+    #[test]
+    fn native_resume_rolls_back_only_failed_parts_not_viable_held_parts() {
+        let manager = ProgressManager::new(NoOpNotifier);
+        let mut session = Session::new();
+        session.register_file(
+            "key".into(),
+            "hash".into(),
+            "transfer".into(),
+            "file".into(),
+            "file".into(),
+            1500,
+            HashMap::new(),
+        );
+        session.complete_chunk("key", 1, "etag".into(), 500);
+        let s = session.get_aggregate_progress(None);
+        let t = session.get_aggregate_progress(Some("transfer"));
+        manager.init(
+            "key".into(),
+            "file".into(),
+            "hash".into(),
+            "transfer".into(),
+            1500,
+            3,
+            500,
+            1,
+            HashSet::from([1]),
+            7,
+            s.clone(),
+            t.clone(),
+        );
+        manager.update_in_flight_for_run("key", 2, 400, Some(7), s.clone(), t.clone());
+        manager.update_in_flight_for_run("key", 3, 200, Some(7), s.clone(), t.clone());
+        manager.set_status_with_pause_progress(
+            "key",
+            UploadState::Paused,
+            true,
+            s.clone(),
+            t.clone(),
+        );
+        manager.reset_failed_part("key", 2, 6, true, s.clone(), t.clone()); // Stale error: ignored.
+        manager.reset_failed_part("key", 2, 7, true, s.clone(), t.clone());
+        assert_eq!(
+            manager.get_live_progress(None, None)[0].uploaded_bytes,
+            1100
+        );
+        manager.set_status("key", UploadState::Running, s.clone(), t.clone());
+        assert_eq!(manager.get_live_progress(None, None)[0].uploaded_bytes, 700);
+        assert_eq!(
+            manager
+                .get_live_aggregate(s.clone(), t.clone(), "transfer")
+                .0
+                .uploaded_size,
+            700
+        );
+        // A completely restarted run has no resumable in-flight bytes.
+        manager.set_status_with_pause_progress(
+            "key",
+            UploadState::Paused,
+            true,
+            s.clone(),
+            t.clone(),
+        );
+        manager.set_status("key", UploadState::Initialized, s, t);
+        assert_eq!(manager.get_live_progress(None, None)[0].uploaded_bytes, 500);
+    }
+
+    #[test]
     fn concurrent_workers_deliver_snapshots_in_progress_order() {
         use std::sync::{mpsc, Arc, Condvar};
         use std::thread;
@@ -264,11 +384,15 @@ impl UploadProgress {
             status: UploadState::Running,
             run_version: 0,
             completed_part_set: HashSet::new(),
+            preserve_paused_progress: false,
+            deferred_failed_parts: HashSet::new(),
         }
     }
 
     pub fn uploaded_bytes(&self) -> u64 {
-        if self.status != UploadState::Running {
+        if self.status != UploadState::Running
+            && !(self.status == UploadState::Paused && self.preserve_paused_progress)
+        {
             return self.completed_bytes.min(self.total_bytes);
         }
         let in_flight_sum: u64 = self.in_flight_progress.values().sum();
@@ -407,10 +531,10 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         }
         // Apply the same acknowledgement ceiling to aggregate callbacks/polls,
         // including when the committed session baseline alone exceeds 99%.
-        if lock
-            .values()
-            .any(|p| p.status == UploadState::Running && p.completed_bytes < p.total_bytes)
-        {
+        if lock.values().any(|p| {
+            (p.status == UploadState::Running || p.preserve_paused_progress)
+                && p.completed_bytes < p.total_bytes
+        }) {
             session_agg.uploaded_size = session_agg.uploaded_size.min(
                 session_agg
                     .total_size
@@ -422,7 +546,7 @@ impl<N: ProgressNotifier> ProgressManager<N> {
             }
         }
         if lock.values().any(|p| {
-            p.status == UploadState::Running
+            (p.status == UploadState::Running || p.preserve_paused_progress)
                 && p.transfer_id == current_transfer_id
                 && p.completed_bytes < p.total_bytes
         }) {
@@ -557,13 +681,67 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         session_agg: AggregateProgress,
         transfer_agg: AggregateProgress,
     ) {
+        self.set_status_with_pause_progress(file_key, status, false, session_agg, transfer_agg);
+    }
+
+    pub fn set_status_with_pause_progress(
+        &self,
+        file_key: &str,
+        status: UploadState,
+        preserve: bool,
+        session_agg: AggregateProgress,
+        transfer_agg: AggregateProgress,
+    ) {
         let _notification = self.notification.lock().unwrap();
         let mut lock = self.progress.lock().unwrap();
         if let Some(p) = lock.get_mut(file_key) {
-            p.status = status.clone();
-            if status != UploadState::Running {
-                p.in_flight_progress.clear();
+            let keep = status == UploadState::Paused
+                && (preserve || (p.status == UploadState::Paused && p.preserve_paused_progress));
+            if status == UploadState::Running {
+                for part in p.deferred_failed_parts.drain() {
+                    p.in_flight_progress.remove(&part);
+                }
             }
+            p.status = status.clone();
+            p.preserve_paused_progress = keep;
+            if status != UploadState::Running && !keep {
+                p.in_flight_progress.clear();
+                p.deferred_failed_parts.clear();
+            }
+            let fp = p.to_file_progress();
+            let tid = p.transfer_id.clone();
+            let (s, t) = Self::build_aggregates(&lock, session_agg, transfer_agg, &tid);
+            drop(lock);
+            self.notifier.notify(&fp, &s, &t);
+        }
+    }
+
+    /// Keep a native paused snapshot stable. Reset only failed attempts once the
+    /// user resumes; healthy held attempts keep their absolute byte counters.
+    pub fn reset_failed_part(
+        &self,
+        file_key: &str,
+        part: u32,
+        version: u64,
+        defer_until_resume: bool,
+        session_agg: AggregateProgress,
+        transfer_agg: AggregateProgress,
+    ) {
+        let _notification = self.notification.lock().unwrap();
+        let mut lock = self.progress.lock().unwrap();
+        if let Some(p) = lock.get_mut(file_key) {
+            if p.run_version != version || p.completed_part_set.contains(&part) {
+                return;
+            }
+            if defer_until_resume || (p.status == UploadState::Paused && p.preserve_paused_progress)
+            {
+                p.deferred_failed_parts.insert(part);
+                return;
+            }
+            if p.status != UploadState::Running {
+                return;
+            }
+            p.in_flight_progress.remove(&part);
             let fp = p.to_file_progress();
             let tid = p.transfer_id.clone();
             let (s, t) = Self::build_aggregates(&lock, session_agg, transfer_agg, &tid);

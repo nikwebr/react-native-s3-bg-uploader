@@ -63,6 +63,7 @@ class Upload:
     progress_reset_verified: bool = False
     last_network_failure_at: float | None = None
     failed_progress_after_ms: float | None = None
+    paused_put_requests: dict = field(default_factory=dict)
 
 
 class Backend:
@@ -174,6 +175,8 @@ class Backend:
                 require(upload.put_requests[3] == 2, "Resume did not restart the cancelled part")
         else:
             require(upload.paused and upload.resumed, "Completion without verified pause/resume")
+            require(all(upload.put_requests[part] == count for part, count in upload.paused_put_requests.items()),
+                    "Resume restarted a PUT that was held across pause")
         require(not upload.completed, "Duplicate completion")
         require(upload.requested[1] == 1, "Resume re-requested the completed first part")
         require(upload.put_requests[1] == 1, "Resume re-uploaded the completed first part")
@@ -215,6 +218,7 @@ class Backend:
             require(before["completedParts"] == after["completedParts"] and
                     before["uploadedBytes"] == after["uploadedBytes"], "Progress changed during pause")
             upload.paused = True
+            upload.paused_put_requests = dict(upload.put_requests)
         elif path == "/resumed":
             require(upload.paused, "Resume without verified pause")
             upload.resumed = True
@@ -294,6 +298,7 @@ class Backend:
             "bufferedRequestCancelled": upload.blocked_part_cancelled.is_set(),
             "progressResetVerified": upload.progress_reset_verified,
             "failedProgressAfterLastNetworkErrorMs": upload.failed_progress_after_ms,
+            "heldPutRequests": upload.paused_put_requests,
         } for mode, upload in self.uploads.items()}
         (self.artifacts / "verification.json").write_text(json.dumps(report, indent=2))
         if final:

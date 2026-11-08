@@ -123,6 +123,15 @@ impl UploadBackend for IosUploadBackend {
         session::is_current_run(&self.file_key, self.run_version)
     }
 
+    async fn wait_until_resumed(&self) -> Result<(), String> {
+        upload_engine::wait_while_paused(
+            &self.file_key,
+            self.run_version,
+            &runtime::run_cancellation(&self.file_key),
+            || PAUSE_FLAG.load(Ordering::Relaxed),
+        )
+    }
+
     fn ciphertext_overhead(&self) -> u64 {
         active_encryptor(self.encryption_config.as_ref())
             .map(|e| e.ciphertext_overhead() as u64)
@@ -181,9 +190,17 @@ impl UploadBackend for IosUploadBackend {
         upload_id: &str,
         results: Vec<crate::core::ChunkUploadResult>,
     ) -> Result<(), String> {
-        self.api
-            .complete_upload(&self.file_key, upload_id, results)
-            .await
+        self.wait_until_resumed().await?;
+        let key = self.file_key.clone();
+        let version = self.run_version;
+        let cancelled = runtime::run_cancellation(&key);
+        nyquest_backend_nsurlsession::with_request_control(
+            Arc::new(move || {
+                cancelled.load(Ordering::Relaxed) || !session::is_current_run(&key, version)
+            }),
+            Arc::new(|| PAUSE_FLAG.load(Ordering::Relaxed)),
+            || pollster::block_on(self.api.complete_upload(&self.file_key, upload_id, results)),
+        )
     }
 }
 
@@ -209,11 +226,26 @@ impl BlockingPlatformAdapter for IosAdapter {
     }
 
     fn fetch_urls(&self, parts: &[u32]) -> Result<std::collections::HashMap<u32, String>, String> {
-        pollster::block_on(
-            NativeApiClient {
-                network: self.network.clone(),
-            }
-            .fetch_upload_urls_batch(&self.file_key, &self.upload_id, parts),
+        let key = self.file_key.clone();
+        let version = self.run_version;
+        let cancelled = runtime::run_cancellation(&key);
+        nyquest_backend_nsurlsession::with_request_control(
+            Arc::new(move || {
+                cancelled.load(Ordering::Relaxed) || !session::is_current_run(&key, version)
+            }),
+            Arc::new(|| PAUSE_FLAG.load(Ordering::Relaxed)),
+            || {
+                pollster::block_on(
+                    NativeApiClient {
+                        network: self.network.clone(),
+                    }
+                    .fetch_upload_urls_batch(
+                        &self.file_key,
+                        &self.upload_id,
+                        parts,
+                    ),
+                )
+            },
         )
     }
 
@@ -345,16 +377,9 @@ fn upload_chunk_with_retry(
     crate::core::retry::run_with_retry_string(
         &policy,
         |_attempt| {
-            if cancelled.load(Ordering::Relaxed) {
-                return Err("Upload aborted".to_string());
-            }
-            // Abort immediately if paused — avoids retry backoff delays burning time after pause_all().
-            if crate::ios::PAUSE_FLAG.load(Ordering::Relaxed) {
-                return Err("paused".to_string());
-            }
-            if !session::is_current_run(&file_key, run_version) {
-                return Err("stale run".to_string());
-            }
+            upload_engine::wait_while_paused(&file_key, run_version, cancelled, || {
+                PAUSE_FLAG.load(Ordering::Relaxed)
+            })?;
 
             runtime::update_in_flight(
                 iosProgress::progress_manager(),
@@ -375,12 +400,12 @@ fn upload_chunk_with_retry(
 
             let fk = file_key.clone();
             let cancel_flag = cancelled.clone();
-            let response = nyquest_backend_nsurlsession::with_request_cancellation(
+            let response = nyquest_backend_nsurlsession::with_request_control(
                 Arc::new(move || {
                     cancel_flag.load(Ordering::Relaxed)
-                        || crate::ios::PAUSE_FLAG.load(Ordering::Relaxed)
                         || !session::is_current_run(&fk, run_version)
                 }),
+                Arc::new(|| PAUSE_FLAG.load(Ordering::Relaxed)),
                 || client.request(request),
             );
             match response {
@@ -393,26 +418,32 @@ fn upload_chunk_with_retry(
                             return Err("Upload aborted".to_string());
                         }
                         let etag = clean_etag(&etag_vec[0]);
-                        if !runtime::complete_chunk(
-                            iosProgress::progress_manager(),
-                            &file_key,
-                            part_number,
-                            etag.clone(),
-                            chunk_size,
-                            run_version,
-                        ) {
-                            return Err("stale run".to_string());
+                        loop {
+                            upload_engine::wait_while_paused(
+                                &file_key,
+                                run_version,
+                                cancelled,
+                                || PAUSE_FLAG.load(Ordering::Relaxed),
+                            )?;
+                            if runtime::complete_chunk(
+                                iosProgress::progress_manager(),
+                                &file_key,
+                                part_number,
+                                etag.clone(),
+                                chunk_size,
+                                run_version,
+                            ) {
+                                break;
+                            }
+                            if !runtime::is_run_paused(&file_key, run_version) {
+                                return Err("stale run".into());
+                            }
                         }
                         Ok(etag)
                     }
                     _ => Err("No ETag in response".to_string()),
                 },
                 Err(e) => {
-                    // If the request failed while we're paused (ProgressReader interrupted
-                    // the body stream), return "paused" immediately — no retry needed.
-                    if crate::ios::PAUSE_FLAG.load(Ordering::Relaxed) {
-                        return Err("paused".to_string());
-                    }
                     if !session::is_current_run(&file_key, run_version) {
                         return Err("stale run".to_string());
                     }
@@ -421,27 +452,27 @@ fn upload_chunk_with_retry(
             }
         },
         |attempt, err, delay_ms| {
-            runtime::update_in_flight(
+            runtime::reset_failed_part(
                 iosProgress::progress_manager(),
                 &file_key,
                 part_number,
-                0,
                 run_version,
+                PAUSE_FLAG.load(Ordering::Relaxed),
             );
             eprintln!(
                 "Upload attempt {} failed for part {}: {}, retrying in {}ms",
                 attempt, part_number, err, delay_ms
             );
-            // Skip the sleep entirely when paused — the next attempt will return
-            // "paused" immediately anyway, so sleeping is pure waste.
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(delay_ms as u64);
-            while std::time::Instant::now() < deadline
-                && !cancelled.load(Ordering::Relaxed)
-                && !crate::ios::PAUSE_FLAG.load(Ordering::Relaxed)
-                && session::is_current_run(&file_key, run_version)
+            let mut remaining = delay_ms;
+            while remaining > 0
+                && upload_engine::wait_while_paused(&file_key, run_version, cancelled, || {
+                    PAUSE_FLAG.load(Ordering::Relaxed)
+                })
+                .is_ok()
             {
-                thread::sleep(std::time::Duration::from_millis(20));
+                let step = remaining.min(20);
+                thread::sleep(std::time::Duration::from_millis(step as u64));
+                remaining -= step;
             }
         },
     )
@@ -456,6 +487,94 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn pause_holds_a_buffered_put_and_resume_receives_its_original_response() {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/part", listener.local_addr().unwrap());
+        let (body_tx, body_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    if request.len() - end - 4 >= 64 * 1024 {
+                        break;
+                    }
+                }
+            }
+            body_tx.send(socket.try_clone().unwrap()).unwrap();
+            reply_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"etag\"\r\nConnection: close\r\n\r\n")
+                .is_ok()
+        });
+        let paused = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicBool::new(false));
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = {
+            let paused = paused.clone();
+            let cancelled = cancelled.clone();
+            thread::spawn(move || {
+                init_nyquest();
+                let client = nyquest::ClientBuilder::default()
+                    .request_timeout(Duration::from_secs(30))
+                    .build_blocking()
+                    .unwrap();
+                let result = nyquest_backend_nsurlsession::with_request_control(
+                    Arc::new(move || cancelled.load(Ordering::SeqCst)),
+                    Arc::new(move || {
+                        let held = paused.load(Ordering::SeqCst);
+                        if held && !seen.swap(true, Ordering::SeqCst) {
+                            seen_tx.send(()).unwrap();
+                        }
+                        held
+                    }),
+                    || {
+                        client.request(nyquest::Request::put(url).with_body(
+                            nyquest::blocking::Body::stream(
+                                std::io::Cursor::new(vec![42; 64 * 1024]),
+                                "application/octet-stream",
+                                64 * 1024,
+                            ),
+                        ))
+                    },
+                )
+                .map(|response| clean_etag(&response.get_header("etag").unwrap()[0]));
+                result_tx
+                    .send(result.map_err(|error| format!("{:?}", error)))
+                    .unwrap();
+            })
+        };
+        let socket = body_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        paused.store(true, Ordering::SeqCst);
+        let observed = seen_rx.recv_timeout(Duration::from_secs(2));
+        reply_tx.send(()).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(250));
+        paused.store(false, Ordering::SeqCst);
+        let resumed = result_rx.recv_timeout(Duration::from_secs(2));
+        cancelled.store(true, Ordering::SeqCst);
+        let _ = socket.shutdown(Shutdown::Both);
+        worker.join().unwrap();
+        let replied = server.join().unwrap();
+        assert!(observed.is_ok());
+        assert!(
+            early.is_err(),
+            "Pause aborted or delivered the request instead of holding it"
+        );
+        assert_eq!(resumed.unwrap().unwrap(), "etag");
+        assert!(replied, "Pause closed the original connection");
+    }
 
     #[test]
     fn cancel_a_fully_buffered_put_without_waiting_for_response_or_timeout() {

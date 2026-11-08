@@ -112,6 +112,15 @@ impl UploadBackend for AndroidUploadBackend {
         session::is_current_run(&self.file_key, self.run_version)
     }
 
+    async fn wait_until_resumed(&self) -> Result<(), String> {
+        upload_engine::wait_while_paused(
+            &self.file_key,
+            self.run_version,
+            &runtime::run_cancellation(&self.file_key),
+            || PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     fn ciphertext_overhead(&self) -> u64 {
         active_encryptor(self.encryption_config.as_ref())
             .map(|e| e.ciphertext_overhead() as u64)
@@ -170,9 +179,13 @@ impl UploadBackend for AndroidUploadBackend {
         upload_id: &str,
         results: Vec<crate::core::ChunkUploadResult>,
     ) -> Result<(), String> {
-        self.api
+        self.wait_until_resumed().await?;
+        let result = self
+            .api
             .complete_upload(&self.file_key, upload_id, results)
-            .await
+            .await;
+        self.wait_until_resumed().await?;
+        result
     }
 }
 
@@ -198,12 +211,20 @@ impl BlockingPlatformAdapter for AndroidAdapter {
     }
 
     fn fetch_urls(&self, parts: &[u32]) -> Result<std::collections::HashMap<u32, String>, String> {
-        pollster::block_on(
+        let cancelled = runtime::run_cancellation(&self.file_key);
+        upload_engine::wait_while_paused(&self.file_key, self.run_version, &cancelled, || {
+            PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+        })?;
+        let result = pollster::block_on(
             NativeApiClient {
                 network: self.network.clone(),
             }
             .fetch_upload_urls_batch(&self.file_key, &self.upload_id, parts),
-        )
+        );
+        upload_engine::wait_while_paused(&self.file_key, self.run_version, &cancelled, || {
+            PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+        })?;
+        result
     }
 
     fn make_worker(
@@ -357,15 +378,9 @@ fn upload_chunk_with_retry(
     crate::core::retry::run_with_retry_string(
         &policy,
         |_attempt| {
-            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err("Upload aborted".to_string());
-            }
-            if crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err("paused".to_string());
-            }
-            if !session::is_current_run(&file_key, run_version) {
-                return Err("stale run".to_string());
-            }
+            upload_engine::wait_while_paused(&file_key, run_version, cancelled, || {
+                PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+            })?;
 
             runtime::update_in_flight(
                 androidProgress::progress_manager(),
@@ -377,20 +392,37 @@ fn upload_chunk_with_retry(
 
             let progress_reader =
                 ProgressReader::new(data.to_vec(), file_key.clone(), run_version, part_number);
-            // reqwest's blocking send cannot be interrupted once the body is
-            // buffered. Drive a cancellable async request on the worker thread
-            // instead, dropping its future on pause, stale run or sibling failure.
+            // Keep the request alive during pause, gating further body reads.
+            // Only cancel/replacement/failure drops the request future.
             let response = request_runtime.block_on(async {
-                let stream =
-                    futures::stream::try_unfold(progress_reader, |mut reader| async move {
+                let stream = futures::stream::try_unfold(
+                    (
+                        progress_reader,
+                        file_key.clone(),
+                        cancelled.clone(),
+                        run_version,
+                    ),
+                    |(mut reader, key, cancelled, version)| async move {
+                        while PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+                            if cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                                || !session::is_current_run(&key, version)
+                            {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "Upload aborted",
+                                ));
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
                         let mut buffer = vec![0; 64 * 1024];
                         let count = std::io::Read::read(&mut reader, &mut buffer)?;
                         if count == 0 {
                             return Ok::<_, std::io::Error>(None);
                         }
                         buffer.truncate(count);
-                        Ok(Some((buffer, reader)))
-                    });
+                        Ok(Some((buffer, (reader, key, cancelled, version))))
+                    },
+                );
                 let request = client
                     .put(url)
                     .header("Content-Length", chunk_size.to_string())
@@ -398,9 +430,6 @@ fn upload_chunk_with_retry(
                     .send();
                 let interruption = async {
                     loop {
-                        if crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
-                            return "paused".to_string();
-                        }
                         if !session::is_current_run(&file_key, run_version) {
                             return "stale run".to_string();
                         }
@@ -411,12 +440,22 @@ fn upload_chunk_with_retry(
                     }
                 };
                 futures::pin_mut!(request, interruption);
-                match futures::future::select(request, interruption).await {
+                let result = match futures::future::select(request, interruption).await {
                     futures::future::Either::Left((response, _)) => {
                         response.map_err(|e| format!("{:?}", e))
                     }
                     futures::future::Either::Right((reason, _)) => Err(reason),
+                };
+                while PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err("Upload aborted".to_string());
+                    }
+                    if !session::is_current_run(&file_key, run_version) {
+                        return Err("stale run".to_string());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
+                result
             })?;
 
             if !response.status().is_success() {
@@ -440,25 +479,33 @@ fn upload_chunk_with_retry(
                 return Err("Upload aborted".to_string());
             }
 
-            if !runtime::complete_chunk(
-                androidProgress::progress_manager(),
-                &file_key,
-                part_number,
-                etag.clone(),
-                chunk_size,
-                run_version,
-            ) {
-                return Err("stale run".to_string());
+            loop {
+                upload_engine::wait_while_paused(&file_key, run_version, cancelled, || {
+                    PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+                })?;
+                if runtime::complete_chunk(
+                    androidProgress::progress_manager(),
+                    &file_key,
+                    part_number,
+                    etag.clone(),
+                    chunk_size,
+                    run_version,
+                ) {
+                    break;
+                }
+                if !runtime::is_run_paused(&file_key, run_version) {
+                    return Err("stale run".into());
+                }
             }
             Ok(etag)
         },
         |attempt, err, delay_ms| {
-            runtime::update_in_flight(
+            runtime::reset_failed_part(
                 androidProgress::progress_manager(),
                 &file_key,
                 part_number,
-                0,
                 run_version,
+                PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed),
             );
             log::warn!(
                 "Upload attempt {} failed for part {}: {}, retrying in {}ms",
@@ -467,14 +514,16 @@ fn upload_chunk_with_retry(
                 err,
                 delay_ms
             );
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(delay_ms as u64);
-            while std::time::Instant::now() < deadline
-                && !cancelled.load(std::sync::atomic::Ordering::Relaxed)
-                && !crate::android::PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
-                && session::is_current_run(&file_key, run_version)
+            let mut remaining = delay_ms;
+            while remaining > 0
+                && upload_engine::wait_while_paused(&file_key, run_version, cancelled, || {
+                    PAUSE_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .is_ok()
             {
-                thread::sleep(std::time::Duration::from_millis(20));
+                let step = remaining.min(20);
+                thread::sleep(std::time::Duration::from_millis(step as u64));
+                remaining -= step;
             }
         },
     )

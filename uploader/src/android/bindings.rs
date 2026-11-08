@@ -479,7 +479,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativePauseAll(
     _class: JClass,
 ) {
     PAUSE_FLAG.store(true, Ordering::Relaxed);
-    runtime::pause_all(androidProgress::progress_manager());
+    runtime::pause_all_preserving_progress(androidProgress::progress_manager());
 }
 
 #[no_mangle]
@@ -487,11 +487,10 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeResumeAll(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    // resume_all resets to confirmed bytes in INITIALIZED state until the new
-    // run starts. Cancelled workers are fenced by run_version.
-    PAUSE_FLAG.store(false, Ordering::Relaxed);
+    // Restore held run state before allowing requests/acknowledgements to proceed.
     match runtime::resume_all(androidProgress::progress_manager()) {
         Ok(()) => {
+            PAUSE_FLAG.store(false, Ordering::Relaxed);
             // Re-enqueue any files that previously failed so they can retry.
             let failed_fds: Vec<(String, RawFd)> = {
                 let mut map = crate::android::FAILED_FDS.lock().unwrap();
