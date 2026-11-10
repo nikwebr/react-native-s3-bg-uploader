@@ -273,6 +273,11 @@ pub fn wasm_cancel_all() {
 pub fn wasm_pause_all() {
     PAUSE_REQUESTED.with(|p| *p.borrow_mut() = true);
     crate::core::runtime::pause_all(wasmProgress::progress_manager());
+    // Browsers cannot suspend a request, so a pause cancels every part still in
+    // transfer instead of leaving it on the wire. `pause_all` already dropped
+    // the in-flight bytes from the progress snapshot, so reported progress falls
+    // back to the confirmed parts and resume re-uploads the unconfirmed ones.
+    crate::wasm::upload::abort_upload_requests(None);
 }
 
 #[wasm_bindgen]

@@ -64,6 +64,9 @@ class Upload:
     last_network_failure_at: float | None = None
     failed_progress_after_ms: float | None = None
     paused_put_requests: dict = field(default_factory=dict)
+    # Platform that reported the pause: web cannot suspend an XHR, so its pause
+    # cancels the in-flight parts instead of holding them across the pause.
+    paused_platform: str | None = None
 
 
 class Backend:
@@ -175,8 +178,16 @@ class Backend:
                 require(upload.put_requests[3] == 2, "Resume did not restart the cancelled part")
         else:
             require(upload.paused and upload.resumed, "Completion without verified pause/resume")
-            require(all(upload.put_requests[part] == count for part, count in upload.paused_put_requests.items()),
-                    "Resume restarted a PUT that was held across pause")
+            restarted = {part: upload.put_requests[part] - count
+                         for part, count in upload.paused_put_requests.items()}
+            if upload.paused_platform == "web":
+                # A browser cannot suspend a request, so the pause must cancel the
+                # parts still in transfer and the resume must upload them again.
+                require(any(count > 0 for count in restarted.values()),
+                        "Web pause left the parts in transfer running")
+            else:
+                require(all(count == 0 for count in restarted.values()),
+                        "Resume restarted a PUT that was held across pause")
         require(not upload.completed, "Duplicate completion")
         require(upload.requested[1] == 1, "Resume re-requested the completed first part")
         require(upload.put_requests[1] == 1, "Resume re-uploaded the completed first part")
@@ -218,6 +229,7 @@ class Backend:
             require(before["completedParts"] == after["completedParts"] and
                     before["uploadedBytes"] == after["uploadedBytes"], "Progress changed during pause")
             upload.paused = True
+            upload.paused_platform = body.get("platform")
             upload.paused_put_requests = dict(upload.put_requests)
         elif path == "/resumed":
             require(upload.paused, "Resume without verified pause")

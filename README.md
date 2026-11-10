@@ -330,17 +330,17 @@ to confirmed parts, and restart both unconfirmed parts on reconnect/`resume()`.
 Both recovered objects are independently downloaded and verified, including
 correct/wrong-key checks. Resuming after reconnect must complete within 20 seconds.
 
-Live progress includes bytes sent while running. Manual pause holds the active
-upload run instead of cancelling its PUTs. Native progress stays at its last sent
-byte count during pause and viable resume; only failed/restarted parts roll back
-when resume/retry determines that their requests cannot continue. Web paused
-progress still reports confirmed parts only. Resume continues viable requests in
-that same run and multipart ID.
-No new parts are dispatched and acknowledgements/completion are deferred until
-resume. iOS suspends its NSURLSession tasks; Android gates further body reads.
-Browsers cannot suspend XHR: already-buffered traffic may finish on the wire, but
-its result is held until resume. Failed requests cannot be revived and still need
-retries; a failed upload or explicit cancel still aborts outstanding PUTs.
+Live progress includes bytes sent while running. Manual pause stops dispatching:
+no new parts are sent and acknowledgements/completion are deferred until resume,
+which continues in that same run and multipart ID.
+Native pause holds the in-flight PUTs instead of cancelling them. iOS suspends its
+NSURLSession tasks; Android gates further body reads. Native progress stays at its
+last sent byte count during pause and viable resume; only failed/restarted parts
+roll back when resume/retry determines that their requests cannot continue.
+A browser cannot suspend an XHR, so web pause aborts every part still in transfer.
+Web progress drops back to the confirmed parts, and `resume()` uploads the aborted
+parts again. Failed requests cannot be revived and still need retries; a failed
+upload or explicit cancel still aborts outstanding PUTs.
 Progress may decrease at a pause, failed request, or retry boundary. The final 1% is
 reserved until all multipart PUTs are acknowledged by S3. `COMPLETED` still means
 the backend's multipart completion call has succeeded.
@@ -402,16 +402,18 @@ it without replacing its requests. Replacing/cancelling that run must still rele
 the queue promptly rather than wait for the retired network worker. A native
 NSURLSession regression sends a PUT body once, suspends while its response arrives,
 and receives that original response only after resume. Shared E2E flows require
-that PUTs already received at the pause boundary are not re-uploaded on resume.
+that a native client does not re-upload the PUTs already received at the pause
+boundary, and that web re-uploads the parts its pause aborted.
 It also checks that native end-of-stream events expose `AtEnd` to their delegate,
 not the `Open` fallback produced when the stream buffer is still locked, and
 that EOF is delivered after the last buffered bytes are consumed.
 The test screen also reads current progress after obtaining the upload key, so a
 fast first-part callback emitted before the start call resolves is not lost.
 The pause check waits for progress to stop changing instead of sleeping a fixed
-time, because parts already in flight may finish after a pause and a slow runner
-would otherwise report those permitted completions as progress made while
-paused. Set `E2E_RELEASE_STAGGER_MS=1000` to make the backend answer those
+time, because on native parts already in flight may finish after a pause and a
+slow runner would otherwise report those permitted completions as progress made
+while paused. Web has no such allowance: an aborted part cannot land, so any
+completion after a web pause fails the run. Set `E2E_RELEASE_STAGGER_MS=1000` to make the backend answer those
 in-flight parts seconds apart and reproduce that timing locally.
 
 The same workflows also test `custom-encryption-example` with both plaintext and

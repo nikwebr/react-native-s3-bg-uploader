@@ -134,9 +134,11 @@ export default function TestApp({ initializeEncryptor }: {
     return file;
   };
 
-  // Parts already sent when pause arrives are allowed to finish. Wait until progress
-  // has been unchanged for a full window, so a slow runner cannot report those
-  // permitted completions as progress that happened "while paused".
+  // Native parts already sent when pause arrives are allowed to finish. Wait until
+  // progress has been unchanged for a full window, so a slow runner cannot report
+  // those permitted completions as progress that happened "while paused".
+  // Web cannot suspend a request: its pause cancels the in-flight parts, so nothing
+  // may land at all (checked below).
   // A no-op pause keeps dispatching, so the quiet window can then never be reached
   // before the deadline: the check still fails if pause does not actually stop work.
   const SETTLE_QUIET_MS = 5000;
@@ -198,6 +200,11 @@ export default function TestApp({ initializeEncryptor }: {
     if (before.completedParts >= before.totalParts) {
       throw new Error('All parts uploaded while paused');
     }
+    if (Platform.OS === 'web' && before.completedParts !== initial.completedParts) {
+      // Browsers cannot suspend a request, so a pause must cancel the parts still
+      // in transfer instead of letting them land once the server gate opens.
+      throw new Error('Web pause left an in-flight part running');
+    }
     if (after.completedParts !== before.completedParts ||
         after.uploadedBytes !== before.uploadedBytes) {
       throw new Error('Upload advanced while paused');
@@ -205,7 +212,12 @@ export default function TestApp({ initializeEncryptor }: {
     if ((await S3BgUploader.getAggregateProgress()).state !== 'PAUSED') {
       throw new Error('Uploader left PAUSED while paused');
     }
-    await api('/paused', { mode: current.current?.mode, before, after });
+    await api('/paused', {
+      mode: current.current?.mode,
+      platform: Platform.OS,
+      before,
+      after,
+    });
     setStatus('Pause verified');
   };
 

@@ -75,7 +75,9 @@ class BackendTests(unittest.TestCase):
         urls = self.backend.urls({**started, "parts": list(range(1, len(chunks) + 1))})["urls"]
         self.backend.control("/release", {"mode": mode})
         snapshot = {"completedParts": 1, "totalParts": len(chunks), "uploadedBytes": PART_SIZE}
-        self.backend.control("/paused", {"mode": mode, "before": snapshot, "after": snapshot})
+        self.backend.control("/paused", {
+            "mode": mode, "platform": "ios", "before": snapshot, "after": snapshot,
+        })
         self.backend.control("/resumed", {"mode": mode})
         parts = []
         buffered = None
@@ -194,6 +196,60 @@ class BackendTests(unittest.TestCase):
             self.backend.control("/paused", {"mode": "plain", "before": before, "after": after})
         with self.assertRaisesRegex(AssertionError, "second multipart"):
             self.backend.start({"mode": "plain"})
+
+    def paused_upload(self, platform, restart_held):
+        """Pause with a part still on the wire, then complete the upload.
+
+        `restart_held` models the platform's pause contract: a browser aborts the
+        request and uploads the part again after resume, a native client holds the
+        request and must not send it twice.
+        """
+        mode = "plain"
+        chunks = [FIXTURE[start:start + PART_SIZE] for start in range(0, len(FIXTURE), PART_SIZE)]
+        started = self.backend.start({"mode": mode})
+        urls = self.backend.urls({**started, "parts": list(range(1, len(chunks) + 1))})["urls"]
+        with urlopen(Request(urls["1"], data=chunks[0], method="PUT"), timeout=10) as result:
+            parts = [{"PartNumber": 1, "ETag": result.headers["ETag"]}]
+        upload = self.backend.upload(mode)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            # Part 2 is on the wire and blocked at the gate when the pause arrives.
+            def hold():
+                with urlopen(Request(urls["2"], data=chunks[1], method="PUT"), timeout=20) as result:
+                    return result.headers["ETag"]
+            held = pool.submit(hold)
+            deadline = time.monotonic() + 10
+            while upload.put_requests[2] < 1:
+                self.assertLess(time.monotonic(), deadline, "Part 2 never reached the server")
+                time.sleep(0.05)
+            snapshot = {"completedParts": 1, "totalParts": len(chunks), "uploadedBytes": PART_SIZE}
+            self.backend.control("/paused", {
+                "mode": mode, "platform": platform, "before": snapshot, "after": snapshot,
+            })
+            self.backend.control("/release", {"mode": mode})
+            self.backend.control("/resumed", {"mode": mode})
+            held_etag = held.result(timeout=10)
+        if not restart_held:
+            parts.append({"PartNumber": 2, "ETag": held_etag})
+        for number, chunk in enumerate(chunks[1:], 2):
+            if number == 2 and not restart_held:
+                continue
+            with urlopen(Request(urls[str(number)], data=chunk, method="PUT"), timeout=10) as result:
+                parts.append({"PartNumber": number, "ETag": result.headers["ETag"]})
+        self.backend.complete(f"/complete/{started['uploadId']}/{started['key']}", {"parts": parts})
+
+    def test_web_pause_must_restart_the_parts_in_transfer(self):
+        self.paused_upload("web", restart_held=True)
+
+    def test_web_pause_that_keeps_the_parts_running_fails(self):
+        with self.assertRaisesRegex(AssertionError, "Web pause left the parts in transfer running"):
+            self.paused_upload("web", restart_held=False)
+
+    def test_native_pause_must_not_restart_a_held_part(self):
+        self.paused_upload("ios", restart_held=False)
+
+    def test_native_pause_that_restarts_a_held_part_fails(self):
+        with self.assertRaisesRegex(AssertionError, "Resume restarted a PUT that was held across pause"):
+            self.paused_upload("ios", restart_held=True)
 
 
 class CustomBackendTests(BackendTests):
