@@ -91,7 +91,11 @@ class Backend:
         self.s3.create_bucket(Bucket=BUCKET)
         self.uploads = {}
         self.lock = threading.Lock()
-        self.network_failure_delay_secs = 25
+        # Delay on the first simulated failure so the client has time to report
+        # in-flight progress before the connection is dropped.  5 s is enough to
+        # exercise the progress-reset logic without making the e2e test excessively
+        # slow (the old 25 s value pushed the encrypted-network test past its timeout).
+        self.network_failure_delay_secs = 5
 
     def upload(self, mode):
         require(mode in self.uploads, f"No upload for {mode}")

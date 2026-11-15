@@ -19,12 +19,12 @@ appId: ${APP_ID}
 - tapOn: Test network retry
 - extendedWaitUntil:
     visible: plain network recovery verified
-    timeout: 120000
+    timeout: 180000
 - assertNotVisible: "E2E error:.*"
 - takeScreenshot: network-retry-verified
 - tapOn: Test network resume
 - extendedWaitUntil:
     visible: encrypted network recovery verified
-    timeout: 120000
+    timeout: 180000
 - assertNotVisible: "E2E error:.*"
 - takeScreenshot: network-resume-verified
