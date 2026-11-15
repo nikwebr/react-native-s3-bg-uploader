@@ -1,9 +1,12 @@
 # Paseo Hub GitHub agent
 
 These Hub workflows are the Paseo replacement for the GitHub Actions
-`Agent Serviceuser` pi agent. They start the same Pi model
-(`deepseek/deepseek-flash`) from GitHub events, gated by labels instead of
-assignees.
+`Agent Serviceuser` pi agent. They run Codex with the DeepSeek provider
+(`deepseek-chat`) from GitHub events, gated by labels instead of assignees.
+
+Hub refuses providers that cannot preapprove exact MCP tools for unattended
+execution, so Pi cannot be used here. Codex is enabled on the daemon with a
+custom DeepSeek provider; see [Runtime setup](#runtime-setup).
 
 ## Labels
 
@@ -42,6 +45,25 @@ same item.
 
 All workflows use the `nikwebr-github` connection and the `dev`
 environment from `hub.yml`. The shared prompt lives in `workflows/partials/`.
+
+## GitHub authorship
+
+The steps intentionally omit the Hub `github` authority block. That keeps Hub
+from injecting the GitHub App token into the agent environment, so `gh` and `git`
+use the daemon user's existing login: `agent-serviceuser`. Commits, pull requests,
+comments, and reviews created by the agent are therefore authored as
+`agent-serviceuser` rather than the Hub App.
+
+## Runtime setup
+
+The daemon needs Codex plus a DeepSeek provider configuration:
+
+- Install `@openai/codex` so `codex` is on the daemon `PATH`.
+- Configure `~/.codex/config.toml` with a `deepseek` model provider using
+  `wire_api = "responses"` and `env_key = "DEEPSEEK_API_KEY"`.
+- Enable the Paseo `codex` provider and give it `DEEPSEEK_API_KEY` (for example in
+  `~/.paseo/config.json` under `agents.providers.codex.env`).
+- Add `deepseek-chat` to the provider models, then reload the daemon.
 
 ## Disabled GitHub Actions workflow
 
