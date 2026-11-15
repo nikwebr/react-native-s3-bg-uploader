@@ -44,6 +44,7 @@ struct XhrGuard {
         wasm_bindgen::closure::Closure<dyn FnMut()>,
         wasm_bindgen::closure::Closure<dyn FnMut()>,
         wasm_bindgen::closure::Closure<dyn FnMut()>,
+        wasm_bindgen::closure::Closure<dyn FnMut()>,
     ),
 }
 
@@ -56,6 +57,7 @@ impl Drop for XhrGuard {
         self.xhr.set_onload(None);
         self.xhr.set_onerror(None);
         self.xhr.set_onabort(None);
+        self.xhr.set_ontimeout(None);
         let _ = self.xhr.abort();
     }
 }
@@ -476,6 +478,11 @@ async fn upload_chunk_xhr(
 
     let xhr = XmlHttpRequest::new().map_err(|e| format!("{:?}", e))?;
     xhr.open("PUT", url).map_err(|e| format!("{:?}", e))?;
+    // Timeout after 60 s so that a server which stops responding (e.g., connection
+    // dropped during network-recovery simulation) does not leave the XHR hanging
+    // forever.  The first simulated failure includes a 25 s server-side delay, so
+    // 60 s is long enough for the request body to be sent and the drop to occur.
+    xhr.set_timeout(60_000);
 
     let fk = file_key.to_string();
     let mut callbacks = None;
@@ -486,6 +493,13 @@ async fn upload_chunk_xhr(
         let xhr_for_progress = xhr.clone();
         let fk_clone = fk.clone();
         let reject_for_abort = reject.clone();
+        let reject_for_timeout = reject.clone();
+
+        let ontimeout = Closure::wrap(Box::new(move || {
+            reject_for_timeout
+                .call1(&JsValue::NULL, &JsValue::from_str("Request timeout"))
+                .ok();
+        }) as Box<dyn FnMut()>);
 
         let onprogress = Closure::wrap(Box::new(move |event: web_sys::ProgressEvent| {
             if !crate::core::session::is_current_run(&fk_clone, run_version) {
@@ -548,7 +562,8 @@ async fn upload_chunk_xhr(
         xhr.set_onload(Some(onload.as_ref().unchecked_ref()));
         xhr.set_onerror(Some(onerror.as_ref().unchecked_ref()));
         xhr.set_onabort(Some(onabort.as_ref().unchecked_ref()));
-        callbacks = Some((onprogress, onload, onerror, onabort));
+        xhr.set_ontimeout(Some(ontimeout.as_ref().unchecked_ref()));
+        callbacks = Some((onprogress, onload, onerror, onabort, ontimeout));
     });
 
     let key = (fk, run_version, part_number);
