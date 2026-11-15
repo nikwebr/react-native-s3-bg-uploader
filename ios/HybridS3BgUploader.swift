@@ -78,8 +78,18 @@ private func rustProgressBridge(_ eventPtr: UnsafePointer<ProgressEvent>?) {
             // in-flight uploads.
             let subtitle = formatTemplate(HybridS3BgUploader.sharedSubtitleTemplate, agg: sessionAggregate)
             task.updateTitle(title, subtitle: subtitle)
-            task.progress.totalUnitCount     = Int64(sessionAggregate.totalSize    / 1024)
-            task.progress.completedUnitCount = Int64(sessionAggregate.uploadedSize / 1024)
+            let totalKB = Int64(sessionAggregate.totalSize    / 1024)
+            var completedKB = Int64(sessionAggregate.uploadedSize / 1024)
+            // Keep the background task from showing the Apple checkmark while the
+            // S3 CompleteMultipartUpload call is still in-flight. Once setTaskCompleted
+            // fires below, the task is done anyway, so the cap matters only while
+            // session state is still Running (all chunks uploaded, but not yet
+            // acknowledged by S3).
+            if sessionAggregate.state == .running || sessionAggregate.state == .runningInBg {
+                completedKB = min(completedKB, max(0, totalKB - 1))
+            }
+            task.progress.totalUnitCount     = totalKB
+            task.progress.completedUnitCount = completedKB
 
             // Complete the task when all uploads are done or failed
             if sessionAggregate.state == .completed || sessionAggregate.state == .failed {
@@ -315,6 +325,21 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
                 guard let task = task as? BGContinuedProcessingTask else { return }
                 HybridS3BgUploader.sharedBgTask = task
                 task.expirationHandler = {
+                    // If an upload has finished uploading all parts and is waiting for
+                    // the multipart complete call to finish, wait for it instead of pausing.
+                    if is_upload_completing() {
+                        DispatchQueue.global(qos: .background).async {
+                            // Poll until completion finishes (typically a fast API call).
+                            while is_upload_completing() {
+                                Thread.sleep(forTimeInterval: 0.5)
+                            }
+                            DispatchQueue.main.async {
+                                HybridS3BgUploader.sharedBgTask = nil
+                                task.setTaskCompleted(success: true)
+                            }
+                        }
+                        return
+                    }
                     pause_all()
                     DispatchQueue.main.async {
                         HybridS3BgUploader.sharedBgTask = nil

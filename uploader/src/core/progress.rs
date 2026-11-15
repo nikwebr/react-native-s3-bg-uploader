@@ -36,6 +36,101 @@ mod tests {
     use crate::core::session::Session;
 
     #[test]
+    fn confirmed_bytes_above_99_percent_remain_exact_until_the_final_acknowledgement() {
+        use std::sync::Arc;
+
+        struct RecordingNotifier(
+            Arc<Mutex<Vec<(FileProgress, AggregateProgress, AggregateProgress)>>>,
+        );
+        impl ProgressNotifier for RecordingNotifier {
+            fn notify(
+                &self,
+                file: &FileProgress,
+                session: &AggregateProgress,
+                transfer: &AggregateProgress,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((file.clone(), session.clone(), transfer.clone()));
+            }
+        }
+
+        const FIRST_PART: u64 = 32 * 1024 * 1024;
+        const FINAL_PART: u64 = 64 * 1024;
+        const TOTAL: u64 = FIRST_PART + FINAL_PART;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let manager = ProgressManager::new(RecordingNotifier(seen.clone()));
+        let mut session = Session::new();
+        session.register_file(
+            "key".into(),
+            "hash".into(),
+            "transfer".into(),
+            "file".into(),
+            "file".into(),
+            TOTAL,
+            HashMap::new(),
+        );
+        let aggregates = |session: &Session| {
+            (
+                session.get_aggregate_progress(None),
+                session.get_aggregate_progress(Some("transfer")),
+            )
+        };
+        let assert_snapshot = |session: &Session, bytes: u64, parts: u32| {
+            let (s, t) = aggregates(session);
+            let file = manager.get_live_progress(None, None).remove(0);
+            let (s, t) = manager.get_live_aggregate(s, t, "transfer");
+            let callback = seen.lock().unwrap().last().unwrap().clone();
+            let percentage = bytes as f64 / TOTAL as f64 * 100.0;
+            for snapshot in [&file, &callback.0] {
+                assert_eq!(snapshot.uploaded_bytes, bytes);
+                assert_eq!(snapshot.completed_parts, parts);
+                assert_eq!(snapshot.percentage, percentage);
+            }
+            for snapshot in [&s, &t, &callback.1, &callback.2] {
+                assert_eq!(snapshot.uploaded_size, bytes);
+                assert_eq!(snapshot.percentage, percentage);
+            }
+        };
+
+        let (s, t) = aggregates(&session);
+        manager.init(
+            "key".into(),
+            "file".into(),
+            "hash".into(),
+            "transfer".into(),
+            TOTAL,
+            2,
+            0,
+            0,
+            HashSet::new(),
+            7,
+            s.clone(),
+            t.clone(),
+        );
+        manager.update_in_flight_for_run("key", 1, FIRST_PART, Some(7), s.clone(), t.clone());
+        manager.update_in_flight_for_run("key", 2, FINAL_PART, Some(7), s, t);
+        assert_snapshot(&session, TOTAL - TOTAL.div_ceil(100), 0);
+
+        session.complete_chunk("key", 1, "etag1".into(), FIRST_PART);
+        let (s, t) = aggregates(&session);
+        manager.complete_chunk("key", 1, FIRST_PART, s.clone(), t.clone());
+        assert_snapshot(&session, FIRST_PART, 1);
+        for sent in [0, FINAL_PART / 2, FINAL_PART] {
+            manager.update_in_flight_for_run("key", 2, sent, Some(7), s.clone(), t.clone());
+            assert_snapshot(&session, FIRST_PART, 1);
+        }
+        manager.reset_failed_part("key", 2, 7, false, s, t);
+        assert_snapshot(&session, FIRST_PART, 1);
+
+        session.complete_chunk("key", 2, "etag2".into(), FINAL_PART);
+        let (s, t) = aggregates(&session);
+        manager.complete_chunk("key", 2, FINAL_PART, s, t);
+        assert_snapshot(&session, TOTAL, 2);
+    }
+
+    #[test]
     fn retries_discard_unconfirmed_bytes_and_never_report_100_before_acknowledgement() {
         let mut p = UploadProgress::new(
             "key".into(),
@@ -407,6 +502,7 @@ impl UploadProgress {
         } else {
             self.total_bytes
                 .saturating_sub(self.total_bytes.div_ceil(100))
+                .max(self.completed_bytes)
         }
     }
 
@@ -504,6 +600,8 @@ impl<N: ProgressNotifier> ProgressManager<N> {
         mut transfer_agg: AggregateProgress,
         current_transfer_id: &str,
     ) -> (AggregateProgress, AggregateProgress) {
+        let committed_session_bytes = session_agg.uploaded_size;
+        let committed_transfer_bytes = transfer_agg.uploaded_size;
         // For each tracked file, replace the session's `uploaded_bytes` baseline
         // with the live value (completed + in-flight) from ProgressManager.
         for p in lock.values() {
@@ -529,8 +627,8 @@ impl<N: ProgressNotifier> ProgressManager<N> {
                 }
             }
         }
-        // Apply the same acknowledgement ceiling to aggregate callbacks/polls,
-        // including when the committed session baseline alone exceeds 99%.
+        // Cap unacknowledged bytes without lowering the confirmed baseline,
+        // which may already exceed 99% when only a small final part remains.
         if lock.values().any(|p| {
             (p.status == UploadState::Running || p.preserve_paused_progress)
                 && p.completed_bytes < p.total_bytes
@@ -538,7 +636,8 @@ impl<N: ProgressNotifier> ProgressManager<N> {
             session_agg.uploaded_size = session_agg.uploaded_size.min(
                 session_agg
                     .total_size
-                    .saturating_sub(session_agg.total_size.div_ceil(100)),
+                    .saturating_sub(session_agg.total_size.div_ceil(100))
+                    .max(committed_session_bytes),
             );
             if session_agg.total_size > 0 {
                 session_agg.percentage =
@@ -553,7 +652,8 @@ impl<N: ProgressNotifier> ProgressManager<N> {
             transfer_agg.uploaded_size = transfer_agg.uploaded_size.min(
                 transfer_agg
                     .total_size
-                    .saturating_sub(transfer_agg.total_size.div_ceil(100)),
+                    .saturating_sub(transfer_agg.total_size.div_ceil(100))
+                    .max(committed_transfer_bytes),
             );
             if transfer_agg.total_size > 0 {
                 transfer_agg.percentage =

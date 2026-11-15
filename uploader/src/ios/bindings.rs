@@ -8,7 +8,7 @@ use crate::core::encryption::{self, XChaCha20Poly1305Encryptor};
 use crate::core::runtime;
 use crate::core::session::{self, register_store, UploadState};
 use crate::ios::progress as iosProgress;
-use crate::ios::{PAUSE_FLAG, QUEUE};
+use crate::ios::{COMPLETING_UPLOAD, PAUSE_FLAG, QUEUE};
 use crate::native::NativeSessionStore;
 
 fn ensure_store() {
@@ -361,6 +361,14 @@ pub extern "C" fn get_global_state() -> *mut c_char {
     CString::new(state)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Returns true if an upload has finished uploading all parts and is waiting for
+/// the multipart complete call to finish. The iOS expiration handler uses this
+/// to wait for completion instead of pausing.
+#[no_mangle]
+pub extern "C" fn is_upload_completing() -> bool {
+    COMPLETING_UPLOAD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[no_mangle]

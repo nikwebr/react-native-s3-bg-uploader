@@ -341,9 +341,10 @@ A browser cannot suspend an XHR, so web pause aborts every part still in transfe
 Web progress drops back to the confirmed parts, and `resume()` uploads the aborted
 parts again. Failed requests cannot be revived and still need retries; a failed
 upload or explicit cancel still aborts outstanding PUTs.
-Progress may decrease at a pause, failed request, or retry boundary. The final 1% is
-reserved until all multipart PUTs are acknowledged by S3. `COMPLETED` still means
-the backend's multipart completion call has succeeded.
+Progress may decrease at a pause, failed request, or retry boundary. In-flight
+progress is capped at 99%, while confirmed parts retain their exact byte count
+even above 99%. Progress reaches 100% once all multipart PUTs are acknowledged
+by S3. `COMPLETED` still means the backend's multipart completion call has succeeded.
 Native snapshot delivery is serialized across concurrent part workers so older
 callbacks cannot arrive after newer progress; callbacks can still query progress.
 Held runs are in-memory only. After process termination, resume still requires

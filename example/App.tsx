@@ -419,11 +419,13 @@ export default function App(): React.JSX.Element {
                     ) : (
                       <Text style={styles.fileStatusText}>Ready</Text>
                     )}
-                    {item.encrypted && (item.fileKey || (item.progress?.totalParts ?? 0) > 0) && (
-                      <Text style={styles.cryptoMeta} selectable numberOfLines={2}>
-                        {item.progress?.totalParts ? `Parts: ${item.progress.totalParts}` : ''}
-                        {item.progress?.totalParts && item.fileKey ? '  ·  ' : ''}
-                        {item.fileKey ? `S3: ${item.fileKey}` : ''}
+                    {((item.progress?.totalParts ?? 0) > 0 || (item.encrypted && item.fileKey)) && (
+                      <Text style={styles.fileMeta} selectable numberOfLines={2}>
+                        {item.progress?.totalParts
+                          ? `Completed parts: ${item.progress.completedParts} / ${item.progress.totalParts}`
+                          : ''}
+                        {item.progress?.totalParts && item.encrypted && item.fileKey ? '  ·  ' : ''}
+                        {item.encrypted && item.fileKey ? `S3: ${item.fileKey}` : ''}
                       </Text>
                     )}
                   </View>
@@ -609,7 +611,7 @@ const styles = StyleSheet.create({
     fontSize: 10, color: '#86efac', letterSpacing: 0.2,
     backgroundColor: '#0f0f1e', borderRadius: 4, padding: 6, overflow: 'hidden',
   },
-  cryptoMeta: {
+  fileMeta: {
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     fontSize: 10, color: '#6b7280', marginTop: 3,
   },

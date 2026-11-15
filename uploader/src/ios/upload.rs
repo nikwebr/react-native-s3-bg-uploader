@@ -185,6 +185,14 @@ impl UploadBackend for IosUploadBackend {
         )
     }
 
+    fn on_enter_completion(&self) {
+        crate::ios::COMPLETING_UPLOAD.store(true, Ordering::Relaxed);
+    }
+
+    fn on_exit_completion(&self) {
+        crate::ios::COMPLETING_UPLOAD.store(false, Ordering::Relaxed);
+    }
+
     async fn complete_upload(
         &self,
         upload_id: &str,
