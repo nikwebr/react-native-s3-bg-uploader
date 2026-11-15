@@ -1,0 +1,15 @@
+# Paseo Hub resources for the GitHub agent.
+#
+# The Hub daemon slug is the daemon registered with the Hub organization; the
+# cwd is the checkout Hub works in. Pi is the only provider enabled on this
+# daemon and matches the model used by the former GitHub Actions pi agent.
+environments:
+  dev:
+    kind: daemon
+    daemon: agent
+    cwd: /home/ubuntu/projects/react-native-s3-bg-uploader
+
+agents:
+  pi:
+    provider: pi
+    model: deepseek/deepseek-flash

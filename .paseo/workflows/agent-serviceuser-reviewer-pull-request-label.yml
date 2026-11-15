@@ -1,0 +1,34 @@
+# Request a review when pi-agent-reviewer is added to a pull request.
+name: agent-serviceuser-reviewer-pull-request-label
+on: github.pull_request_label_added
+max_runtime: 2h
+filters:
+  repo: nikwebr/react-native-s3-bg-uploader
+  connection: nikwebr-github
+  label: pi-agent-reviewer
+  from_users: [nikwebr]
+steps:
+  - id: respond
+    environment: dev
+    max_runtime: 45m
+    idle_timeout: 10m
+    agent: pi
+    github:
+      connection: nikwebr-github
+      repositories: [nikwebr/react-native-s3-bg-uploader]
+      permissions:
+        actions: read
+        checks: read
+        contents: write
+        issues: write
+        pull_requests: write
+    prompt:
+      - include: partials/agent-serviceuser.md
+      - text: |
+          <event-context>
+          ${{ paseo.context }}
+          </event-context>
+
+          <triggering-text>
+          ${{ paseo.prompt }}
+          </triggering-text>
