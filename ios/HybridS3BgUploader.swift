@@ -353,10 +353,11 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
             }
         }
 
+        let aggregate = (try? getAggregateProgress(transferId: nil)) ?? .empty
         let request = BGContinuedProcessingTaskRequest(
             identifier: taskId,
-            title: HybridS3BgUploader.sharedTitleTemplate,
-            subtitle: HybridS3BgUploader.sharedSubtitleTemplate
+            title: formatTemplate(HybridS3BgUploader.sharedTitleTemplate, agg: aggregate),
+            subtitle: formatTemplate(HybridS3BgUploader.sharedSubtitleTemplate, agg: aggregate)
         )
         request.strategy = .queue
         do {
