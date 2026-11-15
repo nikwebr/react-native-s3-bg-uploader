@@ -1,8 +1,9 @@
 # Paseo Hub resources for the GitHub agent.
 #
 # The Hub daemon slug is the daemon registered with the Hub organization; the
-# cwd is the checkout Hub works in. Pi is the only provider enabled on this
-# daemon and matches the model used by the former GitHub Actions pi agent.
+# cwd is the checkout Hub works in. Codex is used because Hub unattended runs
+# require a provider that can preapprove exact MCP tools. Codex is configured
+# with the DeepSeek provider on the daemon.
 environments:
   dev:
     kind: daemon
@@ -10,6 +11,7 @@ environments:
     cwd: /home/ubuntu/projects/react-native-s3-bg-uploader
 
 agents:
-  pi:
-    provider: pi
-    model: deepseek/deepseek-flash
+  codex:
+    provider: codex
+    model: deepseek-chat
+    mode: full-access
