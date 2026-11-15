@@ -12,16 +12,7 @@ steps:
     environment: dev
     max_runtime: 45m
     idle_timeout: 10m
-    agent: pi
-    github:
-      connection: nikwebr-github
-      repositories: [nikwebr/react-native-s3-bg-uploader]
-      permissions:
-        actions: read
-        checks: read
-        contents: write
-        issues: write
-        pull_requests: write
+    agent: codex
     prompt:
       - include: partials/agent-serviceuser.md
       - text: |
