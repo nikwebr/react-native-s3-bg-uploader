@@ -25,6 +25,7 @@ pub extern "C" fn set_config(
     start_upload_api: *const c_char,
     get_upload_urls_api: *const c_char,
     complete_api: *const c_char,
+    cancel_api: *const c_char,
     send_file_hash: bool,
 ) {
     ensure_store();
@@ -37,7 +38,13 @@ pub extern "C" fn set_config(
     let c = unsafe { CStr::from_ptr(complete_api) }
         .to_str()
         .unwrap_or("");
-    crate::core::config::set_config(s, g, c, send_file_hash);
+    // Swift passes an empty string when the host did not configure a cancel endpoint.
+    let x = if cancel_api.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(cancel_api) }.to_str().unwrap_or("")
+    };
+    crate::core::config::set_config(s, g, c, x, send_file_hash);
 }
 
 #[no_mangle]
@@ -212,7 +219,7 @@ pub extern "C" fn cancel_file(file_hash: *const c_char) {
     if !file_key.is_empty() {
         iosProgress::progress_manager().remove(&file_key);
     }
-    session::cancel_file_by_hash(hash);
+    crate::ios::cancel_upload_jobs(session::cancel_file_by_hash(hash));
 
     if !transfer_id.is_empty() {
         runtime::notify_cancelled_file(
@@ -235,13 +242,13 @@ pub extern "C" fn cancel_transfer(transfer_id: *const c_char) {
     let tid = unsafe { CStr::from_ptr(transfer_id) }
         .to_str()
         .unwrap_or("");
-    session::cancel_transfer(tid);
+    crate::ios::cancel_upload_jobs(session::cancel_transfer(tid));
 }
 
 #[no_mangle]
 pub extern "C" fn cancel_all() {
     iosProgress::progress_manager().clear();
-    session::clear_session();
+    crate::ios::cancel_upload_jobs(session::clear_session());
 }
 
 #[no_mangle]

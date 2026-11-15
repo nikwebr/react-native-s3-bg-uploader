@@ -5,8 +5,9 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Request, RequestInit, RequestMode, Response};
 
 use crate::core::api::{
-    complete_upload_body, complete_upload_url, start_upload_body, upload_urls_batch_body,
-    ApiClient, EncryptionInfo, StartUploadResponse, UploadUrlsBatchResponse,
+    cancel_upload_url, complete_upload_body, complete_upload_url, start_upload_body,
+    upload_urls_batch_body, ApiClient, EncryptionInfo, StartUploadResponse,
+    UploadUrlsBatchResponse,
 };
 use crate::core::config::get_config;
 use crate::core::ChunkUploadResult;
@@ -61,6 +62,17 @@ impl ApiClient for WasmApiClient {
             .await
             .map(|_| ())
     }
+
+    async fn cancel_upload(&self, key: &str, upload_id: &str) -> Result<(), String> {
+        let base_url = get_config().cancel_api.clone();
+        if base_url.is_empty() {
+            // The host did not configure a cancel endpoint: cancellations stay local.
+            return Ok(());
+        }
+        let url = cancel_upload_url(&base_url, upload_id, key);
+        // The response body is ignored; only the status decides success.
+        post_ignoring_body(&url, "{}").await
+    }
 }
 
 async fn fetch_request(request: &Request) -> Result<JsValue, JsValue> {
@@ -73,24 +85,29 @@ async fn fetch_request(request: &Request) -> Result<JsValue, JsValue> {
     Err(JsValue::from_str("No global scope available"))
 }
 
+async fn post_ignoring_body(url: &str, body: &str) -> Result<(), String> {
+    let request = build_request(url, "POST", Some(body))
+        .map_err(|e| format!("Failed to create request: {:?}", e))?;
+    let resp_value = fetch_request(&request)
+        .await
+        .map_err(|e| format!("Fetch failed: {:?}", e))?;
+    let resp: Response = resp_value
+        .dyn_into()
+        .map_err(|_| "Not a Response".to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+    // The response body is intentionally ignored: a backend may answer with 204.
+    Ok(())
+}
+
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     url: &str,
     method: &str,
     body: Option<&str>,
 ) -> Result<T, String> {
-    let opts = RequestInit::new();
-    opts.set_method(method);
-    opts.set_mode(RequestMode::Cors);
-    if let Some(body_str) = body {
-        opts.set_body(&JsValue::from_str(body_str));
-    }
-
-    let request = Request::new_with_str_and_init(url, &opts)
+    let request = build_request(url, method, body)
         .map_err(|e| format!("Failed to create request: {:?}", e))?;
-    request
-        .headers()
-        .set("Content-Type", "application/json")
-        .map_err(|_| "Failed to set Content-Type header")?;
 
     let resp_value = fetch_request(&request)
         .await
@@ -113,4 +130,20 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         .ok_or("Not a string")?;
 
     serde_json::from_str(&json_str).map_err(|e| format!("Deserialization failed: {}", e))
+}
+
+fn build_request(url: &str, method: &str, body: Option<&str>) -> Result<Request, JsValue> {
+    let opts = RequestInit::new();
+    opts.set_method(method);
+    opts.set_mode(RequestMode::Cors);
+    if let Some(body_str) = body {
+        opts.set_body(&JsValue::from_str(body_str));
+    }
+
+    let request = Request::new_with_str_and_init(url, &opts)?;
+    request
+        .headers()
+        .set("Content-Type", "application/json")
+        .map_err(|_| JsValue::from_str("Failed to set Content-Type header"))?;
+    Ok(request)
 }

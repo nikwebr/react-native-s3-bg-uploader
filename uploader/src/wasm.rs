@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use wasm_bindgen_futures::spawn_local;
 
+use crate::core::api::ApiClient;
 use crate::core::encryption::ArcEncryptor;
 use crate::core::runtime;
 use crate::core::session::{self, UploadState};
@@ -227,7 +228,9 @@ pub(crate) fn process_pending_files() {
                     PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().remove(&file_hash));
                     if !still_active {
                         // Undo the session.files insertion made by start_and_register.
-                        session::session().cancel_file(&file_key);
+                        // The file was cancelled while startUpload was in flight, so the
+                        // multipart upload the backend just created must be aborted too.
+                        cancel_upload_jobs(session::session().cancel_file(&file_key));
                         return;
                     }
                     runtime::notify_file_registered(wasmProgress::progress_manager(), &file_key);
@@ -297,6 +300,30 @@ pub(crate) fn is_pause_requested() -> bool {
 pub(crate) fn resume_queue() {
     PAUSE_REQUESTED.with(|p| *p.borrow_mut() = false);
     maybe_start_next();
+}
+
+/// Send the best-effort `cancelUpload` requests for uploads that were just removed
+/// from the session while not completed. Cancelling stays synchronous: the requests
+/// run on the worker's microtask queue and a failure only leaves an orphaned multipart
+/// upload for the backend's lifecycle rules to clean up.
+pub(crate) fn cancel_upload_jobs(jobs: Vec<session::CancelledUpload>) {
+    if jobs.is_empty() {
+        return;
+    }
+    spawn_local(async move {
+        let api = WasmApiClient;
+        for job in jobs {
+            if let Err(e) = api.cancel_upload(&job.file_key, &job.upload_id).await {
+                web_sys::console::warn_1(
+                    &format!(
+                        "[S3BgUploader] cancelUpload failed for {}: {}",
+                        job.file_key, e
+                    )
+                    .into(),
+                );
+            }
+        }
+    });
 }
 
 fn maybe_start_next() {

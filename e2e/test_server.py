@@ -116,11 +116,23 @@ class BackendTests(unittest.TestCase):
         self.backend.verify('plain-network')
         self.upload('encrypted-network', encrypted_fixture(self.scheme))
         self.backend.verify('encrypted-network')
+        self.cancelled_upload()
         with self.assertRaisesRegex(AssertionError, "Missing 100%-to-completion"):
             self.backend.report(final=True)
         for mode in ("plain", "encrypted", "plain-network", "encrypted-network"):
             self.backend.control("/completion-timing", {"mode": mode, "completedAfterMs": 20000})
         self.backend.report(final=True)
+
+    def cancelled_upload(self):
+        """Start a multipart upload, store one part, then cancel it."""
+        started = self.backend.start({"mode": "cancel"})
+        chunks = [FIXTURE[start:start + PART_SIZE] for start in range(0, len(FIXTURE), PART_SIZE)]
+        urls = self.backend.urls({**started, "parts": [1]})["urls"]
+        with urlopen(Request(urls["1"], data=chunks[0], method="PUT"), timeout=10) as result:
+            self.assertEqual(result.status, 200)
+        self.backend.cancel(f"/cancel/{started['uploadId']}/{started['key']}", {})
+        self.backend.control("/cancelled", {"mode": "cancel"})
+        return started
 
     def test_completion_timing_rejects_missing_late_and_invalid_evidence(self):
         self.backend.start({"mode": "plain"})
@@ -169,6 +181,29 @@ class BackendTests(unittest.TestCase):
             self.assertFalse(waiting.done())
             self.backend.control("/release", {"mode": "plain"})
             self.assertEqual(waiting.result(timeout=5), 200)
+
+    def test_cancel_requires_the_uploaders_request_and_removes_the_parts(self):
+        started = self.backend.start({"mode": "cancel"})
+        chunks = [FIXTURE[start:start + PART_SIZE] for start in range(0, len(FIXTURE), PART_SIZE)]
+        urls = self.backend.urls({**started, "parts": [1, 2]})["urls"]
+        with urlopen(Request(urls["1"], data=chunks[0], method="PUT"), timeout=10) as result:
+            self.assertEqual(result.status, 200)
+        # A local-only cancel is not evidence: the backend must have been told.
+        with self.assertRaisesRegex(AssertionError, "cancelUpload endpoint was not called"):
+            self.backend.control("/cancelled", {"mode": "cancel"})
+        with self.assertRaisesRegex(AssertionError, "new multipart ID"):
+            self.backend.cancel(f"/cancel/{started['uploadId']}-wrong/{started['key']}", {})
+        self.backend.cancel(f"/cancel/{started['uploadId']}/{started['key']}", {})
+        self.backend.control("/cancelled", {"mode": "cancel"})
+        self.assertTrue(self.backend.upload("cancel").cancel_verified)
+        with self.assertRaisesRegex(AssertionError, "Duplicate cancelUpload request"):
+            self.backend.cancel(f"/cancel/{started['uploadId']}/{started['key']}", {})
+        # A completed upload must never be aborted after completeUpload finalized it.
+        self.backend.start({"mode": "plain"})
+        upload = self.backend.upload("plain")
+        upload.completed = True
+        with self.assertRaisesRegex(AssertionError, "cancelled a completed upload"):
+            self.backend.cancel(f"/cancel/{upload.upload_id}/{upload.key}", {})
 
     def test_fixture_responses_are_complete_and_framed(self):
         for _ in range(2):

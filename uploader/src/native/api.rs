@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 use crate::core::api::{
-    complete_upload_body, complete_upload_url, start_upload_body, upload_urls_batch_body,
-    ApiClient, EncryptionInfo, StartUploadResponse, UploadUrlsBatchResponse,
+    cancel_upload_url, complete_upload_body, complete_upload_url, start_upload_body,
+    upload_urls_batch_body, ApiClient, EncryptionInfo, StartUploadResponse,
+    UploadUrlsBatchResponse,
 };
 use crate::core::config::get_config;
 use crate::core::retry::{run_with_retry_string, RetryPolicy};
@@ -93,6 +94,32 @@ impl<N: BlockingNetwork> ApiClient for NativeApiClient<N> {
         )?;
         Ok(())
     }
+
+    async fn cancel_upload(&self, key: &str, upload_id: &str) -> Result<(), String> {
+        let base_url = get_config().cancel_api.clone();
+        if base_url.is_empty() {
+            // The host did not configure a cancel endpoint: cancellations stay local.
+            return Ok(());
+        }
+        let url = cancel_upload_url(&base_url, upload_id, key);
+        // The backend identifies the upload by its URL; the body is empty JSON so
+        // the request stays a plain POST like every other endpoint here.
+        let body = "{}".to_string();
+        let policy = RetryPolicy::new(3);
+        run_with_retry_string(
+            &policy,
+            |_attempt| {
+                self.network
+                    .post_json(&url, body.clone())
+                    .map(|_| ())
+                    .map_err(|e| format!("cancel_upload request failed: {}", e))
+            },
+            |_attempt, _err, delay_ms| {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
+            },
+        )?;
+        Ok(())
+    }
 }
 
 fn is_retryable_complete_error(error: &str) -> bool {
@@ -103,4 +130,38 @@ fn is_retryable_complete_error(error: &str) -> bool {
         || lower.contains("network connection was lost")
         || lower.contains("nsurlerrordomain code=-1001")
         || lower.contains("nsurlerrordomain code=-1005")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct CountingNetwork(Arc<AtomicUsize>);
+
+    impl BlockingNetwork for CountingNetwork {
+        fn post_json(
+            &self,
+            _url: &str,
+            _body_json: String,
+        ) -> Result<String, Box<dyn std::error::Error>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok("{}".into())
+        }
+    }
+
+    #[test]
+    fn cancel_upload_skips_the_request_without_a_configured_endpoint() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let api = NativeApiClient {
+            network: CountingNetwork(calls.clone()),
+        };
+        pollster::block_on(api.cancel_upload("key", "upload")).unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "an unconfigured cancelApi must not send a request"
+        );
+    }
 }

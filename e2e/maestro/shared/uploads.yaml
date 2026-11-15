@@ -28,3 +28,11 @@ appId: ${APP_ID}
     timeout: 120000
 - assertNotVisible: "E2E error:.*"
 - takeScreenshot: network-resume-verified
+- tapOn: Cancel upload
+# The app cancels mid-upload, then waits for the backend to confirm that the
+# cancelUpload request arrived and S3 dropped the multipart upload and its parts.
+- extendedWaitUntil:
+    visible: Cancellation verified
+    timeout: 90000
+- assertNotVisible: "E2E error:.*"
+- takeScreenshot: cancellation-verified
