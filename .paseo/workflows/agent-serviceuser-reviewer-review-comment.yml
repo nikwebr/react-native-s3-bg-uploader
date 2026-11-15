@@ -1,14 +1,11 @@
-# Matches a conversation comment on a pull request that mentions @agent-serviceuser.
-#
-# GitHub delivers pull-request conversation comments as issue comments; Hub's
-# semantic event separates them from issue comments.
-name: agent-serviceuser-pull-request-comment
-on: github.pull_request_comment_created
+# Respond to a changed-line review comment only when pi-agent-reviewer is present.
+name: agent-serviceuser-reviewer-review-comment
+on: github.pull_request_review_comment
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: agent-serviceuser-github
-  contains: "@agent-serviceuser"
+  labels: [pi-agent-reviewer]
   from_users: [nikwebr]
 steps:
   - id: respond

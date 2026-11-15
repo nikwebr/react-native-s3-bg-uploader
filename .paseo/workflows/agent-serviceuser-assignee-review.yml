@@ -1,15 +1,11 @@
-# Matches a review comment on a changed line that mentions @agent-serviceuser.
-#
-# There is no semantic Hub event for this delivery, so the legacy
-# `github.pull_request_review_comment` source is used. Hub reacts with 👀 while
-# the delivery is accepted and 🚀 when the agent starts.
-name: agent-serviceuser-review-comment
-on: github.pull_request_review_comment
+# Respond to a submitted review only when pi-agent-assignee is present.
+name: agent-serviceuser-assignee-review
+on: github.pull_request_review
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: agent-serviceuser-github
-  contains: "@agent-serviceuser"
+  labels: [pi-agent-assignee]
   from_users: [nikwebr]
 steps:
   - id: respond

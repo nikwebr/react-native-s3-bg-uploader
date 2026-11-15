@@ -1,15 +1,11 @@
-# Matches a submitted pull-request review whose body mentions @agent-serviceuser.
-#
-# There is no semantic Hub event for review submissions, so the legacy
-# `github.pull_request_review` source is used. The prompt checks the live review
-# with `gh` before acting.
-name: agent-serviceuser-review
-on: github.pull_request_review
+# Respond to a pull-request conversation comment only when pi-agent-reviewer is present.
+name: agent-serviceuser-reviewer-pull-request-comment
+on: github.pull_request_comment_created
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: agent-serviceuser-github
-  contains: "@agent-serviceuser"
+  labels: [pi-agent-reviewer]
   from_users: [nikwebr]
 steps:
   - id: respond

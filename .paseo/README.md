@@ -2,18 +2,46 @@
 
 These Hub workflows are the Paseo replacement for the GitHub Actions
 `Agent Serviceuser` pi agent. They start the same Pi model
-(`deepseek/deepseek-flash`) when `@agent-serviceuser` is mentioned on an issue, a
-pull-request conversation, a review comment, or a pull-request review body.
+(`deepseek/deepseek-flash`) from GitHub events, gated by labels instead of
+assignees.
 
-| Workflow | GitHub event |
+## Labels
+
+| Label | Meaning |
 | --- | --- |
-| `agent-serviceuser-issue-comment.yml` | `github.issue_comment_created` |
-| `agent-serviceuser-pull-request-comment.yml` | `github.pull_request_comment_created` |
-| `agent-serviceuser-review-comment.yml` | `github.pull_request_review_comment` |
-| `agent-serviceuser-review.yml` | `github.pull_request_review` |
+| `pi-agent-assignee` | The agent owns implementation: fix/implement an issue or continue a pull request. |
+| `pi-agent-reviewer` | The agent reviews a pull request only and does not change files. On an issue it replies with analysis only. |
 
-All four use the `agent-serviceuser-github` connection and the `dev` environment
-from `hub.yml`. The shared prompt lives in `workflows/partials/`.
+The labels are the new assignment mechanism. Adding a role label starts the agent;
+comment and review events only start it when the item already carries a role
+label. The two labels are intended to be mutually exclusive.
+
+## Workflows
+
+Label events:
+
+| Workflow | Event | Label |
+| --- | --- | --- |
+| `agent-serviceuser-assignee-issue-label.yml` | `github.issue_label_added` | `pi-agent-assignee` |
+| `agent-serviceuser-assignee-pull-request-label.yml` | `github.pull_request_label_added` | `pi-agent-assignee` |
+| `agent-serviceuser-reviewer-pull-request-label.yml` | `github.pull_request_label_added` | `pi-agent-reviewer` |
+
+Comment and review events (each exists once for `assignee` and once for
+`reviewer`):
+
+| Event | Required label |
+| --- | --- |
+| `github.issue_comment_created` | `pi-agent-assignee` or `pi-agent-reviewer` |
+| `github.pull_request_comment_created` | `pi-agent-assignee` or `pi-agent-reviewer` |
+| `github.pull_request_review_comment` | `pi-agent-assignee` or `pi-agent-reviewer` |
+| `github.pull_request_review` | `pi-agent-assignee` or `pi-agent-reviewer` |
+
+Hub filters cannot express "either label", so each comment/review event has one
+workflow per label. Keep the labels mutually exclusive to avoid two runs on the
+same item.
+
+All workflows use the `agent-serviceuser-github` connection and the `dev`
+environment from `hub.yml`. The shared prompt lives in `workflows/partials/`.
 
 ## Disabled GitHub Actions workflow
 
@@ -27,7 +55,7 @@ The GitHub Actions pi agent is disabled but its configuration is preserved:
 
 To re-enable it, move the lock file back to `.github/workflows/`, run
 `gh workflow enable "Agent Serviceuser"`, and remove the matching Hub workflows so
-the same mention does not start both agents.
+the same item does not start both agents.
 
 ## Deployment prerequisite
 
@@ -47,11 +75,3 @@ The `agent-serviceuser-github` connection in Hub has no repositories. The repo
 owner (`nikwebr`) must install the Hub GitHub App on
 `nikwebr/react-native-s3-bg-uploader`, or grant that repository to the existing
 installation, before the bundle can be activated.
-
-## Scope limit
-
-Hub has no GitHub `assigned` or `review_requested` event, so the part of the old
-pi agent that started on assignment or reviewer request cannot be represented
-here. The mention-driven issue, pull-request, review-comment, and review-body
-triggers are covered. The old GitHub Actions workflow can be re-enabled if
-assignment-triggered runs are still needed.

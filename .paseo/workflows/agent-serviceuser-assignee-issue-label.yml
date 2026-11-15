@@ -1,0 +1,34 @@
+# Start implementation when pi-agent-assignee is added to an issue.
+name: agent-serviceuser-assignee-issue-label
+on: github.issue_label_added
+max_runtime: 2h
+filters:
+  repo: nikwebr/react-native-s3-bg-uploader
+  connection: agent-serviceuser-github
+  label: pi-agent-assignee
+  from_users: [nikwebr]
+steps:
+  - id: respond
+    environment: dev
+    max_runtime: 45m
+    idle_timeout: 10m
+    agent: pi
+    github:
+      connection: agent-serviceuser-github
+      repositories: [nikwebr/react-native-s3-bg-uploader]
+      permissions:
+        actions: read
+        checks: read
+        contents: write
+        issues: write
+        pull_requests: write
+    prompt:
+      - include: partials/agent-serviceuser.md
+      - text: |
+          <event-context>
+          ${{ paseo.context }}
+          </event-context>
+
+          <triggering-text>
+          ${{ paseo.prompt }}
+          </triggering-text>

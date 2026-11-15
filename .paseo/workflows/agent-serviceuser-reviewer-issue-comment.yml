@@ -1,15 +1,11 @@
-# Matches a comment on an issue that mentions @agent-serviceuser.
-#
-# Mirrors the old GitHub Actions pi-agent trigger for `issue_comment` events.
-# `from_users` is the only human collaborator with write access; keeping it
-# explicit also prevents the bot's own replies from re-triggering the agent.
-name: agent-serviceuser-issue-comment
+# Respond to an issue comment only when pi-agent-reviewer is present.
+name: agent-serviceuser-reviewer-issue-comment
 on: github.issue_comment_created
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: agent-serviceuser-github
-  contains: "@agent-serviceuser"
+  labels: [pi-agent-reviewer]
   from_users: [nikwebr]
 steps:
   - id: respond
