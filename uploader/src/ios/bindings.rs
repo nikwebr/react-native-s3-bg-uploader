@@ -60,6 +60,7 @@ pub extern "C" fn hash_and_pre_register(
     file_path: *const c_char,
     transfer_id: *const c_char,
     user_params_json: *const c_char,
+    hash_salt: *const c_char,
 ) -> *mut c_char {
     if file_path.is_null() || transfer_id.is_null() {
         return std::ptr::null_mut();
@@ -82,8 +83,13 @@ pub extern "C" fn hash_and_pre_register(
             .unwrap_or("{}");
         serde_json::from_str(json_str).unwrap_or_default()
     };
+    let salt = if hash_salt.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(hash_salt) }.to_str().unwrap_or("")
+    };
 
-    match super::hash_and_pre_register(&path, &tid, user_params, None) {
+    match super::hash_and_pre_register(&path, &tid, salt, user_params, None) {
         Ok(file_hash) => CString::new(file_hash)
             .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut()),
@@ -103,6 +109,7 @@ pub extern "C" fn hash_and_pre_register_encrypted(
     key_hex: *const c_char,
     nonce_hex: *const c_char,
     user_params_json: *const c_char,
+    hash_salt: *const c_char,
 ) -> *mut c_char {
     if file_path.is_null() || transfer_id.is_null() || key_hex.is_null() || nonce_hex.is_null() {
         return std::ptr::null_mut();
@@ -127,6 +134,11 @@ pub extern "C" fn hash_and_pre_register_encrypted(
             .unwrap_or("{}");
         serde_json::from_str(json_str).unwrap_or_default()
     };
+    let salt = if hash_salt.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(hash_salt) }.to_str().unwrap_or("")
+    };
 
     let encryptor = match crate::core::encryption::build_encryptor(key, nonce) {
         Ok(e) => e,
@@ -137,7 +149,7 @@ pub extern "C" fn hash_and_pre_register_encrypted(
         }
     };
 
-    match super::hash_and_pre_register(&path, &tid, user_params, Some(encryptor)) {
+    match super::hash_and_pre_register(&path, &tid, salt, user_params, Some(encryptor)) {
         Ok(file_hash) => CString::new(file_hash)
             .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut()),

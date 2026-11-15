@@ -204,6 +204,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPre
     file_name: JString,
     transfer_id: JString,
     user_params_json: JString,
+    hash_salt: JString,
 ) -> jstring {
     let name: String = env
         .get_string(&file_name)
@@ -219,8 +220,12 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPre
         .unwrap_or_else(|_| "{}".to_string());
     let user_params: HashMap<String, String> =
         serde_json::from_str(&params_str).unwrap_or_default();
+    let salt: String = env
+        .get_string(&hash_salt)
+        .map(|s| s.into())
+        .unwrap_or_default();
 
-    match super::hash_and_pre_register(fd as RawFd, name, &tid, user_params, None) {
+    match super::hash_and_pre_register(fd as RawFd, name, &tid, &salt, user_params, None) {
         Ok(file_hash) => env
             .new_string(&file_hash)
             .map(|s| s.into_raw())
@@ -244,6 +249,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPre
     key_hex: JString,
     nonce_hex: JString,
     user_params_json: JString,
+    hash_salt: JString,
 ) -> jstring {
     let name: String = env
         .get_string(&file_name)
@@ -267,6 +273,10 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPre
         .unwrap_or_else(|_| "{}".to_string());
     let user_params: HashMap<String, String> =
         serde_json::from_str(&params_str).unwrap_or_default();
+    let salt: String = env
+        .get_string(&hash_salt)
+        .map(|s| s.into())
+        .unwrap_or_default();
 
     let encryptor = match crate::core::encryption::build_encryptor(&key, &nonce) {
         Ok(e) => e,
@@ -278,7 +288,14 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeHashAndPre
         }
     };
 
-    match super::hash_and_pre_register(fd as RawFd, name, &tid, user_params, Some(encryptor)) {
+    match super::hash_and_pre_register(
+        fd as RawFd,
+        name,
+        &tid,
+        &salt,
+        user_params,
+        Some(encryptor),
+    ) {
         Ok(file_hash) => env
             .new_string(&file_hash)
             .map(|s| s.into_raw())

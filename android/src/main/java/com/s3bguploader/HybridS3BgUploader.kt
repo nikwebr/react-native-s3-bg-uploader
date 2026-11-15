@@ -95,6 +95,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         filePath: String,
         transferId: String,
         userParams: Map<String, String>?,
+        hashSalt: String?,
     ): Promise<String> {
         return Promise.async(hashScope) {
             val context = appContext() ?: throw IllegalStateException("No application context")
@@ -111,7 +112,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             val fd = pfd.detachFd()
             val fileName = resolveFileName(context, filePath)
 
-            val rawResult = nativeHashAndPreRegister(fd, fileName, transferId, paramsJson)
+            val rawResult = nativeHashAndPreRegister(fd, fileName, transferId, paramsJson, hashSalt ?: "")
             if (rawResult.isEmpty()) throw RuntimeException("hash_and_pre_register failed for $filePath")
             if (rawResult.startsWith("ERROR:")) throw RuntimeException(rawResult.removePrefix("ERROR:"))
             val fileHash = rawResult
@@ -136,6 +137,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         encryptionKey: String,
         encryptionNonce: String,
         userParams: Map<String, String>?,
+        hashSalt: String?,
     ): Promise<String> {
         return Promise.async(hashScope) {
             val context = appContext() ?: throw IllegalStateException("No application context")
@@ -152,7 +154,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             val fd = pfd.detachFd()
             val fileName = resolveFileName(context, filePath)
 
-            val rawResult = nativeHashAndPreRegisterEncrypted(fd, fileName, transferId, encryptionKey, encryptionNonce, paramsJson)
+            val rawResult = nativeHashAndPreRegisterEncrypted(fd, fileName, transferId, encryptionKey, encryptionNonce, paramsJson, hashSalt ?: "")
             if (rawResult.isEmpty()) throw RuntimeException("hash_and_pre_register_encrypted failed for $filePath")
             if (rawResult.startsWith("ERROR:")) throw RuntimeException(rawResult.removePrefix("ERROR:"))
             val fileHash = rawResult
@@ -376,6 +378,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             fileName: String,
             transferId: String,
             userParamsJson: String,
+            hashSalt: String,
         ): String
 
         /** Phase 1 (encrypted): hash fd, pre-register with encryption config. Returns file hash. Takes ownership of fd. */
@@ -386,6 +389,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             keyHex: String,
             nonceHex: String,
             userParamsJson: String,
+            hashSalt: String,
         ): String
 
         /** Phase 2: call start_api and enqueue the file. Returns file key. Takes ownership of fd. */

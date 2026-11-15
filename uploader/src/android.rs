@@ -37,11 +37,12 @@ pub(super) fn hash_and_pre_register(
     raw_fd: RawFd,
     file_name: String,
     transfer_id: &str,
+    hash_salt: &str,
     user_params: HashMap<String, String>,
     encryption_config: Option<ArcEncryptor>,
 ) -> Result<String, String> {
     init_logging();
-    let file_hash = hash::hash_fd(raw_fd, transfer_id).map_err(|e| {
+    let file_hash = hash::hash_fd(raw_fd, transfer_id, hash_salt).map_err(|e| {
         log::error!("pre_register: hashing failed for transfer {}: {}", transfer_id, e);
         e
     })?;

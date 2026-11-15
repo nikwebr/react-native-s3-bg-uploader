@@ -201,7 +201,7 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     // Upload
     // -------------------------------------------------------------------------
 
-    func uploadFile(filePath: String, transferId: String, userParams: [String: String]?) throws -> Promise<String> {
+    func uploadFile(filePath: String, transferId: String, userParams: [String: String]?, hashSalt: String?) throws -> Promise<String> {
         return Promise.parallel(HybridS3BgUploader.hashQueue) { [self] in
             let paramsJson: String
             if let params = userParams, !params.isEmpty {
@@ -214,10 +214,12 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
             let rawResult: String = filePath.withCString { pathPtr in
                 transferId.withCString { tidPtr in
                     paramsJson.withCString { paramsPtr in
-                        if let ptr = hash_and_pre_register(pathPtr, tidPtr, paramsPtr) {
-                            let h = String(cString: ptr); free_string(ptr); return h
+                        (hashSalt ?? "").withCString { saltPtr in
+                            if let ptr = hash_and_pre_register(pathPtr, tidPtr, paramsPtr, saltPtr) {
+                                let h = String(cString: ptr); free_string(ptr); return h
+                            }
+                            return ""
                         }
-                        return ""
                     }
                 }
             }
@@ -252,7 +254,7 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
         }
     }
 
-    func encryptAndUploadFile(filePath: String, transferId: String, encryptionKey: String, encryptionNonce: String, userParams: [String: String]?) throws -> Promise<String> {
+    func encryptAndUploadFile(filePath: String, transferId: String, encryptionKey: String, encryptionNonce: String, userParams: [String: String]?, hashSalt: String?) throws -> Promise<String> {
         return Promise.parallel(HybridS3BgUploader.hashQueue) { [self] in
             let paramsJson: String
             if let params = userParams, !params.isEmpty {
@@ -267,10 +269,12 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
                     encryptionKey.withCString { keyPtr -> String in
                         encryptionNonce.withCString { noncePtr -> String in
                             paramsJson.withCString { paramsPtr -> String in
-                                if let ptr = hash_and_pre_register_encrypted(pathPtr, tidPtr, keyPtr, noncePtr, paramsPtr) {
-                                    let h = String(cString: ptr); free_string(ptr); return h
+                                (hashSalt ?? "").withCString { saltPtr -> String in
+                                    if let ptr = hash_and_pre_register_encrypted(pathPtr, tidPtr, keyPtr, noncePtr, paramsPtr, saltPtr) {
+                                        let h = String(cString: ptr); free_string(ptr); return h
+                                    }
+                                    return ""
                                 }
-                                return ""
                             }
                         }
                     }

@@ -68,6 +68,33 @@ await S3BgUploader.resume()
 S3BgUploader.cancel()
 ```
 
+### Resolving hash conflicts
+
+`uploadFile()` and `encryptAndUploadFile()` hash the file content, size, and
+`transferId` to detect duplicates and resume uploads. If two distinct files collide,
+pass a stable salt as the last argument:
+
+```ts
+const hash = await S3BgUploader.uploadFile(
+  '/path/to/file.mp4',
+  transferId,
+  { userId: '42' },
+  'retry-1',
+)
+
+await S3BgUploader.encryptAndUploadFile(
+  '/path/to/encrypted.mp4',
+  transferId,
+  keyHex,
+  nonceHex,
+  { userId: '42' },
+  'retry-1',
+)
+```
+
+Use the same salt when resuming that upload, and pass the returned `hash` to
+`getProgress()` or `cancelFile()`. Omitting the salt preserves the previous hash.
+
 For the full API reference see the [documentation](https://uploader.ysendit.com/docs).
 
 ### Cancelling an upload
