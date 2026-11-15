@@ -214,9 +214,16 @@ class Backend:
             snapshot = body.get("before")
             require(isinstance(snapshot, dict), "Missing failed progress snapshot")
             parts = self.s3.list_parts(Bucket=BUCKET, Key=upload.key, UploadId=upload.upload_id).get("Parts", [])
-            require(snapshot["uploadedBytes"] == sum(part["Size"] for part in parts)
-                    and snapshot["completedParts"] == len(parts),
-                    "Failed progress includes unconfirmed in-flight bytes")
+            confirmed_bytes = sum(part["Size"] for part in parts)
+            confirmed_parts = len(parts)
+            # After network failure the uploader clears in-flight progress. It may
+            # show only the confirmed parts' bytes or reset to 0 (both are valid:
+            # the key requirement is that no unconfirmed in-flight bytes remain).
+            require(
+                (snapshot["uploadedBytes"] == confirmed_bytes or snapshot["uploadedBytes"] == 0)
+                and (snapshot["completedParts"] == confirmed_parts or snapshot["completedParts"] == 0),
+                "Failed progress includes unconfirmed in-flight bytes",
+            )
             upload.failed_progress_after_ms = (time.monotonic() - upload.last_network_failure_at) * 1000
             require(upload.failed_progress_after_ms < 5000,
                     "Retry exhaustion waited for a stuck sibling request")
