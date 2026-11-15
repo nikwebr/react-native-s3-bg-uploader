@@ -1,0 +1,38 @@
+# Matches a review comment on a changed line that mentions @agent-serviceuser.
+#
+# There is no semantic Hub event for this delivery, so the legacy
+# `github.pull_request_review_comment` source is used. Hub reacts with 👀 while
+# the delivery is accepted and 🚀 when the agent starts.
+name: agent-serviceuser-review-comment
+on: github.pull_request_review_comment
+max_runtime: 2h
+filters:
+  repo: nikwebr/react-native-s3-bg-uploader
+  connection: agent-serviceuser-github
+  contains: "@agent-serviceuser"
+  from_users: [nikwebr]
+steps:
+  - id: respond
+    environment: dev
+    max_runtime: 45m
+    idle_timeout: 10m
+    agent: pi
+    github:
+      connection: agent-serviceuser-github
+      repositories: [nikwebr/react-native-s3-bg-uploader]
+      permissions:
+        actions: read
+        checks: read
+        contents: write
+        issues: write
+        pull_requests: write
+    prompt:
+      - include: partials/agent-serviceuser.md
+      - text: |
+          <event-context>
+          ${{ paseo.context }}
+          </event-context>
+
+          <triggering-text>
+          ${{ paseo.prompt }}
+          </triggering-text>

@@ -1,0 +1,38 @@
+# Matches a submitted pull-request review whose body mentions @agent-serviceuser.
+#
+# There is no semantic Hub event for review submissions, so the legacy
+# `github.pull_request_review` source is used. The prompt checks the live review
+# with `gh` before acting.
+name: agent-serviceuser-review
+on: github.pull_request_review
+max_runtime: 2h
+filters:
+  repo: nikwebr/react-native-s3-bg-uploader
+  connection: agent-serviceuser-github
+  contains: "@agent-serviceuser"
+  from_users: [nikwebr]
+steps:
+  - id: respond
+    environment: dev
+    max_runtime: 45m
+    idle_timeout: 10m
+    agent: pi
+    github:
+      connection: agent-serviceuser-github
+      repositories: [nikwebr/react-native-s3-bg-uploader]
+      permissions:
+        actions: read
+        checks: read
+        contents: write
+        issues: write
+        pull_requests: write
+    prompt:
+      - include: partials/agent-serviceuser.md
+      - text: |
+          <event-context>
+          ${{ paseo.context }}
+          </event-context>
+
+          <triggering-text>
+          ${{ paseo.prompt }}
+          </triggering-text>
