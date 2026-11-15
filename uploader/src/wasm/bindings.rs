@@ -139,9 +139,10 @@ pub async fn upload_file(
     file: web_sys::File,
     transfer_id: String,
     user_params_js: JsValue,
+    hash_salt: String,
 ) -> Result<JsValue, JsValue> {
     let user_params = parse_user_params(user_params_js);
-    let hash = super::start_and_enqueue(file, transfer_id, user_params)
+    let hash = super::start_and_enqueue(file, transfer_id, user_params, hash_salt)
         .await
         .map_err(|e| JsValue::from_str(&format!("Upload failed: {}", e)))?;
 
@@ -164,12 +165,19 @@ pub async fn upload_file_encrypted(
     key_hex: String,
     nonce_hex: String,
     user_params_js: JsValue,
+    hash_salt: String,
 ) -> Result<JsValue, JsValue> {
     let user_params = parse_user_params(user_params_js);
-    let hash =
-        super::start_and_enqueue_encrypted(file, transfer_id, user_params, key_hex, nonce_hex)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Upload failed: {}", e)))?;
+    let hash = super::start_and_enqueue_encrypted(
+        file,
+        transfer_id,
+        user_params,
+        key_hex,
+        nonce_hex,
+        hash_salt,
+    )
+    .await
+    .map_err(|e| JsValue::from_str(&format!("Upload failed: {}", e)))?;
 
     let is_running = QUEUE_RUNNING.with(|r| *r.borrow()) && !PAUSE_REQUESTED.with(|p| *p.borrow());
     if is_running {

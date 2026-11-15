@@ -42,10 +42,11 @@ pub(crate) static COMPLETING_UPLOAD: AtomicBool = AtomicBool::new(false);
 pub(super) fn hash_and_pre_register(
     file_path: &str,
     transfer_id: &str,
+    hash_salt: &str,
     user_params: HashMap<String, String>,
     encryption_config: Option<ArcEncryptor>,
 ) -> Result<String, String> {
-    let file_hash = hash::hash_file(file_path, transfer_id)?;
+    let file_hash = hash::hash_file(file_path, transfer_id, hash_salt)?;
     {
         let sess = session::session();
         if let Some(entry) = sess.find_by_hash(&file_hash) {

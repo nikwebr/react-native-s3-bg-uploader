@@ -50,14 +50,14 @@ export const S3BgUploader: S3BgUploaderAPI = {
     )
   },
 
-  async uploadFile(file: string | File, transferId: string, userParams?: Record<string, string>): Promise<string> {
+  async uploadFile(file: string | File, transferId: string, userParams?: Record<string, string>, hashSalt?: string): Promise<string> {
     if (typeof file !== 'string') {
       throw new TypeError(
         'S3BgUploader: On native platforms, uploadFile requires a string file path.',
       )
     }
     try {
-      return await Native.uploadFile(file, transferId, userParams)
+      return await Native.uploadFile(file, transferId, userParams, hashSalt)
     } catch (e: unknown) {
       const msg = (e as Error)?.message ?? String(e)
       if (msg.includes('DUPLICATE_FILE')) throw new S3BgUploaderDuplicateFileError(msg)
@@ -65,14 +65,14 @@ export const S3BgUploader: S3BgUploaderAPI = {
     }
   },
 
-  async encryptAndUploadFile(file: string | File, transferId: string, encryptionKey: string, encryptionNonce: string, userParams?: Record<string, string>): Promise<string> {
+  async encryptAndUploadFile(file: string | File, transferId: string, encryptionKey: string, encryptionNonce: string, userParams?: Record<string, string>, hashSalt?: string): Promise<string> {
     if (typeof file !== 'string') {
       throw new TypeError(
         'S3BgUploader: On native platforms, encryptAndUploadFile requires a string file path.',
       )
     }
     try {
-      return await Native.encryptAndUploadFile(file, transferId, encryptionKey, encryptionNonce, userParams)
+      return await Native.encryptAndUploadFile(file, transferId, encryptionKey, encryptionNonce, userParams, hashSalt)
     } catch (e: unknown) {
       const msg = (e as Error)?.message ?? String(e)
       if (msg.includes('DUPLICATE_FILE')) throw new S3BgUploaderDuplicateFileError(msg)

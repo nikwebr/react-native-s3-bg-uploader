@@ -53,8 +53,9 @@ pub(super) async fn start_and_enqueue(
     file: web_sys::File,
     transfer_id: String,
     user_params: HashMap<String, String>,
+    hash_salt: String,
 ) -> Result<String, String> {
-    start_and_enqueue_inner(file, transfer_id, user_params, None).await
+    start_and_enqueue_inner(file, transfer_id, user_params, hash_salt, None).await
 }
 
 /// Encrypted variant: same as `start_and_enqueue`, but the upload's own key and
@@ -66,17 +67,26 @@ pub(super) async fn start_and_enqueue_encrypted(
     user_params: HashMap<String, String>,
     key_hex: String,
     nonce_hex: String,
+    hash_salt: String,
 ) -> Result<String, String> {
-    start_and_enqueue_inner(file, transfer_id, user_params, Some((key_hex, nonce_hex))).await
+    start_and_enqueue_inner(
+        file,
+        transfer_id,
+        user_params,
+        hash_salt,
+        Some((key_hex, nonce_hex)),
+    )
+    .await
 }
 
 async fn start_and_enqueue_inner(
     file: web_sys::File,
     transfer_id: String,
     user_params: HashMap<String, String>,
+    hash_salt: String,
     encryption: Option<(String, String)>,
 ) -> Result<String, String> {
-    let file_hash = hash::hash_web_file(&file, &transfer_id)?;
+    let file_hash = hash::hash_web_file(&file, &transfer_id, &hash_salt)?;
 
     // Reject duplicates before invoking a factory that could replace an active instance.
     let existing_state = {

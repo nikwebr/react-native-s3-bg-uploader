@@ -3,7 +3,11 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 const SAMPLE_THRESHOLD: u64 = 128 * 1024;
 const SAMPLE_SIZE: usize = 16 * 1024;
 
-pub fn hash_read_seek<R: Read + Seek>(reader: &mut R, transfer_id: &str) -> Result<String, String> {
+pub fn hash_read_seek<R: Read + Seek>(
+    reader: &mut R,
+    transfer_id: &str,
+    hash_salt: &str,
+) -> Result<String, String> {
     let size = reader
         .seek(SeekFrom::End(0))
         .map_err(|e| format!("Failed to seek: {}", e))?;
@@ -44,6 +48,7 @@ pub fn hash_read_seek<R: Read + Seek>(reader: &mut R, transfer_id: &str) -> Resu
 
     let mut buffer = transfer_id.as_bytes().to_vec();
     buffer.extend(file_samples);
+    buffer.extend(hash_salt.as_bytes());
 
     let hash_result = murmur3::murmur3_x64_128(&mut Cursor::new(buffer), 0)
         .map_err(|e| format!("murmur3 failed: {}", e))?;
@@ -61,4 +66,36 @@ fn put_uvarint(buffer: &mut [u8], x: u64) {
         i += 1;
     }
     buffer[i] = mx as u8;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(content: &[u8], transfer_id: &str, hash_salt: &str) -> String {
+        hash_read_seek(&mut Cursor::new(content), transfer_id, hash_salt).unwrap()
+    }
+
+    #[test]
+    fn empty_salt_preserves_existing_hash() {
+        assert_eq!(
+            hash(b"hello world", "transfer-1", ""),
+            "f84d5e615de3069fcc3693735e52200b"
+        );
+    }
+
+    #[test]
+    fn hash_salt_changes_the_hash() {
+        let unsalted = hash(b"hello world", "transfer-1", "");
+        let salted = hash(b"hello world", "transfer-1", "retry-1");
+        assert_ne!(salted, unsalted);
+    }
+
+    #[test]
+    fn hash_salt_is_deterministic() {
+        assert_eq!(
+            hash(b"hello world", "transfer-1", "retry-1"),
+            hash(b"hello world", "transfer-1", "retry-1")
+        );
+    }
 }

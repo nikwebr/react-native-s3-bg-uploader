@@ -252,12 +252,15 @@ export interface S3BgUploaderAPI extends BaseUploaderAPI, WebEncryptorRegistrati
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
-   * @returns hash of the file (considers file content, size & transferId)
+   * @param hashSalt optional stable value folded into the local hash. Use the same salt
+   *   when resuming; changing it produces a different `fileHash`.
+   * @returns hash of the file (considers file content, size, transferId & hashSalt)
    */
   uploadFile(
     file: string | File,
     transferId: string,
     userParams?: Record<string, string>,
+    hashSalt?: string,
   ): Promise<string>
 
   /**
@@ -270,7 +273,9 @@ export interface S3BgUploaderAPI extends BaseUploaderAPI, WebEncryptorRegistrati
    * @param encryptionNonce 48 hex characters (24 bytes) base nonce; per-part nonce is derived deterministically
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
-   * @returns hash of the file (considers file content, size & transferId)
+   * @param hashSalt optional stable value folded into the local hash. Use the same salt
+   *   when resuming; changing it produces a different `fileHash`.
+   * @returns hash of the file (considers file content, size, transferId & hashSalt)
    */
   encryptAndUploadFile(
     file: string | File,
@@ -278,6 +283,7 @@ export interface S3BgUploaderAPI extends BaseUploaderAPI, WebEncryptorRegistrati
     encryptionKey: string,
     encryptionNonce: string,
     userParams?: Record<string, string>,
+    hashSalt?: string,
   ): Promise<string>
 
   /**
@@ -301,12 +307,15 @@ export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
-   * @returns hash of the file (considers file content, size & transferId)
+   * @param hashSalt optional stable value folded into the local hash. Use the same salt
+   *   when resuming; changing it produces a different `fileHash`.
+   * @returns hash of the file (considers file content, size, transferId & hashSalt)
    */
   uploadFile(
     filePath: string,
     transferId: string,
     userParams?: Record<string, string>,
+    hashSalt?: string,
   ): Promise<string>
 
   /**
@@ -319,7 +328,9 @@ export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
    * @param encryptionNonce 48 hex characters (24 bytes) base nonce; per-part nonce is derived deterministically
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
-   * @returns hash of the file (considers file content, size & transferId)
+   * @param hashSalt optional stable value folded into the local hash. Use the same salt
+   *   when resuming; changing it produces a different `fileHash`.
+   * @returns hash of the file (considers file content, size, transferId & hashSalt)
    */
   encryptAndUploadFile(
     filePath: string,
@@ -327,6 +338,7 @@ export interface NativeS3BgUploaderAPI extends BaseUploaderAPI {
     encryptionKey: string,
     encryptionNonce: string,
     userParams?: Record<string, string>,
+    hashSalt?: string,
   ): Promise<string>
 
   /**
@@ -350,12 +362,15 @@ export interface WebS3BgUploaderAPI extends BaseUploaderAPI, WebEncryptorRegistr
    * throws `S3BgUploaderDuplicateFileError` if a file with the same hash is already part of the session
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
-   * @returns hash of the file (considers file content, size & transferId)
+   * @param hashSalt optional stable value folded into the local hash. Use the same salt
+   *   when resuming; changing it produces a different `fileHash`.
+   * @returns hash of the file (considers file content, size, transferId & hashSalt)
    */
   uploadFile(
     file: File,
     transferId: string,
     userParams?: Record<string, string>,
+    hashSalt?: string,
   ): Promise<string>
 
   /**
@@ -368,7 +383,9 @@ export interface WebS3BgUploaderAPI extends BaseUploaderAPI, WebEncryptorRegistr
    * @param encryptionNonce 48 hex characters (24 bytes) base nonce; per-part nonce is derived deterministically
    * @param userParams these params are added to the `startUpload()` backend call
    * @param transferId group files in transfers to get aggregated progress reporting
-   * @returns hash of the file (considers file content, size & transferId)
+   * @param hashSalt optional stable value folded into the local hash. Use the same salt
+   *   when resuming; changing it produces a different `fileHash`.
+   * @returns hash of the file (considers file content, size, transferId & hashSalt)
    */
   encryptAndUploadFile(
     file: File,
@@ -376,6 +393,7 @@ export interface WebS3BgUploaderAPI extends BaseUploaderAPI, WebEncryptorRegistr
     encryptionKey: string,
     encryptionNonce: string,
     userParams?: Record<string, string>,
+    hashSalt?: string,
   ): Promise<string>
 
   /**

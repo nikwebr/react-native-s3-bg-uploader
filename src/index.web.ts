@@ -98,7 +98,7 @@ onmessage = async function (e) {
 
     case 'uploadFile': {
       try {
-        const fileKey = await wasm.upload_file(payload.file, payload.transferId, payload.userParams ?? null);
+        const fileKey = await wasm.upload_file(payload.file, payload.transferId, payload.userParams ?? null, payload.hashSalt ?? '');
         postMessage({ type: 'result', requestId, ok: true, value: fileKey });
       } catch (err) {
         postMessage({ type: 'result', requestId, ok: false, error: String(err) });
@@ -108,7 +108,7 @@ onmessage = async function (e) {
 
     case 'encryptAndUploadFile': {
       try {
-        const fileKey = await wasm.upload_file_encrypted(payload.file, payload.transferId, payload.encryptionKey, payload.encryptionNonce, payload.userParams ?? null);
+        const fileKey = await wasm.upload_file_encrypted(payload.file, payload.transferId, payload.encryptionKey, payload.encryptionNonce, payload.userParams ?? null, payload.hashSalt ?? '');
         postMessage({ type: 'result', requestId, ok: true, value: fileKey });
       } catch (err) {
         postMessage({ type: 'result', requestId, ok: false, error: String(err) });
@@ -323,12 +323,12 @@ export const S3BgUploader: WebS3BgUploaderAPI = {
     })
   },
 
-  async uploadFile(file: File, transferId: string, userParams?: Record<string, string>): Promise<string> {
+  async uploadFile(file: File, transferId: string, userParams?: Record<string, string>, hashSalt?: string): Promise<string> {
     if (typeof file === 'string') {
       throw new TypeError('S3BgUploader: On web platform, uploadFile requires a File value, not a string path.')
     }
     try {
-      return await sendRequest('uploadFile', { file, transferId, userParams: userParams ?? null }) as Promise<string>
+      return await sendRequest('uploadFile', { file, transferId, userParams: userParams ?? null, hashSalt: hashSalt ?? null }) as Promise<string>
     } catch (e: unknown) {
       const msg = (e as Error)?.message ?? String(e)
       if (msg.includes('DUPLICATE_FILE')) throw new S3BgUploaderDuplicateFileError(msg)
@@ -336,12 +336,12 @@ export const S3BgUploader: WebS3BgUploaderAPI = {
     }
   },
 
-  async encryptAndUploadFile(file: File, transferId: string, encryptionKey: string, encryptionNonce: string, userParams?: Record<string, string>): Promise<string> {
+  async encryptAndUploadFile(file: File, transferId: string, encryptionKey: string, encryptionNonce: string, userParams?: Record<string, string>, hashSalt?: string): Promise<string> {
     if (typeof file === 'string') {
       throw new TypeError('S3BgUploader: On web platform, encryptAndUploadFile requires a File value, not a string path.')
     }
     try {
-      return await sendRequest('encryptAndUploadFile', { file, transferId, encryptionKey, encryptionNonce, userParams: userParams ?? null }) as Promise<string>
+      return await sendRequest('encryptAndUploadFile', { file, transferId, encryptionKey, encryptionNonce, userParams: userParams ?? null, hashSalt: hashSalt ?? null }) as Promise<string>
     } catch (e: unknown) {
       const msg = (e as Error)?.message ?? String(e)
       if (msg.includes('DUPLICATE_FILE')) throw new S3BgUploaderDuplicateFileError(msg)
