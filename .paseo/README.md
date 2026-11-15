@@ -39,9 +39,15 @@ Comment and review events (each exists once for `assignee` and once for
 | `github.pull_request_review_comment` | `pi-agent-assignee` or `pi-agent-reviewer` |
 | `github.pull_request_review` | `pi-agent-assignee` or `pi-agent-reviewer` |
 
-Hub filters cannot express "either label", so each comment/review event has one
-workflow per label. Keep the labels mutually exclusive to avoid two runs on the
-same item.
+CI failures also start the assignee workflow. `.github/workflows/notify-paseo-on-ci-failure.yml`
+posts a pull-request comment from `github-actions[bot]` containing
+`@agent-serviceuser`. `agent-serviceuser-ci-failure.yml` matches only that bot
+comment, requires the `pi-agent-assignee` label, and resumes the same
+pull-request conversation.
+
+Hub filters cannot express "either label", so each human comment/review event
+has one workflow per label. Keep the labels mutually exclusive to avoid two runs
+on the same item.
 
 All workflows use the `nikwebr-github` connection and the `dev`
 environment from `hub.yml`. The shared prompt lives in `workflows/partials/`.
@@ -63,7 +69,7 @@ The daemon needs Codex plus a DeepSeek provider configuration:
   `wire_api = "responses"` and `env_key = "DEEPSEEK_API_KEY"`.
 - Enable the Paseo `codex` provider and give it `DEEPSEEK_API_KEY` (for example in
   `~/.paseo/config.json` under `agents.providers.codex.env`).
-- Add `deepseek-chat` to the provider models, then reload the daemon.
+- Add `deepseek-flash` to the provider models, then reload the daemon.
 
 ## Disabled GitHub Actions workflow
 
@@ -89,4 +95,4 @@ paseo hub deploy -p default
 
 The bundle uses the `nikwebr-github` connection, which has access to
 `nikwebr/react-native-s3-bg-uploader`. It is deployed to the `default` project
-with 11 workflows.
+with 12 workflows.
