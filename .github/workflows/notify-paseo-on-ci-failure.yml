@@ -1,0 +1,87 @@
+name: Notify Paseo on CI failure
+
+on:
+  workflow_run:
+    workflows:
+      - Build Android
+      - Build iOS
+      - Build Web
+      - CodeQL Advanced
+    types: [completed]
+
+permissions:
+  actions: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  notify:
+    name: Comment for Paseo Hub
+    if: |
+      github.event.workflow_run.event == 'pull_request' &&
+      (github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'timed_out')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Comment on the pull request
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const associatedPullRequest = run.pull_requests?.[0];
+
+            if (!associatedPullRequest) {
+              core.info('No pull request is associated with this workflow run.');
+              return;
+            }
+
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: associatedPullRequest.number,
+            });
+
+            if (pullRequest.state !== 'open') {
+              core.info(`Pull request #${pullRequest.number} is not open.`);
+              return;
+            }
+
+            if (!pullRequest.labels.some((label) => label.name === 'pi-agent-assignee')) {
+              core.info(
+                `Pull request #${pullRequest.number} does not have the pi-agent-assignee label.`
+              );
+              return;
+            }
+
+            const marker = `<!-- paseo-ci-failure:${run.head_sha} -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pullRequest.number,
+              per_page: 100,
+            });
+
+            if (comments.some((comment) => comment.body?.includes(marker))) {
+              core.info(`Paseo was already notified for commit ${run.head_sha}.`);
+              return;
+            }
+
+            const body = [
+              '@agent-serviceuser CI failed on this pull request. Please investigate the failing checks, fix the cause, run the relevant validation, and push the update.',
+              '',
+              `- Workflow: **${run.name}**`,
+              `- Run: ${run.html_url}`,
+              `- Commit: \`${run.head_sha}\``,
+              '',
+              marker,
+            ].join('\n');
+
+            const { data: comment } = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pullRequest.number,
+              body,
+            });
+
+            core.info(`Created ${comment.html_url}`);
