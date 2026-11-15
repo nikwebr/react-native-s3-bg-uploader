@@ -26,12 +26,17 @@ class AndroidStartupTests(unittest.TestCase):
         return is_startup_disconnect(self.directory.name)
 
     def test_initial_launch_disconnect_can_retry(self):
-        self.assertTrue(self.check([
-            entry("defineVariablesCommand"),
-            entry("applyConfigurationCommand"),
-            entry("launchAppCommand", "FAILED",
-                  "Command failed (host:transport:emulator-5554): device offline"),
-        ]))
+        for message in (
+            "Command failed (host:transport:emulator-5554): device offline",
+            "Command failed (host:transport:emulator-5554): device 'emulator-5554' not found",
+            "Command failed (host:transport:emulator-5554): no devices/emulators found",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(self.check([
+                    entry("defineVariablesCommand"),
+                    entry("applyConfigurationCommand"),
+                    entry("launchAppCommand", "FAILED", message),
+                ]))
 
     def test_assertion_and_later_disconnects_cannot_retry(self):
         for failed_command in ("assertConditionCommand", "tapOnElementCommand", "launchAppCommand"):
@@ -48,6 +53,8 @@ class AndroidStartupTests(unittest.TestCase):
     def test_other_launch_failures_and_missing_evidence_cannot_retry(self):
         self.assertFalse(is_startup_disconnect(self.directory.name))
         self.assertFalse(self.check([entry("launchAppCommand", "FAILED", "app crashed")]))
+        self.assertFalse(self.check([entry("launchAppCommand", "FAILED",
+                                            "Package com.example not found")]))
         self.assertFalse(self.check([entry("launchAppCommand", "COMPLETED", "device offline")]))
         self.assertFalse(self.check([{}]))
         self.report.write_text("truncated JSON")
