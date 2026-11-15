@@ -75,8 +75,8 @@ export default function TestApp({ initializeEncryptor }: {
       `${BACKEND}/start`,
       `${BACKEND}/urls`,
       `${BACKEND}/complete`,
-      true,
       `${BACKEND}/cancel`,
+      true,
     );
     S3BgUploader.setProgressCallback(onProgress);
     return () => {

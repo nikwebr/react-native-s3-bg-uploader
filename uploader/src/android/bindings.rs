@@ -137,8 +137,8 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetConfig(
     start_upload_api: JString,
     get_upload_urls_api: JString,
     complete_api: JString,
-    send_file_hash: jboolean,
     cancel_api: JString,
+    send_file_hash: jboolean,
 ) {
     ensure_store();
     let s: String = env
@@ -158,7 +158,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetConfig(
         .get_string(&cancel_api)
         .map(|s| s.into())
         .unwrap_or_default();
-    crate::core::config::set_config(&s, &g, &c, send_file_hash != 0, &x);
+    crate::core::config::set_config(&s, &g, &c, &x, send_file_hash != 0);
 }
 
 #[no_mangle]

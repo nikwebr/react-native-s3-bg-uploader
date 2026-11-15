@@ -74,15 +74,15 @@ For the full API reference see the [documentation](https://uploader.ysendit.com/
 
 `cancel()`, `cancelFile()` and `cancelTransfer()` stop the upload locally and remove the
 file from the session immediately. To also release the parts already stored in S3,
-configure the optional cancel endpoint as the fifth argument of `setConfig`:
+configure the optional cancel endpoint as the fourth argument of `setConfig`:
 
 ```ts
 S3BgUploader.setConfig(
   startUploadApi,
   getUploadUrlsApi,
   completeApi,
-  /* sendFileHash */ true,
   /* cancelApi */ 'https://api.example.com/upload/cancelUpload',
+  /* sendFileHash */ true,
 )
 ```
 
@@ -170,8 +170,8 @@ wire sizes rather than local file sizes:
 - `fileHash` is always computed over the **unencrypted** file, so duplicate
 detection and resume behave exactly the same for `uploadFile()` and
 `encryptAndUploadFile()`. `setConfig(startUploadApi, getUploadUrlsApi,
-completeApi, sendFileHash)` defaults to `true`; pass `false` to keep the hash
-local and omit it from the `startUpload()` request body.
+completeApi, cancelApi, sendFileHash)` defaults `sendFileHash` to `true`; pass
+`false` to keep the hash local and omit it from the `startUpload()` request body.
 - `startUpload()` always receives the size of the **local, unencrypted** file as
 `fileSize`, so the backend never has to treat an estimated number as the real
 file size. For `encryptAndUploadFile()` the body also carries an `encryption`

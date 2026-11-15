@@ -144,14 +144,14 @@ class HybridS3BgUploader: HybridS3BgUploaderSpec {
     // Config
     // -------------------------------------------------------------------------
 
-    func setConfig(startUploadApi: String, getUploadUrlsApi: String, completeApi: String, sendFileHash: Bool?, cancelApi: String?) throws {
+    func setConfig(startUploadApi: String, getUploadUrlsApi: String, completeApi: String, cancelApi: String?, sendFileHash: Bool?) throws {
         startUploadApi.withCString { startPtr in
             getUploadUrlsApi.withCString { getUrlsPtr in
                 completeApi.withCString { completePtr in
                     // An empty string means "no cancel endpoint configured"; Rust reads it
                     // as a disabled endpoint and keeps cancellations local.
                     (cancelApi ?? "").withCString { cancelPtr in
-                        set_config(startPtr, getUrlsPtr, completePtr, sendFileHash ?? true, cancelPtr)
+                        set_config(startPtr, getUrlsPtr, completePtr, cancelPtr, sendFileHash ?? true)
                     }
                 }
             }

@@ -35,15 +35,15 @@ pub fn set_config(
     start_upload_api: &str,
     get_upload_urls_api: &str,
     complete_api: &str,
-    send_file_hash: bool,
     cancel_api: &str,
+    send_file_hash: bool,
 ) {
     let mut cfg = config_lock().lock().unwrap();
     cfg.start_upload_api = start_upload_api.to_string();
     cfg.get_upload_urls_api = get_upload_urls_api.to_string();
     cfg.complete_api = complete_api.to_string();
-    cfg.send_file_hash = send_file_hash;
     cfg.cancel_api = cancel_api.to_string();
+    cfg.send_file_hash = send_file_hash;
 }
 
 pub fn get_config() -> MutexGuard<'static, UploaderConfig> {
