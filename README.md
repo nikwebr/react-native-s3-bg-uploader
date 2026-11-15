@@ -70,6 +70,33 @@ S3BgUploader.cancel()
 
 For the full API reference see the [documentation](https://uploader.ysendit.com/docs).
 
+### Cancelling an upload
+
+`cancel()`, `cancelFile()` and `cancelTransfer()` stop the upload locally and remove the
+file from the session immediately. To also release the parts already stored in S3,
+configure the optional cancel endpoint as the fifth argument of `setConfig`:
+
+```ts
+S3BgUploader.setConfig(
+  startUploadApi,
+  getUploadUrlsApi,
+  completeApi,
+  /* sendFileHash */ true,
+  /* cancelApi */ 'https://api.example.com/upload/cancelUpload',
+)
+```
+
+For every file that is cancelled while it is **not** `COMPLETED`, the uploader then calls
+`POST {cancelApi}/{uploadId}/{key}` — the same shape as `completeApi` — so the backend can
+call S3 `AbortMultipartUpload` and delete all uploaded parts of that upload. The response
+body is ignored; only a 2xx status counts as success. The request is best effort: it never
+delays or fails the synchronous cancel call, and if it cannot be delivered the multipart
+upload is left to the backend's lifecycle rules. Without `cancelApi`, cancellations stay
+local to the device.
+
+Files that are already `COMPLETED` are not aborted: `completeUpload` finalized their
+multipart upload on the backend.
+
 ## Building
 For native platforms:
 ```bash

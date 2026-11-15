@@ -43,9 +43,12 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
         getUploadUrlsApi: String,
         completeApi: String,
         sendFileHash: Boolean?,
+        cancelApi: String?,
     ): Unit {
         appContext()?.let { StoragePathInit.ensureInit(it) }
-        nativeSetConfig(startUploadApi, getUploadUrlsApi, completeApi, sendFileHash ?: true)
+        // An empty string means "no cancel endpoint configured"; Rust keeps
+        // cancellations local then.
+        nativeSetConfig(startUploadApi, getUploadUrlsApi, completeApi, sendFileHash ?: true, cancelApi ?: "")
     }
 
     // -------------------------------------------------------------------------
@@ -358,6 +361,7 @@ class HybridS3BgUploader : HybridS3BgUploaderSpec() {
             getUploadUrlsApi: String,
             completeApi: String,
             sendFileHash: Boolean,
+            cancelApi: String,
         )
 
         @JvmStatic external fun nativeSetStoragePath(path: String)

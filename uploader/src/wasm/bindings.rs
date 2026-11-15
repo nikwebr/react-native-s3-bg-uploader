@@ -123,12 +123,14 @@ pub fn wasm_set_config(
     get_upload_urls_api: String,
     complete_api: String,
     send_file_hash: bool,
+    cancel_api: String,
 ) {
     crate::core::config::set_config(
         &start_upload_api,
         &get_upload_urls_api,
         &complete_api,
         send_file_hash,
+        &cancel_api,
     );
 }
 
@@ -215,7 +217,7 @@ pub fn wasm_cancel_file(file_hash: String) {
     PENDING_WASM_FILES.with(|m| m.borrow_mut().remove(&file_hash));
     PENDING_WASM_ENCRYPTION.with(|m| m.borrow_mut().remove(&file_hash));
     crate::wasm::js_encryptor::forget_instance(&file_hash);
-    session::cancel_file_by_hash(&file_hash);
+    crate::wasm::cancel_upload_jobs(session::cancel_file_by_hash(&file_hash));
 
     if !transfer_id.is_empty() {
         runtime::notify_cancelled_file(
@@ -249,7 +251,7 @@ pub fn wasm_cancel_transfer(transfer_id: String) {
     for hash in hashes {
         wasm_cancel_file(hash);
     }
-    session::cancel_transfer(&transfer_id);
+    crate::wasm::cancel_upload_jobs(session::cancel_transfer(&transfer_id));
 }
 
 #[wasm_bindgen]
@@ -265,7 +267,7 @@ pub fn wasm_cancel_all() {
     crate::wasm::js_encryptor::forget_all_instances();
     PAUSE_REQUESTED.with(|p| *p.borrow_mut() = false);
     QUEUE_RUNNING.with(|r| *r.borrow_mut() = false);
-    session::clear_session();
+    crate::wasm::cancel_upload_jobs(session::clear_session());
     wasmProgress::progress_manager().clear();
 }
 

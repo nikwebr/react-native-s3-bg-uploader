@@ -98,8 +98,15 @@ interface BaseUploaderAPI {
    *   Defaults to `true`. The hash is always computed locally (over the **unencrypted**
    *   file) for deduplication and resume detection, so disabling it only changes what the
    *   backend receives. Useful when the backend must not learn a content hash.
+   * @param cancelApi  Endpoint called when a file that is **not** `COMPLETED` is cancelled
+   *   through `cancel()`, `cancelFile()` or `cancelTransfer()`, so the backend can abort
+   *   the S3 multipart upload and discard the parts already uploaded. It receives
+   *   `POST {cancelApi}/{uploadId}/{key}` — the same shape as `completeApi` — and only a
+   *   2xx response counts as success; the body is ignored. Requests are best effort: they
+   *   never delay the synchronous cancel call and a failure only leaves the cleanup to the
+   *   backend. Omitting it keeps cancellations local to the device.
    */
-  setConfig(startUploadApi: string, getUploadUrlsApi: string, completeApi: string, sendFileHash?: boolean): void
+  setConfig(startUploadApi: string, getUploadUrlsApi: string, completeApi: string, sendFileHash?: boolean, cancelApi?: string): void
 
   /**
    * Set a callback that receives progress events.

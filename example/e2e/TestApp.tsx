@@ -71,7 +71,13 @@ export default function TestApp({ initializeEncryptor }: {
   }, []);
 
   useEffect(() => {
-    S3BgUploader.setConfig(`${BACKEND}/start`, `${BACKEND}/urls`, `${BACKEND}/complete`);
+    S3BgUploader.setConfig(
+      `${BACKEND}/start`,
+      `${BACKEND}/urls`,
+      `${BACKEND}/complete`,
+      true,
+      `${BACKEND}/cancel`,
+    );
     S3BgUploader.setProgressCallback(onProgress);
     return () => {
       clearTimeout(completionTimer.current);
@@ -91,7 +97,7 @@ export default function TestApp({ initializeEncryptor }: {
     }
   };
 
-  const prepare = async (mode: 'plain' | 'encrypted', network = false) => {
+  const prepare = async (mode: 'plain' | 'encrypted' | 'cancel', network = false) => {
     clearTimeout(completionTimer.current);
     completionTimer.current = undefined;
     completionTiming.current = new CompletionTiming();
@@ -271,6 +277,34 @@ export default function TestApp({ initializeEncryptor }: {
     setStatus(`${mode} network recovery verified`);
   };
 
+  const cancelUpload = async () => {
+    await prepare('cancel');
+    // Part one completes without the pause gate; parts two and beyond are in flight.
+    const started = Date.now() + 60000;
+    while ((await snapshot()).completedParts < 1) {
+      if (Date.now() > started) throw new Error('Upload did not start before the cancel');
+      await sleep(100);
+    }
+    S3BgUploader.cancel();
+    // cancel() is synchronous and the cancelUpload request is best effort, so wait for
+    // the backend to confirm that S3 dropped the multipart upload and its parts.
+    const deadline = Date.now() + 30000;
+    let lastError: unknown;
+    for (;;) {
+      try {
+        await api('/cancelled', { mode: current.current?.mode });
+        break;
+      } catch (e: unknown) {
+        lastError = e;
+        if (Date.now() > deadline) throw lastError;
+        await sleep(200);
+      }
+    }
+    const remaining = await S3BgUploader.getProgress();
+    if (remaining.length !== 0) throw new Error('Cancelled files are still in the session');
+    setStatus('Cancellation verified');
+  };
+
   const verify = async () => {
     // The uploader evicts finished sessions; retain the real completion event.
     if (progress?.state !== 'COMPLETED' || progress.fileHash !== current.current?.hash) {
@@ -309,6 +343,7 @@ export default function TestApp({ initializeEncryptor }: {
       <Button title="Pause upload" disabled={busy} onPress={() => run(pause)} />
       <Button title="Resume upload" disabled={busy} onPress={() => run(resume)} />
       <Button title="Verify download" disabled={busy} onPress={() => run(verify)} />
+      <Button title="Cancel upload" disabled={busy} onPress={() => run(cancelUpload)} />
       <Button title="Test network retry" disabled={busy} onPress={() => run(() => networkRecovery('plain'))} />
       <Button title="Test network resume" disabled={busy} onPress={() => run(() => networkRecovery('encrypted'))} />
       <Text>{status}</Text>
@@ -325,7 +360,9 @@ export default function TestApp({ initializeEncryptor }: {
 }
 
 const styles = StyleSheet.create({
-  screen: { padding: 24, paddingTop: 64, gap: 16 },
+  // Compact spacing: the extra cancel step keeps every button and the status text
+  // reachable on the emulator without scrolling.
+  screen: { padding: 24, paddingTop: 48, gap: 8 },
   title: { fontSize: 24 },
   input: { borderWidth: 1, padding: 8 },
 });

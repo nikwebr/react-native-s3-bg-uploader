@@ -168,6 +168,37 @@ impl FileEntry {
     }
 }
 
+/// A multipart upload that a cancel call removed from the session while it was not
+/// completed. The platform layer turns each entry into one best-effort
+/// `cancelUpload` request so the backend can abort the S3 multipart upload and
+/// delete the parts already stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelledUpload {
+    /// S3 object key returned by `startUpload`.
+    pub file_key: String,
+    /// Multipart upload ID returned by `startUpload`.
+    pub upload_id: String,
+}
+
+/// The upload to abort after removing `entry`, or `None` when nothing is left in S3.
+///
+/// Completed files are skipped: `completeUpload` already finalized their multipart
+/// upload on the backend. Files whose `startUpload` never answered have no upload ID,
+/// so there is nothing to abort yet either.
+fn abortable_upload(entry: &FileEntry) -> Option<CancelledUpload> {
+    if entry.state == UploadState::Completed {
+        return None;
+    }
+    entry
+        .upload_id
+        .as_ref()
+        .filter(|upload_id| !upload_id.is_empty())
+        .map(|upload_id| CancelledUpload {
+            file_key: entry.file_key.clone(),
+            upload_id: upload_id.clone(),
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferEntry {
     pub transfer_id: String,
@@ -670,34 +701,52 @@ impl Session {
     // Cancel
     // ------------------------------------------------------------------
 
-    pub fn cancel_file(&mut self, file_key: &str) {
+    /// Remove one file and return the multipart upload the backend still has to abort.
+    pub fn cancel_file(&mut self, file_key: &str) -> Vec<CancelledUpload> {
         self.cancel_active_run(file_key);
-        if let Some(entry) = self.files.remove(file_key) {
-            self.hash_to_key.remove(&entry.file_hash);
-            self.files_needing_provision.remove(&entry.file_hash);
-        }
+        let cancelled = self
+            .files
+            .remove(file_key)
+            .and_then(|entry| {
+                self.hash_to_key.remove(&entry.file_hash);
+                self.files_needing_provision.remove(&entry.file_hash);
+                abortable_upload(&entry)
+            })
+            .into_iter()
+            .collect();
         for transfer in self.transfers.values_mut() {
             transfer.file_keys.retain(|k| k != file_key);
         }
         self.recompute_global_state();
+        cancelled
     }
 
-    pub fn cancel_file_by_hash(&mut self, file_hash: &str) {
+    /// Remove one file by hash and return the multipart upload to abort.
+    ///
+    /// A file that only exists in `pending_files` has no multipart upload yet, so
+    /// there is nothing to abort before `startUpload` answered.
+    pub fn cancel_file_by_hash(&mut self, file_hash: &str) -> Vec<CancelledUpload> {
         self.pending_files.remove(file_hash);
         self.files_needing_provision.remove(file_hash);
+        let mut cancelled = Vec::new();
         if let Some(file_key) = self.hash_to_key.remove(file_hash) {
             self.cancel_active_run(&file_key);
-            self.files.remove(&file_key);
+            if let Some(entry) = self.files.remove(&file_key) {
+                cancelled.extend(abortable_upload(&entry));
+            }
             for transfer in self.transfers.values_mut() {
                 transfer.file_keys.retain(|k| k != &file_key);
             }
         }
         self.recompute_global_state();
+        cancelled
     }
 
-    pub fn cancel_transfer(&mut self, transfer_id: &str) {
+    /// Remove every file of a transfer and return the multipart uploads to abort.
+    pub fn cancel_transfer(&mut self, transfer_id: &str) -> Vec<CancelledUpload> {
         self.pending_files
             .retain(|_, p| p.transfer_id != transfer_id);
+        let mut cancelled = Vec::new();
         if let Some(transfer) = self.transfers.get(transfer_id) {
             let keys: Vec<String> = transfer.file_keys.clone();
             for key in keys {
@@ -705,6 +754,7 @@ impl Session {
                 if let Some(entry) = self.files.remove(&key) {
                     self.hash_to_key.remove(&entry.file_hash);
                     self.files_needing_provision.remove(&entry.file_hash);
+                    cancelled.extend(abortable_upload(&entry));
                 }
             }
         }
@@ -713,13 +763,19 @@ impl Session {
             self.current_transfer_id = None;
         }
         self.recompute_global_state();
+        cancelled
     }
 
-    pub fn cancel_all(&mut self) {
+    /// Wipe the session and return the multipart uploads to abort.
+    ///
+    /// Completed files are skipped: the backend finalized their multipart upload
+    /// when it answered `completeUpload`.
+    pub fn cancel_all(&mut self) -> Vec<CancelledUpload> {
         for run in self.active_runs.values() {
             run.cancelled
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        let cancelled = self.files.values().filter_map(abortable_upload).collect();
         self.active_runs.clear();
         self.files.clear();
         self.hash_to_key.clear();
@@ -728,6 +784,7 @@ impl Session {
         self.files_needing_provision.clear();
         self.current_transfer_id = None;
         self.global_state = GlobalUploaderState::NotStarted;
+        cancelled
     }
 
     pub fn pause_all(&mut self) {
@@ -1022,19 +1079,25 @@ pub fn persist_session() {
     }
 }
 
-pub fn cancel_file(key: &str) {
-    session().cancel_file(key);
+/// Cancel one file and return the multipart uploads the backend should abort.
+pub fn cancel_file(key: &str) -> Vec<CancelledUpload> {
+    let cancelled = session().cancel_file(key);
     persist_session();
+    cancelled
 }
 
-pub fn cancel_file_by_hash(hash: &str) {
-    session().cancel_file_by_hash(hash);
+/// Cancel one file by hash and return the multipart uploads to abort.
+pub fn cancel_file_by_hash(hash: &str) -> Vec<CancelledUpload> {
+    let cancelled = session().cancel_file_by_hash(hash);
     persist_session();
+    cancelled
 }
 
-pub fn cancel_transfer(tid: &str) {
-    session().cancel_transfer(tid);
+/// Cancel a whole transfer and return the multipart uploads to abort.
+pub fn cancel_transfer(tid: &str) -> Vec<CancelledUpload> {
+    let cancelled = session().cancel_transfer(tid);
     persist_session();
+    cancelled
 }
 
 pub fn pause_all() {
@@ -1055,11 +1118,13 @@ pub fn is_current_run(file_key: &str, run_version: u64) -> bool {
     file_run_version(file_key) == Some(run_version)
 }
 
-pub fn clear_session() {
-    session().cancel_all();
+/// Wipe the session and return the multipart uploads the backend should abort.
+pub fn clear_session() -> Vec<CancelledUpload> {
+    let cancelled = session().cancel_all();
     if let Some(store) = STORE.get() {
         store.clear();
     }
+    cancelled
 }
 
 pub fn set_storage_path(path: &str) {
@@ -1071,6 +1136,145 @@ pub fn set_storage_path(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn register(
+        sess: &mut Session,
+        key: &str,
+        transfer: &str,
+        state: UploadState,
+        upload_id: Option<&str>,
+    ) {
+        sess.register_file(
+            key.into(),
+            format!("hash-{key}"),
+            transfer.into(),
+            "file".into(),
+            "file".into(),
+            1000,
+            HashMap::new(),
+        );
+        let entry = sess.files.get_mut(key).unwrap();
+        entry.state = state;
+        entry.upload_id = upload_id.map(str::to_string);
+    }
+
+    fn job(key: &str, upload_id: &str) -> CancelledUpload {
+        CancelledUpload {
+            file_key: key.into(),
+            upload_id: upload_id.into(),
+        }
+    }
+
+    #[test]
+    fn cancelling_a_file_returns_only_its_unfinished_multipart_upload() {
+        let mut sess = Session::new();
+        register(
+            &mut sess,
+            "running",
+            "t",
+            UploadState::Running,
+            Some("upload-running"),
+        );
+        register(
+            &mut sess,
+            "done",
+            "t",
+            UploadState::Completed,
+            Some("upload-done"),
+        );
+        register(&mut sess, "no-start", "t", UploadState::Initialized, None);
+
+        assert!(
+            sess.cancel_file("done").is_empty(),
+            "a completed file must not be aborted: completeUpload finalized it"
+        );
+        assert!(
+            sess.cancel_file("no-start").is_empty(),
+            "startUpload did not answer, so no multipart upload exists yet"
+        );
+        assert_eq!(
+            sess.cancel_file("running"),
+            vec![job("running", "upload-running")]
+        );
+        assert!(sess.files.is_empty());
+        assert!(sess.transfers.values().all(|t| t.file_keys.is_empty()));
+    }
+
+    #[test]
+    fn cancelling_by_hash_returns_the_multipart_upload_to_abort() {
+        let mut sess = Session::new();
+        register(
+            &mut sess,
+            "paused",
+            "t",
+            UploadState::Paused,
+            Some("upload-paused"),
+        );
+        assert_eq!(
+            sess.cancel_file_by_hash("hash-paused"),
+            vec![job("paused", "upload-paused")]
+        );
+        assert!(sess.hash_to_key.is_empty());
+
+        // A file that only exists in pending_files was never started.
+        sess.pre_register_file(
+            "hash-pending".into(),
+            "t".into(),
+            "file".into(),
+            "file".into(),
+            10,
+            HashMap::new(),
+            None,
+        );
+        assert!(sess.cancel_file_by_hash("hash-pending").is_empty());
+        assert!(!sess.pending_files.contains_key("hash-pending"));
+    }
+
+    #[test]
+    fn cancelling_a_transfer_or_the_session_aborts_every_unfinished_upload() {
+        let mut sess = Session::new();
+        register(
+            &mut sess,
+            "a-running",
+            "a",
+            UploadState::Running,
+            Some("upload-a1"),
+        );
+        register(
+            &mut sess,
+            "a-done",
+            "a",
+            UploadState::Completed,
+            Some("upload-a2"),
+        );
+        register(
+            &mut sess,
+            "a-failed",
+            "a",
+            UploadState::Failed,
+            Some("upload-a3"),
+        );
+        register(
+            &mut sess,
+            "b-paused",
+            "b",
+            UploadState::Paused,
+            Some("upload-b1"),
+        );
+
+        assert_eq!(
+            sess.cancel_transfer("a"),
+            vec![job("a-running", "upload-a1"), job("a-failed", "upload-a3")]
+        );
+        assert_eq!(sess.files.keys().collect::<Vec<_>>(), vec!["b-paused"]);
+
+        assert_eq!(sess.cancel_all(), vec![job("b-paused", "upload-b1")]);
+        assert!(sess.files.is_empty());
+        assert!(
+            sess.cancel_all().is_empty(),
+            "a wiped session has nothing to abort"
+        );
+    }
 
     #[test]
     fn resume_keeps_a_live_paused_run_but_restarts_restored_or_failed_runs() {

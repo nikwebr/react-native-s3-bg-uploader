@@ -154,6 +154,16 @@ pub fn complete_upload_body(results: Vec<ChunkUploadResult>) -> Result<String, S
 }
 
 pub fn complete_upload_url(base_url: &str, upload_id: &str, key: &str) -> String {
+    multipart_upload_url(base_url, upload_id, key)
+}
+
+/// Build the cancelUpload URL. Addressed exactly like [`complete_upload_url`], so a
+/// backend that already parses that path can reuse the parser.
+pub fn cancel_upload_url(base_url: &str, upload_id: &str, key: &str) -> String {
+    multipart_upload_url(base_url, upload_id, key)
+}
+
+fn multipart_upload_url(base_url: &str, upload_id: &str, key: &str) -> String {
     format!("{}/{}/{}", base_url, upload_id, key)
 }
 
@@ -193,6 +203,14 @@ pub trait ApiClient {
         upload_id: &str,
         results: Vec<ChunkUploadResult>,
     ) -> Result<(), String>;
+
+    /// Best-effort abort of a multipart upload whose file was cancelled before it
+    /// completed, so the backend can delete the parts already stored.
+    ///
+    /// Implementations must return `Ok(())` without a request when no cancel
+    /// endpoint is configured, and must not turn a failure into an upload error:
+    /// cancellation already succeeded locally.
+    async fn cancel_upload(&self, key: &str, upload_id: &str) -> Result<(), String>;
 }
 
 #[cfg(test)]
@@ -205,6 +223,18 @@ mod tests {
             has_footer: true,
             footer_len: 28,
         }
+    }
+
+    #[test]
+    fn cancel_upload_url_addresses_the_multipart_upload_like_complete() {
+        assert_eq!(
+            cancel_upload_url("https://api.test/cancel", "upload-1", "a/fixture.bin"),
+            "https://api.test/cancel/upload-1/a/fixture.bin"
+        );
+        assert_eq!(
+            complete_upload_url("https://api.test/complete", "upload-1", "a/fixture.bin"),
+            "https://api.test/complete/upload-1/a/fixture.bin"
+        );
     }
 
     #[test]

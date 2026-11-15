@@ -65,7 +65,7 @@ onmessage = async function (e) {
 
   switch (type) {
     case 'setConfig': {
-      wasm.wasm_set_config(payload.startUploadApi, payload.getUploadUrlsApi, payload.completeApi, payload.sendFileHash !== false);
+      wasm.wasm_set_config(payload.startUploadApi, payload.getUploadUrlsApi, payload.completeApi, payload.sendFileHash !== false, payload.cancelApi ?? '');
       postMessage({ type: 'ack', requestId });
       break;
     }
@@ -285,8 +285,8 @@ function sendRequest(type: string, payload: Record<string, unknown> = {}): Promi
 // ---------------------------------------------------------------------------
 
 export const S3BgUploader: WebS3BgUploaderAPI = {
-  setConfig(startUploadApi: string, getUploadUrlsApi: string, completeApi: string, sendFileHash?: boolean): void {
-    sendRequest('setConfig', { startUploadApi, getUploadUrlsApi, completeApi, sendFileHash: sendFileHash !== false })
+  setConfig(startUploadApi: string, getUploadUrlsApi: string, completeApi: string, sendFileHash?: boolean, cancelApi?: string): void {
+    sendRequest('setConfig', { startUploadApi, getUploadUrlsApi, completeApi, sendFileHash: sendFileHash !== false, cancelApi })
   },
 
   setProgressCallback(callback: ProgressCallback | null): void {

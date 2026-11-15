@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, Once};
 use std::thread;
 
+use crate::core::api::ApiClient;
 use crate::core::encryption::ArcEncryptor;
 use crate::core::session::{PendingFileEntry, UploadState};
 use crate::core::upload::StartResult;
@@ -149,7 +150,9 @@ pub(super) fn initialize_and_enqueue(
     let still_active = session::session().pending_files.contains_key(file_hash);
     session::session().pending_files.remove(file_hash);
     if !still_active {
-        session::session().cancel_file(result.file_key());
+        // The file was cancelled while startUpload was in flight, so the multipart
+        // upload the backend just created has to be aborted as well.
+        cancel_upload_jobs(session::session().cancel_file(result.file_key()));
         return Err("cancelled".to_string());
     }
     if result.should_upload() {
@@ -210,6 +213,39 @@ pub(crate) fn dup_fd(fd: RawFd) -> std::io::Result<RawFd> {
     } else {
         Ok(new_fd)
     }
+}
+
+/// Send the best-effort `cancelUpload` requests for uploads that were just removed
+/// from the session while not completed. Cancelling stays synchronous: the requests
+/// run on their own thread and a failure only leaves an orphaned multipart upload for
+/// the backend's lifecycle rules to clean up.
+pub(crate) fn cancel_upload_jobs(jobs: Vec<session::CancelledUpload>) {
+    if jobs.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        // Cancellation must not wait for a stalled request: use a short-timeout client
+        // instead of the upload client, whose timeout covers an entire part.
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => {
+                log::warn!("cancelUpload client failed: {}", e);
+                return;
+            }
+        };
+        let api = NativeApiClient {
+            network: AndroidNetwork { client },
+        };
+        for job in jobs {
+            if let Err(e) = pollster::block_on(api.cancel_upload(&job.file_key, &job.upload_id)) {
+                log::warn!("cancelUpload failed for {}: {}", job.file_key, e);
+            }
+        }
+    });
 }
 
 fn start_worker_thread() {

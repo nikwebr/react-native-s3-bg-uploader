@@ -70,6 +70,9 @@ class Upload:
     last_network_failure_at: float | None = None
     failed_progress_after_ms: float | None = None
     paused_put_requests: dict = field(default_factory=dict)
+    # The uploader's cancel endpoint reached us and S3 dropped the multipart upload.
+    cancel_requested: bool = False
+    cancel_verified: bool = False
     # Platform that reported the pause: web cannot suspend an XHR, so its pause
     # cancels the in-flight parts instead of holding them across the pause.
     paused_platform: str | None = None
@@ -105,7 +108,8 @@ class Backend:
 
     def start(self, body):
         mode = body["mode"]
-        require(mode in ("plain", "encrypted", "plain-network", "encrypted-network"), "Unknown encryption mode")
+        require(mode in ("plain", "encrypted", "plain-network", "encrypted-network", "cancel"),
+                "Unknown encryption mode")
         encrypted = mode.startswith("encrypted")
         # Default expectations for callers that start an upload without a startUpload
         # body (the contract tests in e2e/test_server.py).
@@ -208,6 +212,21 @@ class Backend:
         upload.completed = True
         return {}
 
+    def cancel(self, path, body):
+        # Mirrors the uploader's contract: POST {cancelApi}/{uploadId}/{key} with an
+        # empty JSON body. The backend aborts the S3 multipart upload, which deletes
+        # every part received so far.
+        _, _, upload_id, mode, _ = path.split("/")
+        upload = self.upload(mode)
+        require(upload_id == upload.upload_id, "Cancel used a new multipart ID")
+        require(not upload.completed, "The uploader cancelled a completed upload")
+        require(not upload.cancel_requested, "Duplicate cancelUpload request")
+        self.s3.abort_multipart_upload(
+            Bucket=BUCKET, Key=upload.key, UploadId=upload_id,
+        )
+        upload.cancel_requested = True
+        return {}
+
     def control(self, path, body):
         upload = self.upload(body["mode"])
         if path == "/release":
@@ -242,6 +261,17 @@ class Backend:
             upload.resumed = True
         elif path == "/verify":
             self.verify(body["mode"])
+        elif path == "/cancelled":
+            require(upload.cancel_requested, "cancelUpload endpoint was not called")
+            try:
+                self.s3.list_parts(Bucket=BUCKET, Key=upload.key, UploadId=upload.upload_id)
+            except self.s3.exceptions.ClientError as error:
+                require("NoSuchUpload" in str(error),
+                        f"Unexpected S3 error after cancelUpload: {error}")
+            else:
+                raise AssertionError("Aborted multipart upload still exists in S3")
+            require(not upload.completed, "The cancelled upload was completed")
+            upload.cancel_verified = True
         elif path == "/completion-timing":
             elapsed = body.get("completedAfterMs")
             require(upload.completed, "Timing evidence requires a completed upload")
@@ -317,17 +347,26 @@ class Backend:
             "progressResetVerified": upload.progress_reset_verified,
             "failedProgressAfterLastNetworkErrorMs": upload.failed_progress_after_ms,
             "heldPutRequests": upload.paused_put_requests,
+            "cancelRequested": upload.cancel_requested,
+            "cancelVerified": upload.cancel_verified,
         } for mode, upload in self.uploads.items()}
         (self.artifacts / "verification.json").write_text(json.dumps(report, indent=2))
         if final:
-            require(set(report) == {"plain", "encrypted", "plain-network", "encrypted-network"},
-                    "Both upload modes and network recovery scenarios must run")
+            require(set(report) == {"plain", "encrypted", "plain-network", "encrypted-network",
+                                    "cancel"},
+                    "Both upload modes, network recovery and cancellation scenarios must run")
             require(all(u["verified"] and u["paused"] and u["resumed"] and u["completed"]
-                        for mode, u in report.items() if not mode.endswith("-network")),
+                        for mode, u in report.items()
+                        if not mode.endswith("-network") and mode != "cancel"),
                     "Missing upload/download/pause/resume evidence")
-            require(all(u["verified"] and u["completed"] for u in report.values()),
+            require(report["cancel"]["cancelRequested"] and report["cancel"]["cancelVerified"]
+                    and not report["cancel"]["completed"],
+                    "Missing cancelUpload evidence")
+            require(all(u["verified"] and u["completed"]
+                        for mode, u in report.items() if mode != "cancel"),
                     "Missing network recovery/download evidence")
-            require(all(u["completedAfter100PercentMs"] is not None for u in report.values()),
+            require(all(u["completedAfter100PercentMs"] is not None
+                        for mode, u in report.items() if mode != "cancel"),
                     "Missing 100%-to-completion timing evidence")
         return report
 
@@ -378,6 +417,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = backend.urls(body)
             elif self.path.startswith("/complete/"):
                 result = backend.complete(self.path, body)
+            elif self.path.startswith("/cancel/"):
+                result = backend.cancel(self.path, body)
             elif self.path == "/assert":
                 result = backend.report(final=True)
             else:
