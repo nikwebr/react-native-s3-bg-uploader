@@ -14,7 +14,7 @@ The invoking workflow appends:
 Read the live issue or pull request with `gh` before acting. The event payload may
 be stale by the time you start.
 
-## Determine your role from the labels
+## Determine your role
 
 Read the item's current labels with `gh` and act on the first matching rule:
 
@@ -32,8 +32,13 @@ Read the item's current labels with `gh` and act on the first matching rule:
      review feedback and failing checks, and push the update.
 3. Both labels are present: do not change files. Leave one concise comment asking
    which role to use, then finish.
-4. Neither label is present: the label was removed after the event was delivered.
-   Do nothing and finish.
+4. Neither label is present:
+   - For a comment or review that mentions `@agent-serviceuser`, treat the
+     triggering text as the whole scope. Answer the question, make the requested
+     change, or perform the requested review. Do not take ownership of the
+     entire issue or pull request, and do not open a pull request unless the
+     triggering text explicitly asks for one.
+   - For a label event whose label is no longer present, do nothing and finish.
 
 For a comment or review, respond to that message only. Answer questions, make a
 requested change within your role, or review if asked. If it contains no request

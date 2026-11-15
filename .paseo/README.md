@@ -1,8 +1,9 @@
 # Paseo Hub GitHub agent
 
 These Hub workflows are the Paseo replacement for the GitHub Actions
-`Agent Serviceuser` pi agent. They run Codex with the DeepSeek provider
-(`deepseek-chat`) from GitHub events, gated by labels instead of assignees.
+`Agent Serviceuser` pi agent. They run Codex with the DeepSeek provider from
+GitHub events. Label events start the agent directly; comment and review events
+start it when their body mentions `@agent-serviceuser`.
 
 Hub refuses providers that cannot preapprove exact MCP tools for unattended
 execution, so Pi cannot be used here. Codex is enabled on the daemon with a
@@ -15,9 +16,12 @@ custom DeepSeek provider; see [Runtime setup](#runtime-setup).
 | `pi-agent-assignee` | The agent owns implementation: fix/implement an issue or continue a pull request. |
 | `pi-agent-reviewer` | The agent reviews a pull request only and does not change files. On an issue it replies with analysis only. |
 
-The labels are the new assignment mechanism. Adding a role label starts the agent;
-comment and review events only start it when the item already carries a role
-label. The two labels are intended to be mutually exclusive.
+The labels are the assignment mechanism for label events. Adding a role label
+starts the agent. Comments and reviews also start it when they mention
+`@agent-serviceuser`, even when the issue or pull request has no role label.
+When a role label is present it selects the role; otherwise the mention is
+handled as a scoped request. The two labels are intended to be mutually
+exclusive.
 
 ## Workflows
 
@@ -29,25 +33,23 @@ Label events:
 | `agent-serviceuser-assignee-pull-request-label.yml` | `github.pull_request_label_added` | `pi-agent-assignee` |
 | `agent-serviceuser-reviewer-pull-request-label.yml` | `github.pull_request_label_added` | `pi-agent-reviewer` |
 
-Comment and review events (each exists once for `assignee` and once for
-`reviewer`):
+Comment and review events:
 
-| Event | Required label |
+| Event | Trigger |
 | --- | --- |
-| `github.issue_comment_created` | `pi-agent-assignee` or `pi-agent-reviewer` |
-| `github.pull_request_comment_created` | `pi-agent-assignee` or `pi-agent-reviewer` |
-| `github.pull_request_review_comment` | `pi-agent-assignee` or `pi-agent-reviewer` |
-| `github.pull_request_review` | `pi-agent-assignee` or `pi-agent-reviewer` |
+| `github.issue_comment_created` | Body mentions `@agent-serviceuser` |
+| `github.pull_request_comment_created` | Body mentions `@agent-serviceuser` |
+| `github.pull_request_review_comment` | Body mentions `@agent-serviceuser` |
+| `github.pull_request_review` | Body mentions `@agent-serviceuser` |
 
-CI failures also start the assignee workflow. `.github/workflows/notify-paseo-on-ci-failure.yml`
+CI failures also start the agent. `.github/workflows/notify-paseo-on-ci-failure.yml`
 posts a pull-request comment from `github-actions[bot]` containing
 `@agent-serviceuser`. `agent-serviceuser-ci-failure.yml` matches only that bot
-comment, requires the `pi-agent-assignee` label, and resumes the same
-pull-request conversation.
+comment and resumes the same pull-request conversation.
 
-Hub filters cannot express "either label", so each human comment/review event
-has one workflow per label. Keep the labels mutually exclusive to avoid two runs
-on the same item.
+Hub filters cannot express "either label", so each label-added event has one
+workflow per label. Keep the labels mutually exclusive to avoid two runs on the
+same item.
 
 All workflows use the `nikwebr-github` connection and the `dev`
 environment from `hub.yml`. The shared prompt lives in `workflows/partials/`.
@@ -95,4 +97,4 @@ paseo hub deploy -p default
 
 The bundle uses the `nikwebr-github` connection, which has access to
 `nikwebr/react-native-s3-bg-uploader`. It is deployed to the `default` project
-with 12 workflows.
+with 8 workflows.

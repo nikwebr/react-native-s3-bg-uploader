@@ -47,13 +47,6 @@ jobs:
               return;
             }
 
-            if (!pullRequest.labels.some((label) => label.name === 'pi-agent-assignee')) {
-              core.info(
-                `Pull request #${pullRequest.number} does not have the pi-agent-assignee label.`
-              );
-              return;
-            }
-
             const marker = `<!-- paseo-ci-failure:${run.head_sha} -->`;
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
