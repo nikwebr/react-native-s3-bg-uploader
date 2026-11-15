@@ -1,11 +1,11 @@
-# Respond to a pull-request conversation comment only when pi-agent-reviewer is present.
-name: agent-serviceuser-reviewer-pull-request-comment
+# Respond to a pull-request conversation comment that mentions @agent-serviceuser.
+name: agent-serviceuser-pull-request-comment
 on: github.pull_request_comment_created
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: nikwebr-github
-  labels: [pi-agent-reviewer]
+  contains: "@agent-serviceuser"
   from_users: [nikwebr]
 steps:
   - id: respond

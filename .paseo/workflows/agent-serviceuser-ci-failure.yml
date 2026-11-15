@@ -5,7 +5,6 @@ max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: nikwebr-github
-  labels: [pi-agent-assignee]
   contains: "@agent-serviceuser"
   from_users: ["github-actions[bot]"]
 steps:

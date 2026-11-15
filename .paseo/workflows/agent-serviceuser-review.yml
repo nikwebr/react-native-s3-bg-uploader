@@ -1,11 +1,11 @@
-# Respond to a submitted review only when pi-agent-assignee is present.
-name: agent-serviceuser-assignee-review
+# Respond to a submitted review whose body mentions @agent-serviceuser.
+name: agent-serviceuser-review
 on: github.pull_request_review
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: nikwebr-github
-  labels: [pi-agent-assignee]
+  contains: "@agent-serviceuser"
   from_users: [nikwebr]
 steps:
   - id: respond

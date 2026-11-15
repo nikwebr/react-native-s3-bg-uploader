@@ -1,11 +1,11 @@
-# Respond to a changed-line review comment only when pi-agent-assignee is present.
-name: agent-serviceuser-assignee-review-comment
+# Respond to a changed-line review comment that mentions @agent-serviceuser.
+name: agent-serviceuser-review-comment
 on: github.pull_request_review_comment
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: nikwebr-github
-  labels: [pi-agent-assignee]
+  contains: "@agent-serviceuser"
   from_users: [nikwebr]
 steps:
   - id: respond
