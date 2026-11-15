@@ -233,7 +233,7 @@ impl BlockingPlatformAdapter for AndroidAdapter {
     ) -> Result<Box<dyn BlockingWorker>, String> {
         Ok(Box::new(AndroidWorker {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(300))
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .tcp_keepalive(std::time::Duration::from_secs(30))
                 .build()
