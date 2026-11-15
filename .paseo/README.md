@@ -40,7 +40,7 @@ Hub filters cannot express "either label", so each comment/review event has one
 workflow per label. Keep the labels mutually exclusive to avoid two runs on the
 same item.
 
-All workflows use the `agent-serviceuser-github` connection and the `dev`
+All workflows use the `nikwebr-github` connection and the `dev`
 environment from `hub.yml`. The shared prompt lives in `workflows/partials/`.
 
 ## Disabled GitHub Actions workflow
@@ -57,7 +57,7 @@ To re-enable it, move the lock file back to `.github/workflows/`, run
 `gh workflow enable "Agent Serviceuser"`, and remove the matching Hub workflows so
 the same item does not start both agents.
 
-## Deployment prerequisite
+## Deployment
 
 Deploy with:
 
@@ -65,13 +65,6 @@ Deploy with:
 paseo hub deploy -p default
 ```
 
-Hub currently rejects the bundle with:
-
-```
-filters.repo: "nikwebr/react-native-s3-bg-uploader" does not match any GitHub repository (connected: none)
-```
-
-The `agent-serviceuser-github` connection in Hub has no repositories. The repo
-owner (`nikwebr`) must install the Hub GitHub App on
-`nikwebr/react-native-s3-bg-uploader`, or grant that repository to the existing
-installation, before the bundle can be activated.
+The bundle uses the `nikwebr-github` connection, which has access to
+`nikwebr/react-native-s3-bg-uploader`. It is deployed to the `default` project
+with 11 workflows.

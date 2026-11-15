@@ -4,7 +4,7 @@ on: github.pull_request_label_added
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
-  connection: agent-serviceuser-github
+  connection: nikwebr-github
   label: pi-agent-reviewer
   from_users: [nikwebr]
 steps:
@@ -14,7 +14,7 @@ steps:
     idle_timeout: 10m
     agent: pi
     github:
-      connection: agent-serviceuser-github
+      connection: nikwebr-github
       repositories: [nikwebr/react-native-s3-bg-uploader]
       permissions:
         actions: read
