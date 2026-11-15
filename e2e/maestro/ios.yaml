@@ -8,5 +8,9 @@ appId: com.s3bguploaderexample
     timeout: 120000
 - tapOn: Fixture path
 - inputText: ${FIXTURE_PATH}
-- hideKeyboard
+# Maestro's hideKeyboard taps the middle of the screen on iOS, which lands on the
+# action buttons and can start another upload. The ScrollView's
+# keyboardShouldPersistTaps="handled" dismisses the keyboard when the inert title
+# is tapped, so do that instead.
+- tapOn: Uploader E2E
 - runFlow: shared/uploads.yaml

@@ -137,6 +137,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetConfig(
     start_upload_api: JString,
     get_upload_urls_api: JString,
     complete_api: JString,
+    cancel_api: JString,
     send_file_hash: jboolean,
 ) {
     ensure_store();
@@ -152,7 +153,12 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeSetConfig(
         .get_string(&complete_api)
         .map(|s| s.into())
         .unwrap_or_default();
-    crate::core::config::set_config(&s, &g, &c, send_file_hash != 0);
+    // Kotlin passes an empty string when the host did not configure a cancel endpoint.
+    let x: String = env
+        .get_string(&cancel_api)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    crate::core::config::set_config(&s, &g, &c, &x, send_file_hash != 0);
 }
 
 #[no_mangle]
@@ -411,7 +417,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelFile
             unsafe { libc::close(fd) };
         }
     }
-    session::cancel_file_by_hash(&hash);
+    crate::android::cancel_upload_jobs(session::cancel_file_by_hash(&hash));
 
     if !transfer_id.is_empty() {
         runtime::notify_cancelled_file(
@@ -451,7 +457,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelTran
             }
         }
     }
-    session::cancel_transfer(&t);
+    crate::android::cancel_upload_jobs(session::cancel_transfer(&t));
 }
 
 #[no_mangle]
@@ -460,7 +466,7 @@ pub extern "system" fn Java_com_s3bguploader_HybridS3BgUploader_nativeCancelAll(
     _class: JClass,
 ) {
     androidProgress::progress_manager().clear();
-    session::clear_session();
+    crate::android::cancel_upload_jobs(session::clear_session());
     // Close all saved failed fds so they are not re-enqueued on resume.
     let fds: Vec<RawFd> = crate::android::FAILED_FDS
         .lock()

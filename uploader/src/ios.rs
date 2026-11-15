@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, Once};
 use std::thread;
 
+use crate::core::api::ApiClient;
 use crate::core::encryption::ArcEncryptor;
 use crate::core::session::UploadState;
 use crate::core::upload::StartResult;
@@ -117,8 +118,10 @@ pub(super) fn initialize_and_enqueue(file_hash: &str, transfer_id: &str) -> Resu
     let still_active = session::session().pending_files.contains_key(file_hash);
     session::session().pending_files.remove(file_hash);
     if !still_active {
-        // Undo the session.files insertion made by start_and_register.
-        session::session().cancel_file(result.file_key());
+        // Undo the session.files insertion made by start_and_register. The file was
+        // cancelled while startUpload was in flight, so its multipart upload (which the
+        // backend just created) must be aborted too.
+        cancel_upload_jobs(session::session().cancel_file(result.file_key()));
         return Err("cancelled".to_string());
     }
     if result.should_upload() {
@@ -158,6 +161,40 @@ pub(crate) struct IosNetwork {
 pub(crate) fn init_nyquest() {
     INIT.call_once(|| {
         nyquest_backend_nsurlsession::register();
+    });
+}
+
+/// Send the best-effort `cancelUpload` requests for uploads that were just removed
+/// from the session while not completed. Cancelling stays synchronous: the requests
+/// run on their own thread and a failure only leaves an orphaned multipart upload for
+/// the backend's lifecycle rules to clean up.
+pub(crate) fn cancel_upload_jobs(jobs: Vec<session::CancelledUpload>) {
+    if jobs.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        init_nyquest();
+        let client = match nyquest::ClientBuilder::default()
+            .request_timeout(std::time::Duration::from_secs(30))
+            .build_blocking()
+        {
+            Ok(client) => client,
+            Err(e) => {
+                eprintln!("[S3BgUploader] cancelUpload client failed: {:?}", e);
+                return;
+            }
+        };
+        let api = NativeApiClient {
+            network: IosNetwork { client },
+        };
+        for job in jobs {
+            if let Err(e) = pollster::block_on(api.cancel_upload(&job.file_key, &job.upload_id)) {
+                eprintln!(
+                    "[S3BgUploader] cancelUpload failed for {}: {}",
+                    job.file_key, e
+                );
+            }
+        }
     });
 }
 
