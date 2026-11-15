@@ -162,6 +162,9 @@ if [[ "$maestro_status" != 0 ]]; then
     cp "$artifacts/junit.xml" "$artifacts/junit-startup-failure.xml"
     echo "ADB disconnected during initial launch; waiting before one startup retry"
     "$python" e2e/android_startup.py wait "${adb_args[@]}"
+    # Reverse tunnels belong to the ADB connection and are lost on disconnect.
+    "${adb_args[@]}" reverse tcp:8081 tcp:8080
+    "${adb_args[@]}" reverse tcp:8765 tcp:8765
     run_maestro
   else
     exit "$maestro_status"
