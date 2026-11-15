@@ -49,7 +49,7 @@ pub(super) fn run_upload(file_key: &str) {
     };
 
     let client = match nyquest::ClientBuilder::default()
-        .request_timeout(std::time::Duration::from_secs(300))
+        .request_timeout(std::time::Duration::from_secs(30))
         .build_blocking()
     {
         Ok(c) => c,
@@ -262,7 +262,7 @@ impl BlockingPlatformAdapter for IosAdapter {
         cancelled: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Box<dyn BlockingWorker>, String> {
         let client = nyquest::ClientBuilder::default()
-            .request_timeout(std::time::Duration::from_secs(300))
+            .request_timeout(std::time::Duration::from_secs(30))
             .build_blocking()
             .map_err(|e| format!("Failed to create client in worker thread: {:?}", e))?;
         Ok(Box::new(IosWorker {
