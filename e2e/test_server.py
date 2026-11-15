@@ -16,7 +16,7 @@ from moto.server import ThreadedMotoServer
 from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_encrypt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from server import Backend, BUCKET, FIXTURE, Handler, KEY, NONCE, PART_SIZE
+from server import Backend, BUCKET, FIXTURE, Handler, KEY, NONCE, PART_SIZE, UPLOAD_ATTEMPTS
 
 
 def encrypted_fixture(scheme="xchacha"):
@@ -89,7 +89,7 @@ class BackendTests(unittest.TestCase):
         for number, chunk in enumerate(chunks, 1):
             failed_part = 2 if mode == 'encrypted-network' else len(chunks)
             if mode.endswith('-network') and number == failed_part:
-                failures = 1 if mode == 'plain-network' else 5
+                failures = 1 if mode == 'plain-network' else UPLOAD_ATTEMPTS
                 for _ in range(failures):
                     with self.assertRaises(http.client.RemoteDisconnected):
                         urlopen(Request(urls[str(number)], data=chunk, method='PUT'), timeout=10)
@@ -136,6 +136,24 @@ class BackendTests(unittest.TestCase):
                     })
         self.backend.control("/completion-timing", {"mode": "plain", "completedAfterMs": 20000})
         self.assertEqual(self.backend.report()["plain"]["completedAfter100PercentMs"], 20000)
+
+    def test_reconnect_requires_the_uploaders_full_retry_exhaustion(self):
+        self.backend.start({"mode": "encrypted-network"})
+        upload = self.backend.upload("encrypted-network")
+        upload.blocked_part_cancelled.set()
+        upload.last_network_failure_at = time.monotonic()
+        body = {"mode": "encrypted-network", "before": {
+            "uploadedBytes": 0, "completedParts": 0,
+        }}
+        for failures in (*range(UPLOAD_ATTEMPTS), UPLOAD_ATTEMPTS + 1):
+            with self.subTest(failures=failures):
+                upload.network_failures = failures
+                with self.assertRaisesRegex(AssertionError, "Reconnect before retry exhaustion"):
+                    self.backend.control("/recover", body)
+                self.assertFalse(upload.recovered)
+        upload.network_failures = UPLOAD_ATTEMPTS
+        self.backend.control("/recover", body)
+        self.assertTrue(upload.recovered)
 
     def test_gate_blocks_parts_until_pause(self):
         started = self.backend.start({"mode": "plain"})

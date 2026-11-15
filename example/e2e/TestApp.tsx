@@ -3,6 +3,7 @@ import { Button, Platform, ScrollView, StyleSheet, Text, TextInput } from 'react
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
 import type { UploadProgress } from '../../src/specs/s3-bg-uploader.types';
 import { CompletionTiming, COMPLETION_TIMEOUT_MS } from './completionTiming';
+import { assertAggregateAcknowledged } from './networkProgress';
 
 // Public, deterministic test material only. Never used by the normal example.
 const KEY = '0123456789abcdef'.repeat(4);
@@ -108,7 +109,7 @@ export default function TestApp({ initializeEncryptor }: {
     if (Platform.OS === 'web') {
       const response = await fetch(`${BACKEND}/fixture`);
       if (!response.ok) throw new Error(`Fixture download: HTTP ${response.status}`);
-      file = new File([await response.blob()], 'fixture.bin');
+      file = new File([await response.arrayBuffer()], 'fixture.bin');
     } else if (!fixturePath) {
       throw new Error('Enter the fixture path provided by the E2E runner');
     }
@@ -241,11 +242,10 @@ export default function TestApp({ initializeEncryptor }: {
       while (latestProgress.current?.state !== state) {
         if (recoveryError.current) throw new Error(recoveryError.current);
         if (performance.now() > deadline) throw new Error(`Network recovery did not reach ${state}`);
-        const aggregate = await S3BgUploader.getAggregateProgress();
-        if (aggregate.percentage >= 100 && latestProgress.current &&
-            latestProgress.current.completedParts < latestProgress.current.totalParts) {
-          throw new Error('Aggregate reached 100% before acknowledgement');
-        }
+        await assertAggregateAcknowledged(
+          async () => S3BgUploader.getAggregateProgress(),
+          async () => (await S3BgUploader.getProgress(current.current!.mode, current.current!.hash))[0],
+        );
         await sleep(100);
       }
     };

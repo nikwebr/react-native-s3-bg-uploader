@@ -143,10 +143,29 @@ XML
       > "$artifacts/metro-warmup.log"
   fi
 fi
-"${maestro_args[@]}" \
-  "${test_args[@]}" \
-  --format junit --output "$artifacts/junit.xml" --test-output-dir "$artifacts/maestro" \
-  -e "APP_ID=$app_id" -e "FIXTURE_PATH=$fixture_path" \
-  "$flow"
+mkdir -p "$artifacts/maestro"
+maestro_artifacts="$(mktemp -d "$artifacts/maestro/run-XXXXXX")"
+run_maestro() {
+  "${maestro_args[@]}" \
+    "${test_args[@]}" \
+    --format junit --output "$artifacts/junit.xml" --test-output-dir "$maestro_artifacts" \
+    -e "APP_ID=$app_id" -e "FIXTURE_PATH=$fixture_path" \
+    "$flow"
+}
+maestro_status=0
+run_maestro || maestro_status=$?
+if [[ "$maestro_status" != 0 ]]; then
+  if [[ "$platform" == android ]] && "$python" e2e/android_startup.py check "$maestro_artifacts"; then
+    # ADB can disconnect while Maestro installs its driver on a cold emulator.
+    # The report must prove the initial launch failed before any UI action ran.
+    # Keep the first attempt's diagnostics, and retry with a fresh driver once.
+    cp "$artifacts/junit.xml" "$artifacts/junit-startup-failure.xml"
+    echo "ADB disconnected during initial launch; waiting before one startup retry"
+    "$python" e2e/android_startup.py wait "${adb_args[@]}"
+    run_maestro
+  else
+    exit "$maestro_status"
+  fi
+fi
 curl --fail --silent --show-error -X POST -H 'Content-Type: application/json' \
   -d '{}' http://127.0.0.1:8765/assert > "$artifacts/final-assertions.json"

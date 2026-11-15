@@ -7,6 +7,7 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 import select
 import socket
 from pathlib import Path
@@ -21,6 +22,11 @@ from botocore.config import Config
 from moto.server import ThreadedMotoServer
 
 ROOT = Path(__file__).resolve().parents[1]
+# Retry exhaustion is defined by the uploader, including changes to its policy.
+UPLOAD_ATTEMPTS = int(re.search(
+    r"pub const MAX_RETRIES: usize = (\d+);",
+    (ROOT / "uploader/src/core.rs").read_text(),
+).group(1))
 # Reserve the descriptor too, keeping encrypted intermediate parts >= S3's 5 MiB.
 PART_SIZE = 5 * 1024 * 1024 + 28
 # More than four parts (the uploader's concurrency), including a partial last part.
@@ -91,11 +97,7 @@ class Backend:
         self.s3.create_bucket(Bucket=BUCKET)
         self.uploads = {}
         self.lock = threading.Lock()
-        # Delay on the first simulated failure so the client has time to report
-        # in-flight progress before the connection is dropped.  5 s is enough to
-        # exercise the progress-reset logic without making the e2e test excessively
-        # slow (the old 25 s value pushed the encrypted-network test past its timeout).
-        self.network_failure_delay_secs = 5
+        self.network_failure_delay_secs = 25
 
     def upload(self, mode):
         require(mode in self.uploads, f"No upload for {mode}")
@@ -173,7 +175,7 @@ class Backend:
         upload = self.upload(mode)
         require(upload_id == upload.upload_id, "Completion used a new multipart ID")
         if upload.network_recovery:
-            expected_failures = 1 if mode == "plain-network" else 5
+            expected_failures = 1 if mode == "plain-network" else UPLOAD_ATTEMPTS
             require(upload.network_failures == expected_failures, "Missing real network failures")
             if mode == "encrypted-network":
                 require(upload.recovered, "Completion before reconnect/resume")
@@ -211,23 +213,16 @@ class Backend:
         if path == "/release":
             upload.released.set()
         elif path == "/recover":
-            require(upload.network_recovery and upload.network_failures == 5,
+            require(upload.network_recovery and upload.network_failures == UPLOAD_ATTEMPTS,
                     "Reconnect before retry exhaustion")
             require(upload.blocked_part_cancelled.wait(timeout=5),
                     "Uploader is still waiting for the old buffered request")
             snapshot = body.get("before")
             require(isinstance(snapshot, dict), "Missing failed progress snapshot")
             parts = self.s3.list_parts(Bucket=BUCKET, Key=upload.key, UploadId=upload.upload_id).get("Parts", [])
-            confirmed_bytes = sum(part["Size"] for part in parts)
-            confirmed_parts = len(parts)
-            # After network failure the uploader clears in-flight progress. It may
-            # show only the confirmed parts' bytes or reset to 0 (both are valid:
-            # the key requirement is that no unconfirmed in-flight bytes remain).
-            require(
-                (snapshot["uploadedBytes"] == confirmed_bytes or snapshot["uploadedBytes"] == 0)
-                and (snapshot["completedParts"] == confirmed_parts or snapshot["completedParts"] == 0),
-                "Failed progress includes unconfirmed in-flight bytes",
-            )
+            require(snapshot["uploadedBytes"] == sum(part["Size"] for part in parts)
+                    and snapshot["completedParts"] == len(parts),
+                    "Failed progress includes unconfirmed in-flight bytes")
             upload.failed_progress_after_ms = (time.monotonic() - upload.last_network_failure_at) * 1000
             require(upload.failed_progress_after_ms < 5000,
                     "Retry exhaustion waited for a stuck sibling request")
@@ -436,7 +431,7 @@ class Handler(BaseHTTPRequestHandler):
                 # A 25s black hole reproduces premature 100% before retry/failure.
                 if first_failure:
                     time.sleep(self.server.backend.network_failure_delay_secs)
-                if mode == "encrypted-network" and upload.network_failures == 5:
+                if mode == "encrypted-network" and upload.network_failures == UPLOAD_ATTEMPTS:
                     upload.last_network_failure_at = time.monotonic()
                 self.log_message("Dropping network connection for %s part %s", mode, part)
                 self.close_connection = True
