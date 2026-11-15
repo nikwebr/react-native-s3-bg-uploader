@@ -280,15 +280,27 @@ export default function TestApp({ initializeEncryptor }: {
   const cancelUpload = async () => {
     await prepare('cancel');
     // Part one completes without the pause gate; parts two and beyond are in flight.
-    const started = Date.now() + 60000;
-    while ((await snapshot()).completedParts < 1) {
-      if (Date.now() > started) throw new Error('Upload did not start before the cancel');
+    // `resume()` can return before startUpload answered, and a pending file is not
+    // reported by getProgress(fileHash): treat that transient absence as "not started"
+    // instead of a disappeared upload.
+    const deadline = Date.now() + 60000;
+    let started: UploadProgress | undefined;
+    while (Date.now() < deadline) {
+      try {
+        started = await snapshot();
+        if (started.completedParts >= 1) break;
+      } catch {
+        // hashing or startUpload still in flight
+      }
       await sleep(100);
+    }
+    if (!started || started.completedParts < 1) {
+      throw new Error('Upload did not start before the cancel');
     }
     S3BgUploader.cancel();
     // cancel() is synchronous and the cancelUpload request is best effort, so wait for
     // the backend to confirm that S3 dropped the multipart upload and its parts.
-    const deadline = Date.now() + 30000;
+    const abortDeadline = Date.now() + 30000;
     let lastError: unknown;
     for (;;) {
       try {
@@ -296,7 +308,7 @@ export default function TestApp({ initializeEncryptor }: {
         break;
       } catch (e: unknown) {
         lastError = e;
-        if (Date.now() > deadline) throw lastError;
+        if (Date.now() > abortDeadline) throw lastError;
         await sleep(200);
       }
     }
