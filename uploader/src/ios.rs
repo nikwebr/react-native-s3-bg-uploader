@@ -31,6 +31,11 @@ pub(crate) static QUEUE_SIGNAL: Condvar = Condvar::new();
 static WORKER_STARTED: Once = Once::new();
 pub(crate) static PAUSE_FLAG: AtomicBool = AtomicBool::new(false);
 
+/// Set to true when an upload has finished uploading all parts and is waiting for
+/// the multipart complete call to finish.  The iOS expiration handler checks this
+/// flag so it can wait for completion instead of pausing.
+pub(crate) static COMPLETING_UPLOAD: AtomicBool = AtomicBool::new(false);
+
 /// Phase 1: hash the file and pre-register it in the session (before start_api).
 /// Returns the file hash on success.
 pub(super) fn hash_and_pre_register(

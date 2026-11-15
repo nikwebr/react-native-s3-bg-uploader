@@ -311,6 +311,15 @@ pub struct Session {
     /// Not persisted.
     #[serde(skip)]
     pub files_needing_provision: HashSet<String>,
+    /// Live runs survive manual pause, but never survive process restoration.
+    #[serde(skip)]
+    pub active_runs: HashMap<String, ActiveRun>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveRun {
+    pub version: u64,
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Session {
@@ -325,6 +334,7 @@ impl Session {
             subtitle_template: String::new(),
             pending_files: HashMap::new(),
             files_needing_provision: HashSet::new(),
+            active_runs: HashMap::new(),
         }
     }
 
@@ -661,6 +671,7 @@ impl Session {
     // ------------------------------------------------------------------
 
     pub fn cancel_file(&mut self, file_key: &str) {
+        self.cancel_active_run(file_key);
         if let Some(entry) = self.files.remove(file_key) {
             self.hash_to_key.remove(&entry.file_hash);
             self.files_needing_provision.remove(&entry.file_hash);
@@ -675,6 +686,7 @@ impl Session {
         self.pending_files.remove(file_hash);
         self.files_needing_provision.remove(file_hash);
         if let Some(file_key) = self.hash_to_key.remove(file_hash) {
+            self.cancel_active_run(&file_key);
             self.files.remove(&file_key);
             for transfer in self.transfers.values_mut() {
                 transfer.file_keys.retain(|k| k != &file_key);
@@ -689,6 +701,7 @@ impl Session {
         if let Some(transfer) = self.transfers.get(transfer_id) {
             let keys: Vec<String> = transfer.file_keys.clone();
             for key in keys {
+                self.cancel_active_run(&key);
                 if let Some(entry) = self.files.remove(&key) {
                     self.hash_to_key.remove(&entry.file_hash);
                     self.files_needing_provision.remove(&entry.file_hash);
@@ -703,6 +716,11 @@ impl Session {
     }
 
     pub fn cancel_all(&mut self) {
+        for run in self.active_runs.values() {
+            run.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.active_runs.clear();
         self.files.clear();
         self.hash_to_key.clear();
         self.transfers.clear();
@@ -716,6 +734,32 @@ impl Session {
         for entry in self.files.values_mut() {
             if entry.state == UploadState::Running {
                 entry.state = UploadState::Paused;
+            }
+        }
+        self.recompute_global_state();
+    }
+
+    fn cancel_active_run(&mut self, file_key: &str) {
+        if let Some(run) = self.active_runs.remove(file_key) {
+            run.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn resume_all(&mut self) {
+        for entry in self.files.values_mut() {
+            if entry.state == UploadState::Paused || entry.state == UploadState::Failed {
+                let held = entry.state == UploadState::Paused
+                    && self.active_runs.get(&entry.file_key).is_some_and(|run| {
+                        run.version == entry.run_version
+                            && !run.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                    });
+                if held {
+                    entry.state = UploadState::Running;
+                } else {
+                    entry.run_version = entry.run_version.saturating_add(1);
+                    entry.state = UploadState::NotStarted;
+                }
             }
         }
         self.recompute_global_state();
@@ -999,16 +1043,7 @@ pub fn pause_all() {
 }
 
 pub fn resume_all() {
-    let file_keys: Vec<String> = session()
-        .files
-        .values()
-        .filter(|e| e.state == UploadState::Paused || e.state == UploadState::Failed)
-        .map(|e| e.file_key.clone())
-        .collect();
-    for key in &file_keys {
-        session().bump_run_version(key);
-        session().mark_file_state(key, UploadState::NotStarted);
-    }
+    session().resume_all();
     persist_session();
 }
 
@@ -1036,13 +1071,52 @@ pub fn set_storage_path(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_keeps_a_live_paused_run_but_restarts_restored_or_failed_runs() {
+        let mut sess = Session::new();
+        sess.register_file(
+            "key".into(),
+            "hash".into(),
+            "transfer".into(),
+            "file".into(),
+            "file".into(),
+            1000,
+            HashMap::new(),
+        );
+        sess.files.get_mut("key").unwrap().run_version = 7;
+        sess.mark_file_state("key", UploadState::Running);
+        sess.complete_chunk("key", 1, "etag".into(), 500);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        sess.active_runs.insert(
+            "key".into(),
+            ActiveRun {
+                version: 7,
+                cancelled: cancelled.clone(),
+            },
+        );
+        sess.pause_all();
+        let serialized = sess.to_json().unwrap();
+        assert_eq!(sess.files["key"].run_version, 7);
+        sess.resume_all();
+        assert_eq!(sess.files["key"].state, UploadState::Running);
+        assert_eq!(sess.files["key"].run_version, 7);
+        assert_eq!(sess.files["key"].uploaded_bytes, 500);
+        let mut restored = Session::from_json(&serialized).unwrap();
+        assert!(restored.active_runs.is_empty());
+        restored.resume_all();
+        assert_eq!(restored.files["key"].state, UploadState::NotStarted);
+        assert_eq!(restored.files["key"].run_version, 8);
+        sess.pause_all();
+        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        sess.resume_all();
+        assert_eq!(sess.files["key"].state, UploadState::NotStarted);
+        assert_eq!(sess.files["key"].run_version, 8);
+    }
     use crate::core::encryption::XChaCha20Poly1305Encryptor;
 
     fn encryptor() -> ArcEncryptor {
-        Arc::new(
-            XChaCha20Poly1305Encryptor::from_hex(&"ab".repeat(32), &"cd".repeat(24))
-                .unwrap(),
-        )
+        Arc::new(XChaCha20Poly1305Encryptor::from_hex(&"ab".repeat(32), &"cd".repeat(24)).unwrap())
     }
 
     fn restored_encrypted_session() -> Session {

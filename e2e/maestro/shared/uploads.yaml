@@ -16,3 +16,15 @@ appId: ${APP_ID}
     timeout: 30000
 - assertNotVisible: "E2E error:.*"
 - takeScreenshot: encrypted-verified
+- tapOn: Test network retry
+- extendedWaitUntil:
+    visible: plain network recovery verified
+    timeout: 120000
+- assertNotVisible: "E2E error:.*"
+- takeScreenshot: network-retry-verified
+- tapOn: Test network resume
+- extendedWaitUntil:
+    visible: encrypted network recovery verified
+    timeout: 120000
+- assertNotVisible: "E2E error:.*"
+- takeScreenshot: network-resume-verified

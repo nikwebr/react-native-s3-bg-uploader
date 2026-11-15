@@ -8,7 +8,7 @@ use crate::core::encryption::{self, XChaCha20Poly1305Encryptor};
 use crate::core::runtime;
 use crate::core::session::{self, register_store, UploadState};
 use crate::ios::progress as iosProgress;
-use crate::ios::{PAUSE_FLAG, QUEUE};
+use crate::ios::{COMPLETING_UPLOAD, PAUSE_FLAG, QUEUE};
 use crate::native::NativeSessionStore;
 
 fn ensure_store() {
@@ -247,7 +247,7 @@ pub extern "C" fn cancel_all() {
 #[no_mangle]
 pub extern "C" fn pause_all() {
     PAUSE_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
-    runtime::pause_all(iosProgress::progress_manager());
+    runtime::pause_all_preserving_progress(iosProgress::progress_manager());
 }
 
 #[no_mangle]
@@ -265,22 +265,15 @@ pub extern "C" fn resume_all() -> *mut c_char {
                 .unwrap_or(std::ptr::null_mut());
         }
     }
-    let resumed_keys: Vec<String> = {
-        let sess = session::session();
-        sess.files
-            .values()
-            .filter(|e| e.state == UploadState::Paused || e.state == UploadState::Failed)
-            .map(|e| e.file_key.clone())
-            .collect()
-    };
-    session::resume_all();
-    for key in &resumed_keys {
-        iosProgress::progress_manager().remove(key);
+    if let Err(message) = runtime::resume_all(iosProgress::progress_manager()) {
+        return CString::new(message)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut());
     }
     let mut queue = QUEUE.lock().unwrap();
     queue.pending.clear();
     queue.pending_keys.clear();
-    // Do not let the worker dequeue an old paused run before its version is reset.
+    // Restore held session/progress state before unblocking network workers.
     PAUSE_FLAG.store(false, std::sync::atomic::Ordering::Relaxed);
     drop(queue);
     let next_key = session::session().next_pending_file();
@@ -368,6 +361,14 @@ pub extern "C" fn get_global_state() -> *mut c_char {
     CString::new(state)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Returns true if an upload has finished uploading all parts and is waiting for
+/// the multipart complete call to finish. The iOS expiration handler uses this
+/// to wait for completion instead of pausing.
+#[no_mangle]
+pub extern "C" fn is_upload_completing() -> bool {
+    COMPLETING_UPLOAD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[no_mangle]

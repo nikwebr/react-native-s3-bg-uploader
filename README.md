@@ -321,6 +321,37 @@ Both upload modes must report `COMPLETED` within **20 seconds of the first
 later progress drops do not reset the deadline. The elapsed time is saved as
 `completedAfter100PercentMs` in the verification artifacts.
 
+The shared flow drops a plain upload's final PUT connection after reading its
+entire body, with a 25-second response black hole, and verifies automatic retry.
+The encrypted case exhausts retries for one part while another part's entire
+body has been received but its response is blocked. The uploader must cancel that
+blocked connection without waiting for a network timeout, reset failed progress
+to confirmed parts, and restart both unconfirmed parts on reconnect/`resume()`.
+Both recovered objects are independently downloaded and verified, including
+correct/wrong-key checks. Resuming after reconnect must complete within 20 seconds.
+
+Live progress includes bytes sent while running. Manual pause stops dispatching:
+no new parts are sent and acknowledgements/completion are deferred until resume,
+which continues in that same run and multipart ID.
+Native pause holds the in-flight PUTs instead of cancelling them. iOS suspends its
+NSURLSession tasks; Android gates further body reads. Native progress stays at its
+last sent byte count during pause and viable resume; only failed/restarted parts
+roll back when resume/retry determines that their requests cannot continue.
+A browser cannot suspend an XHR, so web pause aborts every part still in transfer.
+Web progress drops back to the confirmed parts, and `resume()` uploads the aborted
+parts again. Failed requests cannot be revived and still need retries; a failed
+upload or explicit cancel still aborts outstanding PUTs.
+Progress may decrease at a pause, failed request, or retry boundary. In-flight
+progress is capped at 99%, while confirmed parts retain their exact byte count
+even above 99%. Progress reaches 100% once all multipart PUTs are acknowledged
+by S3. `COMPLETED` still means the backend's multipart completion call has succeeded.
+Native snapshot delivery is serialized across concurrent part workers so older
+callbacks cannot arrive after newer progress; callbacks can still query progress.
+Held runs are in-memory only. After process termination, resume still requires
+re-providing local files/keys and restarts unconfirmed parts. Neither pausing nor
+holding guarantees a TCP connection will survive loss of connectivity or a server
+timeout, and it does not eliminate a storage-provider completion wait.
+
 Tests use a local Moto S3-compatible HTTP server and synthetic 31 MiB fixtures;
 no AWS credentials, external demo bucket, or Maestro Cloud subscription are
 needed. Encryption and uploading run through the real native/Rust or WASM
@@ -367,18 +398,23 @@ Before launching either iOS example, the runner requests its test bundle from
 Metro with a separate ten-minute preparation limit. This keeps cold JavaScript
 bundling outside the screen-readiness wait; failures stop the run explicitly.
 Preparation timing is retained in `metro-warmup.log`.
-The iOS workflow also runs a native regression that pauses or replaces an upload
-while its old network worker is blocked. The upload queue must return promptly
-and allow a resumed run to finish without waiting for that old request.
+The iOS workflow also verifies that manual pause retains a blocked run and resumes
+it without replacing its requests. Replacing/cancelling that run must still release
+the queue promptly rather than wait for the retired network worker. A native
+NSURLSession regression sends a PUT body once, suspends while its response arrives,
+and receives that original response only after resume. Shared E2E flows require
+that a native client does not re-upload the PUTs already received at the pause
+boundary, and that web re-uploads the parts its pause aborted.
 It also checks that native end-of-stream events expose `AtEnd` to their delegate,
 not the `Open` fallback produced when the stream buffer is still locked, and
 that EOF is delivered after the last buffered bytes are consumed.
 The test screen also reads current progress after obtaining the upload key, so a
 fast first-part callback emitted before the start call resolves is not lost.
 The pause check waits for progress to stop changing instead of sleeping a fixed
-time, because parts already in flight may finish after a pause and a slow runner
-would otherwise report those permitted completions as progress made while
-paused. Set `E2E_RELEASE_STAGGER_MS=1000` to make the backend answer those
+time, because on native parts already in flight may finish after a pause and a
+slow runner would otherwise report those permitted completions as progress made
+while paused. Web has no such allowance: an aborted part cannot land, so any
+completion after a web pause fails the run. Set `E2E_RELEASE_STAGGER_MS=1000` to make the backend answer those
 in-flight parts seconds apart and reproduce that timing locally.
 
 The same workflows also test `custom-encryption-example` with both plaintext and

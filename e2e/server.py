@@ -7,6 +7,9 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
+import select
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -19,6 +22,11 @@ from botocore.config import Config
 from moto.server import ThreadedMotoServer
 
 ROOT = Path(__file__).resolve().parents[1]
+# Retry exhaustion is defined by the uploader, including changes to its policy.
+UPLOAD_ATTEMPTS = int(re.search(
+    r"pub const MAX_RETRIES: usize = (\d+);",
+    (ROOT / "uploader/src/core.rs").read_text(),
+).group(1))
 # Reserve the descriptor too, keeping encrypted intermediate parts >= S3's 5 MiB.
 PART_SIZE = 5 * 1024 * 1024 + 28
 # More than four parts (the uploader's concurrency), including a partial last part.
@@ -53,6 +61,18 @@ class Upload:
     completed_after_ms: float | None = None
     # Size derived from the startUpload declaration (or the scheme default).
     declared_size: int = 0
+    network_recovery: bool = False
+    network_failures: int = 0
+    recovered: bool = False
+    blocked_part_started: threading.Event = field(default_factory=threading.Event)
+    blocked_part_cancelled: threading.Event = field(default_factory=threading.Event)
+    progress_reset_verified: bool = False
+    last_network_failure_at: float | None = None
+    failed_progress_after_ms: float | None = None
+    paused_put_requests: dict = field(default_factory=dict)
+    # Platform that reported the pause: web cannot suspend an XHR, so its pause
+    # cancels the in-flight parts instead of holding them across the pause.
+    paused_platform: str | None = None
 
 
 class Backend:
@@ -77,6 +97,7 @@ class Backend:
         self.s3.create_bucket(Bucket=BUCKET)
         self.uploads = {}
         self.lock = threading.Lock()
+        self.network_failure_delay_secs = 25
 
     def upload(self, mode):
         require(mode in self.uploads, f"No upload for {mode}")
@@ -84,13 +105,14 @@ class Backend:
 
     def start(self, body):
         mode = body["mode"]
-        require(mode in ("plain", "encrypted"), "Unknown encryption mode")
+        require(mode in ("plain", "encrypted", "plain-network", "encrypted-network"), "Unknown encryption mode")
+        encrypted = mode.startswith("encrypted")
         # Default expectations for callers that start an upload without a startUpload
         # body (the contract tests in e2e/test_server.py).
         effective_size = PART_SIZE - 16 - 28
         part_count = (len(FIXTURE) + effective_size - 1) // effective_size
         declared_size = len(FIXTURE)
-        if mode == "encrypted":
+        if encrypted:
             declared_size += part_count * 16 + 28
         if "fileSize" in body:
             # The uploader always reports the local, unencrypted size. For an
@@ -103,7 +125,7 @@ class Backend:
                 f"{len(FIXTURE)} for {mode} mode",
             )
             encryption = body.get("encryption")
-            if mode == "plain":
+            if not encrypted:
                 require(encryption is None, "Plain upload declared encryption parameters")
             else:
                 require(isinstance(encryption, dict),
@@ -131,6 +153,7 @@ class Backend:
             result = self.s3.create_multipart_upload(Bucket=BUCKET, Key=key)
             upload = Upload(key, result["UploadId"])
             upload.declared_size = declared_size
+            upload.network_recovery = mode.endswith("-network")
             self.uploads[mode] = upload
         return {"key": key, "uploadId": upload.upload_id, "partSize": PART_SIZE}
 
@@ -151,7 +174,26 @@ class Backend:
         _, _, upload_id, mode, _ = path.split("/")
         upload = self.upload(mode)
         require(upload_id == upload.upload_id, "Completion used a new multipart ID")
-        require(upload.paused and upload.resumed, "Completion without verified pause/resume")
+        if upload.network_recovery:
+            expected_failures = 1 if mode == "plain-network" else UPLOAD_ATTEMPTS
+            require(upload.network_failures == expected_failures, "Missing real network failures")
+            if mode == "encrypted-network":
+                require(upload.recovered, "Completion before reconnect/resume")
+                require(upload.blocked_part_cancelled.is_set(), "Old buffered PUT was not cancelled")
+                require(upload.progress_reset_verified, "Missing confirmed-only rollback evidence")
+                require(upload.put_requests[3] == 2, "Resume did not restart the cancelled part")
+        else:
+            require(upload.paused and upload.resumed, "Completion without verified pause/resume")
+            restarted = {part: upload.put_requests[part] - count
+                         for part, count in upload.paused_put_requests.items()}
+            if upload.paused_platform == "web":
+                # A browser cannot suspend a request, so the pause must cancel the
+                # parts still in transfer and the resume must upload them again.
+                require(any(count > 0 for count in restarted.values()),
+                        "Web pause left the parts in transfer running")
+            else:
+                require(all(count == 0 for count in restarted.values()),
+                        "Resume restarted a PUT that was held across pause")
         require(not upload.completed, "Duplicate completion")
         require(upload.requested[1] == 1, "Resume re-requested the completed first part")
         require(upload.put_requests[1] == 1, "Resume re-uploaded the completed first part")
@@ -170,6 +212,22 @@ class Backend:
         upload = self.upload(body["mode"])
         if path == "/release":
             upload.released.set()
+        elif path == "/recover":
+            require(upload.network_recovery and upload.network_failures == UPLOAD_ATTEMPTS,
+                    "Reconnect before retry exhaustion")
+            require(upload.blocked_part_cancelled.wait(timeout=5),
+                    "Uploader is still waiting for the old buffered request")
+            snapshot = body.get("before")
+            require(isinstance(snapshot, dict), "Missing failed progress snapshot")
+            parts = self.s3.list_parts(Bucket=BUCKET, Key=upload.key, UploadId=upload.upload_id).get("Parts", [])
+            require(snapshot["uploadedBytes"] == sum(part["Size"] for part in parts)
+                    and snapshot["completedParts"] == len(parts),
+                    "Failed progress includes unconfirmed in-flight bytes")
+            upload.failed_progress_after_ms = (time.monotonic() - upload.last_network_failure_at) * 1000
+            require(upload.failed_progress_after_ms < 5000,
+                    "Retry exhaustion waited for a stuck sibling request")
+            upload.progress_reset_verified = True
+            upload.recovered = True
         elif path == "/paused":
             require(not upload.completed, "Upload completed while paused")
             before, after = body["before"], body["after"]
@@ -177,6 +235,8 @@ class Backend:
             require(before["completedParts"] == after["completedParts"] and
                     before["uploadedBytes"] == after["uploadedBytes"], "Progress changed during pause")
             upload.paused = True
+            upload.paused_platform = body.get("platform")
+            upload.paused_put_requests = dict(upload.put_requests)
         elif path == "/resumed":
             require(upload.paused, "Resume without verified pause")
             upload.resumed = True
@@ -215,7 +275,7 @@ class Backend:
             downloaded = stream.read()
         input_path = self.artifacts / f"{mode}.download"
         input_path.write_bytes(downloaded)
-        if mode == "plain":
+        if mode.startswith("plain"):
             require(downloaded == FIXTURE, "Unencrypted download differs from original bytes")
             result = subprocess.run(self.decrypt_command(
                 KEY, input_path, self.artifacts / "plain.decrypted"), capture_output=True)
@@ -245,18 +305,28 @@ class Backend:
 
     def report(self, final=False):
         report = {mode: {
-            "scheme": self.scheme if mode == "encrypted" else "plain",
+            "scheme": self.scheme if mode.startswith("encrypted") else "plain",
             "paused": upload.paused, "resumed": upload.resumed,
             "completed": upload.completed, "verified": upload.verified,
             "completedAfter100PercentMs": upload.completed_after_ms,
             "partUrlRequests": dict(upload.requested),
             "partPutRequests": dict(upload.put_requests),
+            "networkFailures": upload.network_failures,
+            "recovered": upload.recovered,
+            "bufferedRequestCancelled": upload.blocked_part_cancelled.is_set(),
+            "progressResetVerified": upload.progress_reset_verified,
+            "failedProgressAfterLastNetworkErrorMs": upload.failed_progress_after_ms,
+            "heldPutRequests": upload.paused_put_requests,
         } for mode, upload in self.uploads.items()}
         (self.artifacts / "verification.json").write_text(json.dumps(report, indent=2))
         if final:
-            require(set(report) == {"plain", "encrypted"}, "Both upload modes must run")
+            require(set(report) == {"plain", "encrypted", "plain-network", "encrypted-network"},
+                    "Both upload modes and network recovery scenarios must run")
             require(all(u["verified"] and u["paused"] and u["resumed"] and u["completed"]
-                        for u in report.values()), "Missing upload/download/pause/resume evidence")
+                        for mode, u in report.items() if not mode.endswith("-network")),
+                    "Missing upload/download/pause/resume evidence")
+            require(all(u["verified"] and u["completed"] for u in report.values()),
+                    "Missing network recovery/download evidence")
             require(all(u["completedAfter100PercentMs"] is not None for u in report.values()),
                     "Missing 100%-to-completion timing evidence")
         return report
@@ -325,8 +395,54 @@ class Handler(BaseHTTPRequestHandler):
         with self.server.backend.lock:
             upload.put_requests.update([part])
         data = self.rfile.read(int(self.headers["Content-Length"]))
+        if upload.network_recovery:
+            part_count = (upload.declared_size + PART_SIZE - 1) // PART_SIZE
+            with self.server.backend.lock:
+                fail = (
+                    (mode == "plain-network" and upload.network_failures < 1) or
+                    (mode == "encrypted-network" and not upload.recovered)
+                ) and part == (part_count if mode == "plain-network" else 2)
+                blocked = mode == "encrypted-network" and part == 3 and upload.put_requests[3] == 1
+                if fail:
+                    upload.network_failures += 1
+                    first_failure = upload.network_failures == 1
+                    upload.last_network_failure_at = time.monotonic()
+            if blocked:
+                # The entire body has been buffered, so a ProgressReader pause
+                # check is no longer sufficient. Require actual socket cancellation
+                # without releasing this request or waiting for its 300s timeout.
+                upload.blocked_part_started.set()
+                deadline = time.monotonic() + 120
+                while time.monotonic() < deadline:
+                    readable, _, _ = select.select([self.connection], [], [], 0.1)
+                    if readable:
+                        try:
+                            closed = not self.connection.recv(1, socket.MSG_PEEK)
+                        except (ConnectionResetError, OSError):
+                            closed = True
+                        if closed:
+                            upload.blocked_part_cancelled.set()
+                            self.close_connection = True
+                            return
+                self.reply(504, b'{"error":"Buffered request was never cancelled"}')
+                return
+            if fail:
+                # Receive the entire final request, but never forward it to S3.
+                # A 25s black hole reproduces premature 100% before retry/failure.
+                if first_failure:
+                    time.sleep(self.server.backend.network_failure_delay_secs)
+                if mode == "encrypted-network" and upload.network_failures == UPLOAD_ATTEMPTS:
+                    upload.last_network_failure_at = time.monotonic()
+                self.log_message("Dropping network connection for %s part %s", mode, part)
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+                return
         # Part one completes normally; all other PUTs wait until the app pauses.
-        if part != 1:
+        if part != 1 and not upload.network_recovery:
             if not upload.released.wait(timeout=120):
                 self.reply(504, b'{"error":"Timed out waiting for pause"}')
                 return

@@ -2,18 +2,21 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
+import http.client
+import socket
 import struct
 import tempfile
 import threading
 import time
 import unittest
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 from moto.server import ThreadedMotoServer
 from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_encrypt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from server import Backend, BUCKET, FIXTURE, Handler, KEY, NONCE, PART_SIZE
+from server import Backend, BUCKET, FIXTURE, Handler, KEY, NONCE, PART_SIZE, UPLOAD_ATTEMPTS
 
 
 def encrypted_fixture(scheme="xchacha"):
@@ -54,6 +57,7 @@ class BackendTests(unittest.TestCase):
             scheme=self.scheme,
         )
         self.server.backend = self.backend
+        self.backend.network_failure_delay_secs = 0
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
 
@@ -71,10 +75,32 @@ class BackendTests(unittest.TestCase):
         urls = self.backend.urls({**started, "parts": list(range(1, len(chunks) + 1))})["urls"]
         self.backend.control("/release", {"mode": mode})
         snapshot = {"completedParts": 1, "totalParts": len(chunks), "uploadedBytes": PART_SIZE}
-        self.backend.control("/paused", {"mode": mode, "before": snapshot, "after": snapshot})
+        self.backend.control("/paused", {
+            "mode": mode, "platform": "ios", "before": snapshot, "after": snapshot,
+        })
         self.backend.control("/resumed", {"mode": mode})
         parts = []
+        buffered = None
+        if mode == 'encrypted-network':
+            parsed = urlsplit(urls['3'])
+            buffered = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+            buffered.request('PUT', parsed.path + '?' + parsed.query, body=chunks[2])
+            self.assertTrue(self.backend.upload(mode).blocked_part_started.wait(timeout=5))
         for number, chunk in enumerate(chunks, 1):
+            failed_part = 2 if mode == 'encrypted-network' else len(chunks)
+            if mode.endswith('-network') and number == failed_part:
+                failures = 1 if mode == 'plain-network' else UPLOAD_ATTEMPTS
+                for _ in range(failures):
+                    with self.assertRaises(http.client.RemoteDisconnected):
+                        urlopen(Request(urls[str(number)], data=chunk, method='PUT'), timeout=10)
+                if mode == 'encrypted-network':
+                    buffered.sock.shutdown(socket.SHUT_RDWR)
+                    buffered.close()
+                    confirmed = self.backend.s3.list_parts(Bucket=BUCKET, Key=started['key'], UploadId=started['uploadId']).get('Parts', [])
+                    self.backend.control('/recover', {'mode': mode, 'before': {
+                        'uploadedBytes': sum(part['Size'] for part in confirmed),
+                        'completedParts': len(confirmed),
+                    }})
             with urlopen(Request(urls[str(number)], data=chunk, method="PUT"), timeout=10) as result:
                 parts.append({"PartNumber": number, "ETag": result.headers["ETag"]})
         self.backend.complete(f"/complete/{started['uploadId']}/{started['key']}", {"parts": parts})
@@ -86,9 +112,13 @@ class BackendTests(unittest.TestCase):
         self.backend.verify("plain")
         self.upload("encrypted", encrypted_fixture(self.scheme))
         self.backend.verify("encrypted")
+        self.upload('plain-network', chunks)
+        self.backend.verify('plain-network')
+        self.upload('encrypted-network', encrypted_fixture(self.scheme))
+        self.backend.verify('encrypted-network')
         with self.assertRaisesRegex(AssertionError, "Missing 100%-to-completion"):
             self.backend.report(final=True)
-        for mode in ("plain", "encrypted"):
+        for mode in ("plain", "encrypted", "plain-network", "encrypted-network"):
             self.backend.control("/completion-timing", {"mode": mode, "completedAfterMs": 20000})
         self.backend.report(final=True)
 
@@ -106,6 +136,24 @@ class BackendTests(unittest.TestCase):
                     })
         self.backend.control("/completion-timing", {"mode": "plain", "completedAfterMs": 20000})
         self.assertEqual(self.backend.report()["plain"]["completedAfter100PercentMs"], 20000)
+
+    def test_reconnect_requires_the_uploaders_full_retry_exhaustion(self):
+        self.backend.start({"mode": "encrypted-network"})
+        upload = self.backend.upload("encrypted-network")
+        upload.blocked_part_cancelled.set()
+        upload.last_network_failure_at = time.monotonic()
+        body = {"mode": "encrypted-network", "before": {
+            "uploadedBytes": 0, "completedParts": 0,
+        }}
+        for failures in (*range(UPLOAD_ATTEMPTS), UPLOAD_ATTEMPTS + 1):
+            with self.subTest(failures=failures):
+                upload.network_failures = failures
+                with self.assertRaisesRegex(AssertionError, "Reconnect before retry exhaustion"):
+                    self.backend.control("/recover", body)
+                self.assertFalse(upload.recovered)
+        upload.network_failures = UPLOAD_ATTEMPTS
+        self.backend.control("/recover", body)
+        self.assertTrue(upload.recovered)
 
     def test_gate_blocks_parts_until_pause(self):
         started = self.backend.start({"mode": "plain"})
@@ -166,6 +214,60 @@ class BackendTests(unittest.TestCase):
             self.backend.control("/paused", {"mode": "plain", "before": before, "after": after})
         with self.assertRaisesRegex(AssertionError, "second multipart"):
             self.backend.start({"mode": "plain"})
+
+    def paused_upload(self, platform, restart_held):
+        """Pause with a part still on the wire, then complete the upload.
+
+        `restart_held` models the platform's pause contract: a browser aborts the
+        request and uploads the part again after resume, a native client holds the
+        request and must not send it twice.
+        """
+        mode = "plain"
+        chunks = [FIXTURE[start:start + PART_SIZE] for start in range(0, len(FIXTURE), PART_SIZE)]
+        started = self.backend.start({"mode": mode})
+        urls = self.backend.urls({**started, "parts": list(range(1, len(chunks) + 1))})["urls"]
+        with urlopen(Request(urls["1"], data=chunks[0], method="PUT"), timeout=10) as result:
+            parts = [{"PartNumber": 1, "ETag": result.headers["ETag"]}]
+        upload = self.backend.upload(mode)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            # Part 2 is on the wire and blocked at the gate when the pause arrives.
+            def hold():
+                with urlopen(Request(urls["2"], data=chunks[1], method="PUT"), timeout=20) as result:
+                    return result.headers["ETag"]
+            held = pool.submit(hold)
+            deadline = time.monotonic() + 10
+            while upload.put_requests[2] < 1:
+                self.assertLess(time.monotonic(), deadline, "Part 2 never reached the server")
+                time.sleep(0.05)
+            snapshot = {"completedParts": 1, "totalParts": len(chunks), "uploadedBytes": PART_SIZE}
+            self.backend.control("/paused", {
+                "mode": mode, "platform": platform, "before": snapshot, "after": snapshot,
+            })
+            self.backend.control("/release", {"mode": mode})
+            self.backend.control("/resumed", {"mode": mode})
+            held_etag = held.result(timeout=10)
+        if not restart_held:
+            parts.append({"PartNumber": 2, "ETag": held_etag})
+        for number, chunk in enumerate(chunks[1:], 2):
+            if number == 2 and not restart_held:
+                continue
+            with urlopen(Request(urls[str(number)], data=chunk, method="PUT"), timeout=10) as result:
+                parts.append({"PartNumber": number, "ETag": result.headers["ETag"]})
+        self.backend.complete(f"/complete/{started['uploadId']}/{started['key']}", {"parts": parts})
+
+    def test_web_pause_must_restart_the_parts_in_transfer(self):
+        self.paused_upload("web", restart_held=True)
+
+    def test_web_pause_that_keeps_the_parts_running_fails(self):
+        with self.assertRaisesRegex(AssertionError, "Web pause left the parts in transfer running"):
+            self.paused_upload("web", restart_held=False)
+
+    def test_native_pause_must_not_restart_a_held_part(self):
+        self.paused_upload("ios", restart_held=False)
+
+    def test_native_pause_that_restarts_a_held_part_fails(self):
+        with self.assertRaisesRegex(AssertionError, "Resume restarted a PUT that was held across pause"):
+            self.paused_upload("ios", restart_held=True)
 
 
 class CustomBackendTests(BackendTests):

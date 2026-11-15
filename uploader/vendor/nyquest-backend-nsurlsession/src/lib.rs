@@ -31,6 +31,9 @@ cfg_if::cfg_if! {
 #[derive(Clone)]
 pub struct NSUrlSessionBackend;
 
+#[cfg(all(target_vendor = "apple", feature = "blocking"))]
+pub use blocking::{with_request_cancellation, with_request_control};
+
 #[cfg(target_vendor = "apple")]
 /// Registers [`NSUrlSessionBackend`] as global default.
 pub fn register() {

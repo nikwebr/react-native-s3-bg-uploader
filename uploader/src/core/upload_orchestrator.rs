@@ -27,6 +27,10 @@ pub trait UploadBackend {
         true
     }
 
+    async fn wait_until_resumed(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn encryption_config(&self) -> Option<&ArcEncryptor> {
         None
     }
@@ -70,14 +74,38 @@ pub trait UploadBackend {
     ) -> Result<(), String>;
 
     fn on_session_completed(&self) {}
+
+    /// Called before the multipart complete request so the platform can signal
+    /// that the upload is in its final completion phase.  The iOS expiration
+    /// handler uses this to wait for completion instead of pausing.
+    fn on_enter_completion(&self) {}
+
+    /// Called after the multipart complete request (success or failure).
+    fn on_exit_completion(&self) {}
 }
 
 pub async fn run_upload<B: UploadBackend>(backend: &B) -> UploadOutcome {
     let file_key = backend.file_key().to_string();
-
-    runtime::mark_state_persist(&file_key, UploadState::Running);
-
-    let outcome = run_upload_inner(backend).await;
+    let run = runtime::begin_run(&file_key);
+    runtime::mark_state_persist(
+        &file_key,
+        if backend.is_paused() {
+            UploadState::Paused
+        } else {
+            UploadState::Running
+        },
+    );
+    let mut outcome = run_upload_inner(backend).await;
+    if !backend.is_current_run() {
+        outcome = UploadOutcome::Paused;
+    }
+    if matches!(outcome, UploadOutcome::Failed(_)) {
+        run.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if backend.is_paused() && backend.wait_until_resumed().await.is_err() {
+        outcome = UploadOutcome::Paused;
+    }
 
     match &outcome {
         UploadOutcome::Completed => {
@@ -144,7 +172,8 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
     if prepared.remaining_parts.is_empty() {
         let all_completed =
             upload::combine_upload_results(prepared.completed_etags.clone(), Vec::new());
-        return match backend
+        backend.on_enter_completion();
+        let outcome = match backend
             .complete_upload(&prepared.upload_id, all_completed)
             .await
         {
@@ -152,6 +181,8 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
             Err(e) if e.contains("stale run") => UploadOutcome::Paused,
             Err(e) => UploadOutcome::Failed(e),
         };
+        backend.on_exit_completion();
+        return outcome;
     }
 
     runtime::init_progress(
@@ -188,14 +219,17 @@ async fn run_upload_inner<B: UploadBackend>(backend: &B) -> UploadOutcome {
     if !backend.is_current_run() {
         return UploadOutcome::Paused;
     }
-    match backend
+    backend.on_enter_completion();
+    let outcome = match backend
         .complete_upload(&prepared.upload_id, all_results)
         .await
     {
         Ok(_) => UploadOutcome::Completed,
         Err(e) if e.contains("stale run") => UploadOutcome::Paused,
         Err(e) => UploadOutcome::Failed(e),
-    }
+    };
+    backend.on_exit_completion();
+    outcome
 }
 
 #[cfg(not(target_arch = "wasm32"))]

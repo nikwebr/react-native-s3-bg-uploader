@@ -3,6 +3,7 @@ import { Button, Platform, ScrollView, StyleSheet, Text, TextInput } from 'react
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
 import type { UploadProgress } from '../../src/specs/s3-bg-uploader.types';
 import { CompletionTiming, COMPLETION_TIMEOUT_MS } from './completionTiming';
+import { assertAggregateAcknowledged } from './networkProgress';
 
 // Public, deterministic test material only. Never used by the normal example.
 const KEY = '0123456789abcdef'.repeat(4);
@@ -33,11 +34,22 @@ export default function TestApp({ initializeEncryptor }: {
   const current = useRef<{ hash: string; mode: string } | undefined>(undefined);
   const completionTiming = useRef(new CompletionTiming());
   const completionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const latestProgress = useRef<UploadProgress | undefined>(undefined);
+  const recoveryError = useRef('');
 
   const onProgress = useCallback((file: UploadProgress) => {
     if (file.fileHash !== current.current?.hash || file.transferId !== current.current?.mode) return;
     setProgress({ ...file });
-    if (file.state === 'FAILED') setError(`Upload failed: ${file.fileName}`);
+    if (current.current.mode.endsWith('-network')) {
+      if (file.percentage >= 100 && file.completedParts < file.totalParts) {
+        recoveryError.current = '100% reported before S3 acknowledged every part';
+      }
+      if (recoveryError.current) setError(recoveryError.current);
+    }
+    latestProgress.current = { ...file };
+    if (file.state === 'FAILED' && current.current.mode !== 'encrypted-network') {
+      setError(`Upload failed: ${file.fileName}`);
+    }
     const timing = completionTiming.current;
     try {
       timing.observe(file, performance.now());
@@ -79,11 +91,13 @@ export default function TestApp({ initializeEncryptor }: {
     }
   };
 
-  const prepare = async (mode: 'plain' | 'encrypted') => {
+  const prepare = async (mode: 'plain' | 'encrypted', network = false) => {
     clearTimeout(completionTimer.current);
     completionTimer.current = undefined;
     completionTiming.current = new CompletionTiming();
     current.current = undefined;
+    latestProgress.current = undefined;
+    recoveryError.current = '';
     setCompletionAfterMs(undefined);
     await initializeEncryptor?.();
     S3BgUploader.cancel();
@@ -95,18 +109,19 @@ export default function TestApp({ initializeEncryptor }: {
     if (Platform.OS === 'web') {
       const response = await fetch(`${BACKEND}/fixture`);
       if (!response.ok) throw new Error(`Fixture download: HTTP ${response.status}`);
-      file = new File([await response.blob()], 'fixture.bin');
+      file = new File([await response.arrayBuffer()], 'fixture.bin');
     } else if (!fixturePath) {
       throw new Error('Enter the fixture path provided by the E2E runner');
     }
+    const transfer = network ? `${mode}-network` : mode;
     const hash = mode === 'encrypted'
-      ? await S3BgUploader.encryptAndUploadFile(file, mode, KEY, NONCE, { mode })
-      : await S3BgUploader.uploadFile(file, mode, { mode });
-    current.current = { hash, mode };
+      ? await S3BgUploader.encryptAndUploadFile(file, transfer, KEY, NONCE, { mode: transfer })
+      : await S3BgUploader.uploadFile(file, transfer, { mode: transfer });
+    current.current = { hash, mode: transfer };
     setStatus(`${mode} queued`);
     await S3BgUploader.resume();
     // Native uploads can emit progress before uploadFile resolves with their key.
-    for (const fileProgress of await S3BgUploader.getProgress(mode, hash)) {
+    for (const fileProgress of await S3BgUploader.getProgress(transfer, hash)) {
       onProgress(fileProgress);
     }
     setStatus('Upload started');
@@ -120,9 +135,11 @@ export default function TestApp({ initializeEncryptor }: {
     return file;
   };
 
-  // Parts already sent when pause arrives are allowed to finish. Wait until progress
-  // has been unchanged for a full window, so a slow runner cannot report those
-  // permitted completions as progress that happened "while paused".
+  // Native parts already sent when pause arrives are allowed to finish. Wait until
+  // progress has been unchanged for a full window, so a slow runner cannot report
+  // those permitted completions as progress that happened "while paused".
+  // Web cannot suspend a request: its pause cancels the in-flight parts, so nothing
+  // may land at all (checked below).
   // A no-op pause keeps dispatching, so the quiet window can then never be reached
   // before the deadline: the check still fails if pause does not actually stop work.
   const SETTLE_QUIET_MS = 5000;
@@ -150,6 +167,7 @@ export default function TestApp({ initializeEncryptor }: {
   };
 
   const pause = async () => {
+    const beforePause = await snapshot();
     S3BgUploader.pause();
     const deadline = Date.now() + 10000;
     while ((await S3BgUploader.getAggregateProgress()).state !== 'PAUSED') {
@@ -157,6 +175,9 @@ export default function TestApp({ initializeEncryptor }: {
       await sleep(100);
     }
     const initial = await snapshot();
+    if (Platform.OS !== 'web' && initial.uploadedBytes < beforePause.uploadedBytes) {
+      throw new Error('Native pause discarded progress of a held request');
+    }
     if (initial.completedParts < 1 || initial.completedParts >= initial.totalParts) {
       throw new Error('Pause must occur after a completed part and before completion');
     }
@@ -180,6 +201,11 @@ export default function TestApp({ initializeEncryptor }: {
     if (before.completedParts >= before.totalParts) {
       throw new Error('All parts uploaded while paused');
     }
+    if (Platform.OS === 'web' && before.completedParts !== initial.completedParts) {
+      // Browsers cannot suspend a request, so a pause must cancel the parts still
+      // in transfer instead of letting them land once the server gate opens.
+      throw new Error('Web pause left an in-flight part running');
+    }
     if (after.completedParts !== before.completedParts ||
         after.uploadedBytes !== before.uploadedBytes) {
       throw new Error('Upload advanced while paused');
@@ -187,14 +213,62 @@ export default function TestApp({ initializeEncryptor }: {
     if ((await S3BgUploader.getAggregateProgress()).state !== 'PAUSED') {
       throw new Error('Uploader left PAUSED while paused');
     }
-    await api('/paused', { mode: current.current?.mode, before, after });
+    await api('/paused', {
+      mode: current.current?.mode,
+      platform: Platform.OS,
+      before,
+      after,
+    });
     setStatus('Pause verified');
   };
 
   const resume = async () => {
+    const before = await snapshot();
     await api('/resumed', { mode: current.current?.mode });
     await S3BgUploader.resume();
+    if (Platform.OS !== 'web' && current.current) {
+      const after = (await S3BgUploader.getProgress(current.current.mode, current.current.hash))[0];
+      if (after && after.uploadedBytes < before.uploadedBytes) {
+        throw new Error('Native resume discarded progress of a viable held request');
+      }
+    }
     setStatus('Resume requested');
+  };
+
+  const networkRecovery = async (mode: 'plain' | 'encrypted') => {
+    await prepare(mode, true);
+    const waitForState = async (state: string, timeout: number) => {
+      const deadline = performance.now() + timeout;
+      while (latestProgress.current?.state !== state) {
+        if (recoveryError.current) throw new Error(recoveryError.current);
+        if (performance.now() > deadline) throw new Error(`Network recovery did not reach ${state}`);
+        await assertAggregateAcknowledged(
+          async () => S3BgUploader.getAggregateProgress(),
+          async () => (await S3BgUploader.getProgress(current.current!.mode, current.current!.hash))[0],
+        );
+        await sleep(100);
+      }
+    };
+    if (mode === 'encrypted') {
+      await waitForState('FAILED', 90000);
+      const before = await snapshot();
+      const after = await snapshot();
+      if (before.uploadedBytes !== after.uploadedBytes) {
+        throw new Error('Failed progress did not settle at confirmed parts');
+      }
+      await api('/recover', { mode: current.current?.mode, before });
+      await S3BgUploader.resume();
+      await waitForState('COMPLETED', 20000);
+    } else {
+      await waitForState('COMPLETED', 90000);
+    }
+    if (recoveryError.current) throw new Error(recoveryError.current);
+    await api('/completion-timing', {
+      mode: current.current?.mode,
+      completedAfterMs: completionTiming.current.assertComplete(),
+    });
+    await api('/verify', { mode: current.current?.mode });
+    setStatus(`${mode} network recovery verified`);
   };
 
   const verify = async () => {
@@ -235,6 +309,8 @@ export default function TestApp({ initializeEncryptor }: {
       <Button title="Pause upload" disabled={busy} onPress={() => run(pause)} />
       <Button title="Resume upload" disabled={busy} onPress={() => run(resume)} />
       <Button title="Verify download" disabled={busy} onPress={() => run(verify)} />
+      <Button title="Test network retry" disabled={busy} onPress={() => run(() => networkRecovery('plain'))} />
+      <Button title="Test network resume" disabled={busy} onPress={() => run(() => networkRecovery('encrypted'))} />
       <Text>{status}</Text>
       <Text>{progress?.state === 'COMPLETED'
         ? 'Upload completed'

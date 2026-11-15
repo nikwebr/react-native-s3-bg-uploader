@@ -1,5 +1,15 @@
 # Local patches to nyquest-backend-nsurlsession 0.3.1
 
+## blocking.rs — cancellation while waiting for response headers
+
+`with_request_control` installs thread-scoped cancellation and pause predicates.
+It suspends/resumes the existing NSURLSession task during manual pause, retaining
+its body stream, and applies the same gate while consuming response bodies.
+Explicit cancellation, replacement or sibling failure still calls `task.cancel()`.
+The request loop checks control at most every 20ms, including after the full body
+has been sent. `with_request_cancellation` remains available for cancel-only callers.
+Ordinary requests without scoped control retain upstream blocking behavior.
+
 ## blocking.rs — explicit task.cancel() on stream body error
 
 **File:** `src/blocking.rs`, in `NSUrlSessionBlockingClient::request()`
