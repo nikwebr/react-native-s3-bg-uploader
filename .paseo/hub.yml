@@ -13,5 +13,5 @@ environments:
 agents:
   codex:
     provider: codex
-    model: deepseek-chat
+    model: deepseek-flash
     mode: full-access

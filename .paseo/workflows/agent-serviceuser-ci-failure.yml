@@ -1,14 +1,14 @@
-# Respond to a changed-line review comment only when pi-agent-assignee is present.
-name: agent-serviceuser-assignee-review-comment
-on: github.pull_request_review_comment
+# Fix CI failures reported by the GitHub Actions failure-comment bridge.
+name: agent-serviceuser-ci-failure
+on: github.pull_request_comment_created
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: nikwebr-github
-  labels: [pi-agent-assignee]
-  from_users: [nikwebr]
+  contains: "@agent-serviceuser"
+  from_users: ["github-actions[bot]"]
 steps:
-  - id: respond
+  - id: fix
     environment: dev
     max_runtime: 45m
     idle_timeout: 10m
@@ -16,6 +16,10 @@ steps:
     prompt:
       - include: partials/agent-serviceuser.md
       - text: |
+          This comment was posted automatically because CI failed on this pull
+          request. Treat it as a request to fix the failing checks and continue
+          the existing pull-request work.
+
           <event-context>
           ${{ paseo.context }}
           </event-context>

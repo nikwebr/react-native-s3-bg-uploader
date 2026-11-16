@@ -1,11 +1,11 @@
-# Respond to an issue comment only when pi-agent-reviewer is present.
-name: agent-serviceuser-reviewer-issue-comment
-on: github.issue_comment_created
+# Respond to a submitted review whose body mentions @agent-serviceuser.
+name: agent-serviceuser-review
+on: github.pull_request_review
 max_runtime: 2h
 filters:
   repo: nikwebr/react-native-s3-bg-uploader
   connection: nikwebr-github
-  labels: [pi-agent-reviewer]
+  contains: "@agent-serviceuser"
   from_users: [nikwebr]
 steps:
   - id: respond
