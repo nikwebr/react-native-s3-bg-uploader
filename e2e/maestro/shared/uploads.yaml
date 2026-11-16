@@ -16,6 +16,12 @@ appId: ${APP_ID}
     timeout: 30000
 - assertNotVisible: "E2E error:.*"
 - takeScreenshot: encrypted-verified
+- tapOn: Test hash salt
+- extendedWaitUntil:
+    visible: Hash salt verified for plain and encrypted uploads
+    timeout: 60000
+- assertNotVisible: "E2E error:.*"
+- takeScreenshot: hash-salt-verified
 - tapOn: Test network retry
 - extendedWaitUntil:
     visible: plain network recovery verified

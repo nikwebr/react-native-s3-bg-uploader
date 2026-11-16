@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Platform, ScrollView, StyleSheet, Text, TextInput } from 'react-native';
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
+import { S3BgUploaderDuplicateFileError } from '../../src/specs/s3-bg-uploader.types';
 import type { UploadProgress } from '../../src/specs/s3-bg-uploader.types';
 import { CompletionTiming, COMPLETION_TIMEOUT_MS } from './completionTiming';
 import { assertAggregateAcknowledged } from './networkProgress';
@@ -9,6 +10,7 @@ import { assertAggregateAcknowledged } from './networkProgress';
 const KEY = '0123456789abcdef'.repeat(4);
 const NONCE = '0123456789abcdef'.repeat(3);
 const BACKEND = 'http://127.0.0.1:8765';
+const HASH_SALT = 'maestro-hash-salt';
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 async function api(path: string, body: unknown): Promise<void> {
@@ -97,7 +99,80 @@ export default function TestApp({ initializeEncryptor }: {
     }
   };
 
-  const prepare = async (mode: 'plain' | 'encrypted' | 'cancel', network = false) => {
+  const loadFixture = async (): Promise<File | string> => {
+    if (Platform.OS === 'web') {
+      const response = await fetch(`${BACKEND}/fixture`);
+      if (!response.ok) throw new Error(`Fixture download: HTTP ${response.status}`);
+      return new File([await response.arrayBuffer()], 'fixture.bin');
+    }
+    if (!fixturePath) {
+      throw new Error('Enter the fixture path provided by the E2E runner');
+    }
+    return fixturePath;
+  };
+
+  const startHashSaltUpload = (
+    file: File | string,
+    transfer: string,
+    encrypted: boolean,
+    hashSalt?: string,
+  ) => encrypted
+    ? S3BgUploader.encryptAndUploadFile(file, transfer, KEY, NONCE, { mode: transfer }, hashSalt)
+    : S3BgUploader.uploadFile(file, transfer, { mode: transfer }, hashSalt);
+
+  const expectDuplicate = async (upload: () => Promise<string>, label: string) => {
+    try {
+      await upload();
+    } catch (e: unknown) {
+      if (e instanceof S3BgUploaderDuplicateFileError) return;
+      throw e;
+    }
+    throw new Error(`${label} did not reject a duplicate hash`);
+  };
+
+  const testHashSalt = async () => {
+    clearTimeout(completionTimer.current);
+    completionTimer.current = undefined;
+    completionTiming.current = new CompletionTiming();
+    current.current = undefined;
+    latestProgress.current = undefined;
+    recoveryError.current = '';
+    setCompletionAfterMs(undefined);
+    await initializeEncryptor?.();
+    S3BgUploader.cancel();
+    await S3BgUploader.getProgress();
+    setProgress(undefined);
+    setStatus('Preparing hash salt test');
+    const file = await loadFixture();
+
+    const check = async (encrypted: boolean) => {
+      const transfer = encrypted ? 'encrypted-hash-salt' : 'plain-hash-salt';
+      const unsalted = await startHashSaltUpload(file, transfer, encrypted);
+      const salted = await startHashSaltUpload(file, transfer, encrypted, HASH_SALT);
+      if (salted === unsalted) {
+        throw new Error(`${transfer} salt did not change the hash`);
+      }
+      await expectDuplicate(
+        () => startHashSaltUpload(file, transfer, encrypted, HASH_SALT),
+        `${transfer} salted hash`,
+      );
+      S3BgUploader.cancelFile(unsalted);
+      S3BgUploader.cancelFile(salted);
+      if ((await S3BgUploader.getProgress()).length !== 0) {
+        throw new Error(`${transfer} test hashes remained in the session`);
+      }
+    };
+
+    await check(false);
+    await check(true);
+    setStatus('Hash salt verified for plain and encrypted uploads');
+  };
+
+  const prepare = async (
+    mode: 'plain' | 'encrypted' | 'cancel',
+    network = false,
+    hashSalt?: string,
+  ) => {
     clearTimeout(completionTimer.current);
     completionTimer.current = undefined;
     completionTiming.current = new CompletionTiming();
@@ -111,18 +186,11 @@ export default function TestApp({ initializeEncryptor }: {
     await S3BgUploader.getProgress();
     setProgress(undefined);
     setStatus('Preparing fixture');
-    let file: File | string = fixturePath;
-    if (Platform.OS === 'web') {
-      const response = await fetch(`${BACKEND}/fixture`);
-      if (!response.ok) throw new Error(`Fixture download: HTTP ${response.status}`);
-      file = new File([await response.arrayBuffer()], 'fixture.bin');
-    } else if (!fixturePath) {
-      throw new Error('Enter the fixture path provided by the E2E runner');
-    }
+    const file = await loadFixture();
     const transfer = network ? `${mode}-network` : mode;
     const hash = mode === 'encrypted'
-      ? await S3BgUploader.encryptAndUploadFile(file, transfer, KEY, NONCE, { mode: transfer })
-      : await S3BgUploader.uploadFile(file, transfer, { mode: transfer });
+      ? await S3BgUploader.encryptAndUploadFile(file, transfer, KEY, NONCE, { mode: transfer }, hashSalt)
+      : await S3BgUploader.uploadFile(file, transfer, { mode: transfer }, hashSalt);
     current.current = { hash, mode: transfer };
     setStatus(`${mode} queued`);
     await S3BgUploader.resume();
@@ -350,8 +418,9 @@ export default function TestApp({ initializeEncryptor }: {
           style={styles.input}
         />
       )}
-      <Button title="Upload unencrypted fixture" disabled={busy} onPress={() => run(() => prepare('plain'))} />
-      <Button title="Upload encrypted fixture" disabled={busy} onPress={() => run(() => prepare('encrypted'))} />
+      <Button title="Upload unencrypted fixture" disabled={busy} onPress={() => run(() => prepare('plain', false, HASH_SALT))} />
+      <Button title="Upload encrypted fixture" disabled={busy} onPress={() => run(() => prepare('encrypted', false, HASH_SALT))} />
+      <Button title="Test hash salt" disabled={busy} onPress={() => run(testHashSalt)} />
       <Button title="Pause upload" disabled={busy} onPress={() => run(pause)} />
       <Button title="Resume upload" disabled={busy} onPress={() => run(resume)} />
       <Button title="Verify download" disabled={busy} onPress={() => run(verify)} />
