@@ -370,6 +370,9 @@ first chunk, and downloads both
 objects. The independent Python oracle checks exact plaintext bytes, ciphertext
 size and absence of plaintext, correct-key decryption back to the original
 bytes, and rejection of a wrong key.
+The shared flow also verifies that a `hashSalt` produces a distinct, stable hash
+for both `uploadFile()` and `encryptAndUploadFile()`, then uses salted hashes in
+the full pause/resume upload scenarios.
 Both upload modes must report `COMPLETED` within **20 seconds of the first
 100% progress callback**. The shared test uses a monotonic clock and a watchdog;
 later progress drops do not reset the deadline. The elapsed time is saved as
