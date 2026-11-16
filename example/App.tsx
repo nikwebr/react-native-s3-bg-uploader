@@ -9,10 +9,12 @@ import {
   ScrollView,
   PermissionsAndroid,
   TextInput,
+  Alert,
 } from 'react-native';
 import { S3BgUploader } from 'react-native-s3-bg-uploader';
 import { pick, types } from '@react-native-documents/picker';
 import type { UploadProgress, AggregateProgress } from '../src/specs/s3-bg-uploader.types';
+import { S3BgUploaderDuplicateFileError } from '../src/specs/s3-bg-uploader.types';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -20,6 +22,7 @@ import type { UploadProgress, AggregateProgress } from '../src/specs/s3-bg-uploa
 const START_UPLOAD_API = 'https://development1.ysendit.com/upload/MobileS3/startUpload';
 const GET_UPLOAD_URLS_API = 'https://development1.ysendit.com/upload/MobileS3/getUploadUrls';
 const COMPLETE_API = 'https://development1.ysendit.com/upload/MobileS3/complete';
+const CANCEL_API = 'https://development1.ysendit.com/upload/MobileS3/cancel';
 
 // Test encryption key (AES-256) and nonce — 32 bytes / 24 bytes, hex-encoded.
 // In a real app these would come from your key-management system.
@@ -45,6 +48,19 @@ function uriToPath(uri: string): string {
   return uri.startsWith('file://') ? decodeURIComponent(uri.slice(7)) : uri;
 }
 
+function confirmDuplicateFile(name: string): Promise<boolean> {
+  const message = `A file with the same hash as "${name}" is already added. Add it again?`;
+  if (Platform.OS === 'web') {
+    return Promise.resolve(window.confirm(message));
+  }
+  return new Promise((resolve) => {
+    Alert.alert('File already added', message, [
+      { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+      { text: 'Add again', onPress: () => resolve(true) },
+    ], { cancelable: true, onDismiss: () => resolve(false) });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -55,6 +71,7 @@ interface QueuedFile {
   webFile?: File;
   transferId: string;
   fileHash?: string;
+  hashSalt?: string;
   fileKey?: string;
   progress?: UploadProgress;
   /** True while uploadFile() is in-flight for this entry. */
@@ -81,6 +98,7 @@ export default function App(): React.JSX.Element {
 
   const webInputRef = useRef<HTMLInputElement | null>(null);
   const pendingTransferIdRef = useRef<string>('');
+  const duplicateConfirmationRef = useRef<Promise<boolean>>(Promise.resolve(false));
 
   // ------------------------------------------------------------------
   // Progress callback
@@ -114,7 +132,7 @@ export default function App(): React.JSX.Element {
   // Init: config + restore persisted session
   // ------------------------------------------------------------------
   useEffect(() => {
-    S3BgUploader.setConfig(START_UPLOAD_API, GET_UPLOAD_URLS_API, COMPLETE_API);
+    S3BgUploader.setConfig(START_UPLOAD_API, GET_UPLOAD_URLS_API, COMPLETE_API, CANCEL_API);
     S3BgUploader.setTaskSubtitle(
       '{percentage} | {uploadedSize}/{totalSize} | {completedTransfers}/{totalTransfers} transfers | {completedFiles}/{totalFiles} files',
     );
@@ -153,17 +171,33 @@ export default function App(): React.JSX.Element {
   // Concurrently with other uploads — each item updates independently.
   // ------------------------------------------------------------------
   const runUpload = useCallback(
-    async (id: string, fileOrPath: File | string, transferId: string, encrypted = false) => {
+    async (id: string, fileOrPath: File | string, transferId: string, encrypted = false, name = 'This file') => {
       try {
-        const fileHash = encrypted
-          ? await S3BgUploader.encryptAndUploadFile(fileOrPath, transferId, ENCRYPT_KEY, ENCRYPT_NONCE)
-          : await S3BgUploader.uploadFile(fileOrPath, transferId);
+        const upload = (hashSalt?: string) => encrypted
+          ? S3BgUploader.encryptAndUploadFile(fileOrPath, transferId, ENCRYPT_KEY, ENCRYPT_NONCE, undefined, hashSalt)
+          : S3BgUploader.uploadFile(fileOrPath, transferId, undefined, hashSalt);
+        let fileHash: string;
+        let hashSalt: string | undefined;
+        try {
+          fileHash = await upload();
+        } catch (e) {
+          if (!(e instanceof S3BgUploaderDuplicateFileError)) throw e;
+          const confirmation = duplicateConfirmationRef.current.then(() => confirmDuplicateFile(name));
+          // Keep dialogs sequential even when several selected files are duplicates.
+          duplicateConfirmationRef.current = confirmation.catch(() => false);
+          if (!(await confirmation)) {
+            setQueue((prev) => prev.filter((q) => q.id !== id));
+            return;
+          }
+          hashSalt = `duplicate-${id}`;
+          fileHash = await upload(hashSalt);
+        }
         setQueue((prev) => {
           const withoutDuplicate = prev.filter(
             (f) => f.id === id || f.fileHash !== fileHash,
           );
           return withoutDuplicate.map((q) =>
-            q.id === id ? { ...q, fileHash, isLoading: false } : q,
+            q.id === id ? { ...q, fileHash, hashSalt, isLoading: false } : q,
           );
         });
       } catch (e) {
@@ -191,7 +225,7 @@ export default function App(): React.JSX.Element {
       }));
       setQueue((prev) => [...prev, ...newItems]);
       startListening();
-      newItems.forEach((item) => runUpload(item.id, item.path!, item.transferId, item.encrypted));
+      newItems.forEach((item) => runUpload(item.id, item.path!, item.transferId, item.encrypted, item.name));
     } catch (e) {
       setErrorMsg((e as Error)?.message ?? String(e));
     }
@@ -217,7 +251,7 @@ export default function App(): React.JSX.Element {
       }));
       setQueue((prev) => [...prev, ...newItems]);
       startListening();
-      newItems.forEach((item) => runUpload(item.id, item.webFile!, item.transferId, item.encrypted));
+      newItems.forEach((item) => runUpload(item.id, item.webFile!, item.transferId, item.encrypted, item.name));
       event.target.value = '';
     },
     [encryptEnabled, startListening, runUpload],
